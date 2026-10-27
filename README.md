@@ -25,7 +25,8 @@ about.html
 services.html
 contact.html
 css/styles.css   # all styles; brand colours (sage green and white) are tokens in :root
-js/main.js       # mobile menu, scroll reveal, contact form
+js/main.js       # mobile menu, scroll reveal, back-to-top, contact form
+images/          # service illustrations (replace with real photos of the same name)
 ```
 
 ## Preview locally

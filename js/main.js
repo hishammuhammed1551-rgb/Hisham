@@ -26,6 +26,16 @@
     el.textContent = new Date().getFullYear();
   });
 
+  // Show the back-to-top button once the visitor has scrolled down
+  const backToTop = document.querySelector(".back-to-top");
+  if (backToTop) {
+    const updateBackToTop = function () {
+      backToTop.classList.toggle("show", window.scrollY > 400);
+    };
+    window.addEventListener("scroll", updateBackToTop, { passive: true });
+    updateBackToTop();
+  }
+
   // Fade sections in as they scroll into view
   const revealEls = document.querySelectorAll(".reveal");
 
