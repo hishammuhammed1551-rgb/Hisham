@@ -1,42 +1,42 @@
 /* ==========================================================================
-   Meridian Advisory — site styles
+   Lowcaps — site styles
    Edit the tokens in :root to rebrand the whole site.
    ========================================================================== */
 
 :root {
   --color-bg: #ffffff;
-  --color-surface: #f5f7fa;
-  --color-surface-alt: #eef2f7;
-  --color-text: #1b2333;
-  --color-muted: #5b6577;
-  --color-border: #dde3eb;
-  --color-primary: #1f4e79;
-  --color-primary-dark: #163a5c;
-  --color-accent: #c8963e;
+  --color-surface: #f3f7f4;
+  --color-surface-alt: #e6efe9;
+  --color-text: #1c2a22;
+  --color-muted: #5a6b60;
+  --color-border: #dbe5de;
+  --color-primary: #4a7a5c;
+  --color-primary-dark: #3b6449;
+  --color-accent: #8db59a;
   --color-on-primary: #ffffff;
   --color-success: #1e7d4f;
   --color-error: #b3261e;
 
   --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-serif: "Source Serif 4", Georgia, "Times New Roman", serif;
+  --font-serif: "Plus Jakarta Sans", "Inter", system-ui, sans-serif;
 
   --radius: 10px;
-  --shadow: 0 6px 24px rgba(17, 30, 54, 0.08);
+  --shadow: 0 6px 24px rgba(28, 52, 38, 0.08);
   --container: 1140px;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --color-bg: #0f1520;
-    --color-surface: #161e2c;
-    --color-surface-alt: #1c2637;
-    --color-text: #e6ebf2;
-    --color-muted: #9aa6b8;
-    --color-border: #2a3548;
-    --color-primary: #6fa8dc;
-    --color-primary-dark: #8bbbe6;
-    --color-accent: #e0b468;
-    --color-on-primary: #0f1520;
+    --color-bg: #0f1612;
+    --color-surface: #16201a;
+    --color-surface-alt: #1c2a21;
+    --color-text: #e7efe9;
+    --color-muted: #9db0a3;
+    --color-border: #2a3a30;
+    --color-primary: #9cc5a8;
+    --color-primary-dark: #b4d6be;
+    --color-accent: #9cc5a8;
+    --color-on-primary: #0f1612;
     --color-success: #5cc58e;
     --color-error: #f2867d;
     --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
@@ -161,7 +161,7 @@ p {
 
 .btn-light {
   background: #ffffff;
-  color: #1f4e79;
+  color: #3b6449;
 }
 
 /* ---------- Header / nav ---------- */
@@ -331,7 +331,7 @@ p {
   font-weight: 700;
   letter-spacing: 0.12em;
   text-transform: uppercase;
-  color: var(--color-accent);
+  color: var(--color-primary);
   margin-bottom: 12px;
 }
 
@@ -345,7 +345,7 @@ p {
 .hero {
   padding: 110px 0 96px;
   background:
-    radial-gradient(circle at 85% 20%, rgba(200, 150, 62, 0.14), transparent 45%),
+    radial-gradient(circle at 85% 20%, rgba(141, 181, 154, 0.28), transparent 45%),
     linear-gradient(180deg, var(--color-surface) 0%, var(--color-bg) 100%);
 }
 
@@ -532,7 +532,7 @@ p {
   aspect-ratio: 4 / 3;
   border-radius: 16px;
   background:
-    linear-gradient(135deg, rgba(31, 78, 121, 0.92), rgba(22, 58, 92, 0.98)),
+    linear-gradient(135deg, rgba(110, 156, 125, 0.95), rgba(59, 100, 73, 0.98)),
     repeating-linear-gradient(45deg, transparent 0 18px, rgba(255, 255, 255, 0.05) 18px 36px);
   color: #ffffff;
   display: flex;
@@ -590,7 +590,7 @@ p {
   font-family: var(--font-serif);
   font-size: 2rem;
   font-weight: 700;
-  color: var(--color-accent);
+  color: var(--color-primary);
 }
 
 .steps p {
@@ -653,7 +653,7 @@ p {
 }
 
 .team-member .role {
-  color: var(--color-accent);
+  color: var(--color-primary);
   font-weight: 600;
   font-size: 0.95rem;
   margin-bottom: 10px;
@@ -715,7 +715,7 @@ p {
 
 .faq summary::after {
   content: "+";
-  color: var(--color-accent);
+  color: var(--color-primary);
   font-size: 1.4rem;
   line-height: 1;
 }
@@ -732,7 +732,7 @@ p {
 /* ---------- CTA band ---------- */
 
 .cta {
-  background: #1f4e79;
+  background: linear-gradient(135deg, #5f8f70, #3b6449);
   color: #ffffff;
   border-radius: 16px;
   padding: 56px;
@@ -818,7 +818,7 @@ p {
 .field textarea:focus {
   outline: none;
   border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px rgba(31, 78, 121, 0.2);
+  box-shadow: 0 0 0 3px rgba(74, 122, 92, 0.25);
 }
 
 .field.invalid input,
@@ -872,7 +872,7 @@ p {
   font-size: 0.8rem;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--color-accent);
+  color: var(--color-primary);
   margin-top: 22px;
 }
 
@@ -901,14 +901,14 @@ p {
 /* ---------- Footer ---------- */
 
 .site-footer {
-  background: #111a28;
-  color: #b9c3d3;
+  background: #1a2a20;
+  color: #b8c9bd;
   padding: 64px 0 28px;
   font-size: 0.95rem;
 }
 
 .site-footer a {
-  color: #dbe3ef;
+  color: #dfeae2;
   text-decoration: none;
 }
 
@@ -947,12 +947,12 @@ p {
 }
 
 .site-footer .logo-mark {
-  background: #c8963e;
-  color: #111a28;
+  background: #8db59a;
+  color: #1a2a20;
 }
 
 .footer-bottom {
-  border-top: 1px solid #263246;
+  border-top: 1px solid #2c3f33;
   padding-top: 24px;
   display: flex;
   justify-content: space-between;
@@ -1000,4 +1000,20 @@ p {
   .card {
     transition: none;
   }
+}
+
+/* ---------- Map ---------- */
+
+.map {
+  margin-top: 24px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+}
+
+.map iframe {
+  display: block;
+  width: 100%;
+  height: 260px;
+  border: 0;
 }

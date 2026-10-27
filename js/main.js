@@ -1,4 +1,4 @@
-// Meridian Advisory — site behaviour
+// Lowcaps — site behaviour
 
 (function () {
   "use strict";
@@ -107,10 +107,10 @@
       }
 
       form.reset();
-      status.textContent = "Thank you — your message has been sent. We'll be in touch within one business day.";
+      status.textContent = "Thank you — your message has been sent. Our team will get back to you shortly.";
       status.classList.add("success");
     } catch (err) {
-      status.textContent = "Sorry, something went wrong. Please email us directly at hello@meridianadvisory.com.";
+      status.textContent = "Sorry, something went wrong. Please call or email us directly using the details on this page.";
       status.classList.add("error");
     } finally {
       button.disabled = false;

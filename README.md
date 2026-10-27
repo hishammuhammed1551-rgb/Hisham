@@ -1,17 +1,21 @@
-# Meridian Advisory — Company Website
+# Lowcaps — Company Website
 
-A responsive, four-page website for a professional services firm, built with plain HTML, CSS and JavaScript (no build step).
+Website for **Lowcaps**, a logistics company in Khor Fakkan, UAE, providing shipping, clearing and customs services. Built with plain HTML, CSS and JavaScript (no build step).
 
-> "Meridian Advisory" and all names, figures, addresses and testimonials are **placeholder content**. Replace them with your company's real details before publishing.
+## Still to fill in
+
+- **Phone number:** search for `+971 XX XXX XXXX` and `+971000000000` (the `tel:` link) in the HTML files.
+- **Email address:** search for `info@example.com` in the HTML files.
+- **Contact form delivery:** see below.
 
 ## Pages
 
-| File            | Contents                                                                 |
-| --------------- | ------------------------------------------------------------------------ |
-| `index.html`    | Hero, key stats, services overview, approach, process, testimonials, CTA |
-| `about.html`    | Company story, mission & values, leadership team                         |
-| `services.html` | Detailed services, engagement models, FAQ                                |
-| `contact.html`  | Validated contact form, address, phone, email, office hours              |
+| File            | Contents                                                     |
+| --------------- | ------------------------------------------------------------ |
+| `index.html`    | Hero, services overview, Khor Fakkan location, process, CTA  |
+| `about.html`    | Who we are and our values                                    |
+| `services.html` | Shipping, clearing and customs in detail, FAQ                |
+| `contact.html`  | Quote request form, contact details, map of Khor Fakkan      |
 
 ## Structure
 
@@ -20,7 +24,7 @@ index.html
 about.html
 services.html
 contact.html
-css/styles.css   # all styles; brand colours and fonts are tokens in :root
+css/styles.css   # all styles; brand colours (sage green and white) are tokens in :root
 js/main.js       # mobile menu, scroll reveal, contact form
 ```
 
@@ -35,10 +39,8 @@ python3 -m http.server 8000
 
 ## Customising
 
-- **Company name / text:** search and replace `Meridian Advisory` across the HTML files, then edit the copy on each page.
 - **Colours & fonts:** edit the variables at the top of `css/styles.css` (`--color-primary`, `--color-accent`, `--font-sans`, `--font-serif`). Dark-mode colours are in the `prefers-color-scheme: dark` block below them.
-- **Logo:** the "M" badge (`.logo-mark`) is in the header and footer of each page. Swap it for an `<img>` if you have a logo file.
-- **Contact details:** update the address, phone and email in the footer of each page and in `contact.html`.
+- **Logo:** the "L" badge (`.logo-mark`) is in the header and footer of each page. Swap it for an `<img>` if you have a logo file.
 
 ## Making the contact form send email
 
