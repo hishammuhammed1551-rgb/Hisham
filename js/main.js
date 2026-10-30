@@ -107,14 +107,18 @@
     try {
       // Set data-endpoint on the form (e.g. a Formspree URL) to deliver real messages.
       const endpoint = form.dataset.endpoint;
-      if (endpoint) {
-        const response = await fetch(endpoint, {
-          method: "POST",
-          body: new FormData(form),
-          headers: { Accept: "application/json" },
-        });
-        if (!response.ok) throw new Error("Request failed");
+      if (!endpoint) {
+        status.textContent = "Online enquiries aren't connected yet. Please call or email us using the details on this page.";
+        status.classList.add("error");
+        return;
       }
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        body: new FormData(form),
+        headers: { Accept: "application/json" },
+      });
+      if (!response.ok) throw new Error("Request failed");
 
       form.reset();
       status.textContent = "Thank you — your message has been sent. Our team will get back to you shortly.";

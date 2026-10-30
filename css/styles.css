@@ -26,7 +26,7 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --color-bg: #0f1612;
     --color-surface: #16201a;
     --color-surface-alt: #1c2a21;
@@ -40,7 +40,25 @@
     --color-success: #5cc58e;
     --color-error: #f2867d;
     --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    color-scheme: dark;
   }
+}
+
+:root[data-theme="dark"] {
+  --color-bg: #0f1612;
+  --color-surface: #16201a;
+  --color-surface-alt: #1c2a21;
+  --color-text: #e7efe9;
+  --color-muted: #9db0a3;
+  --color-border: #2a3a30;
+  --color-primary: #9cc5a8;
+  --color-primary-dark: #b4d6be;
+  --color-accent: #9cc5a8;
+  --color-on-primary: #0f1612;
+  --color-success: #5cc58e;
+  --color-error: #f2867d;
+  --shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+  color-scheme: dark;
 }
 
 /* ---------- Base ---------- */
@@ -168,7 +186,7 @@ p {
 
 .site-header {
   position: sticky;
-  top: 0;
+  top: env(safe-area-inset-top, 0px);
   z-index: 50;
   background: var(--color-bg);
   border-bottom: 1px solid var(--color-border);
@@ -1119,8 +1137,8 @@ p {
 
 .back-to-top {
   position: fixed;
-  right: 20px;
-  bottom: 20px;
+  right: calc(20px + env(safe-area-inset-right, 0px));
+  bottom: calc(20px + env(safe-area-inset-bottom, 0px));
   z-index: 60;
   width: 52px;
   height: 52px;
