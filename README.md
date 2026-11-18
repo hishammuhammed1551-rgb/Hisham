@@ -2,6 +2,8 @@
 
 Website for **Lowcaps**, a logistics company in Khor Fakkan, UAE, providing shipping, clearing and customs services. Built with plain HTML, CSS and JavaScript (no build step).
 
+The `erp/` folder holds **Lowcaps ERP**, the internal system for staff (customers/CRM to start with). It runs separately from the website and needs a Node.js server. See [`erp/README.md`](erp/README.md).
+
 ## Still to fill in
 
 - **Phone number:** search for `+971 XX XXX XXXX` and `+971000000000` (the `tel:` link) in the HTML files.
