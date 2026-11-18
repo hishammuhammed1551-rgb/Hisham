@@ -15,6 +15,8 @@ const app = createApp({
   timeZone: process.env.TZ_BUSINESS || 'Asia/Dubai',
   // Set COOKIE_SECURE=true once the ERP is served over HTTPS.
   secureCookies: process.env.COOKIE_SECURE === 'true',
+  // Set TRUST_PROXY=true only when a reverse proxy (e.g. Caddy) sits in front of the ERP.
+  trustProxy: process.env.TRUST_PROXY === 'true',
 });
 
 const server = http.createServer(app);

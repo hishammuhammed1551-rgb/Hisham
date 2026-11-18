@@ -36,8 +36,13 @@ Run the tests with `npm test`.
 | `DB_FILE`       | `erp/data/lowcaps.db`| Where the database is stored. |
 | `TZ_BUSINESS`   | `Asia/Dubai`         | Time zone used to decide what "today" and "overdue" mean. |
 | `COOKIE_SECURE` | `false`              | Set to `true` once the ERP is served over HTTPS. |
+| `TRUST_PROXY`   | `false`              | Set to `true` only when a reverse proxy (e.g. Caddy) sits in front, so login limits use the visitor's real IP. |
 
 ## Putting it online for the team
+
+**Chosen setup: Oracle Cloud Always Free, UAE region.** Follow [`deploy/ORACLE-CLOUD.md`](deploy/ORACLE-CLOUD.md); `deploy/setup.sh` installs and configures everything on the server (HTTPS, auto-restart, nightly backups) and `deploy/update.sh` installs new versions.
+
+Other options, for reference:
 
 The website in the parent folder is static and can live on GitHub Pages, but **the ERP needs a server** because it has a database and logins. Options:
 

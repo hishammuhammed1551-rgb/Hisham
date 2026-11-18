@@ -46,7 +46,7 @@ function compile(pattern) {
   return { re, keys };
 }
 
-function createApp({ db, timeZone = 'Asia/Dubai', secureCookies = false }) {
+function createApp({ db, timeZone = 'Asia/Dubai', secureCookies = false, trustProxy = false }) {
   const routes = [];
   const limiter = new auth.LoginLimiter();
   const route = (method, pattern, opts, handler) => {
@@ -397,7 +397,7 @@ function createApp({ db, timeZone = 'Asia/Dubai', secureCookies = false }) {
       }
 
       const result = await r.handler({
-        params, body, user, token, query: url.searchParams, ip: req.socket.remoteAddress,
+        params, body, user, token, query: url.searchParams, ip: clientIp(req, trustProxy),
       });
       const out = result && (result.body !== undefined || result.raw !== undefined || result.cookie) ? result : { body: result };
       const headers = { ...SECURITY_HEADERS, 'Cache-Control': 'no-store', ...(out.headers || {}) };
@@ -429,6 +429,12 @@ function findRoute(routes, method, pathname) {
     return { r, params };
   }
   return pathMatched ? false : null;
+}
+
+/** Behind a reverse proxy (Caddy), the visitor's address is the last X-Forwarded-For entry. */
+function clientIp(req, trustProxy) {
+  const forwarded = trustProxy && String(req.headers['x-forwarded-for'] || '').split(',').pop().trim();
+  return forwarded || req.socket.remoteAddress;
 }
 
 function parseCookies(header = '') {
