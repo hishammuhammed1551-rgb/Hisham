@@ -1,9 +1,19 @@
 'use strict';
 
-/* Lowcaps ERP — single-page front end. All user data goes through h()/text nodes, never innerHTML. */
+/* Lowcaps ERP — single-page front end on Supabase.
+   Every data operation is a call to a database function in supabase/schema.sql (sb.rpc), which
+   checks permissions and validates input. All user data goes through h()/text nodes, never innerHTML. */
 
-const state = { user: null, users: [] };
+const state = { user: null, users: [], recovering: false };
 const app = document.getElementById('app');
+const config = window.LOWCAPS_CONFIG || {};
+const MIN_PASSWORD = Number(config.minPasswordLength) || 10;
+const configured = Boolean(config.supabaseUrl && config.supabaseKey && !/YOUR-/.test(config.supabaseUrl + config.supabaseKey));
+const sb = configured && window.supabase
+  ? window.supabase.createClient(config.supabaseUrl, config.supabaseKey, {
+      auth: { flowType: 'pkce', persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+    })
+  : null;
 
 // ---------- helpers ----------
 
@@ -50,9 +60,9 @@ const statusBadge = s => h('span', { class: `badge badge-${s}` }, STATUS_LABEL[s
 
 function fmtDate(value, withTime = false) {
   if (!value) return '';
-  // SQLite datetimes are UTC without a zone; plain dates are calendar days.
+  // Plain dates (YYYY-MM-DD) are calendar days; everything else is an ISO timestamp with a zone.
   const isDay = /^\d{4}-\d{2}-\d{2}$/.test(value);
-  const d = new Date(isDay ? value + 'T00:00:00' : value.replace(' ', 'T') + 'Z');
+  const d = new Date(isDay ? value + 'T00:00:00' : value);
   return d.toLocaleString('en-GB', withTime && !isDay
     ? { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }
     : { day: 'numeric', month: 'short', year: 'numeric' });
@@ -65,28 +75,45 @@ function toast(message, isError = false) {
 }
 
 class ApiError extends Error {
-  constructor(status, data) {
-    super(data.error || `Request failed (${status})`);
-    this.status = status;
-    this.details = data.details || {};
+  constructor(code, message, fields) {
+    super(message || 'Something went wrong');
+    this.code = code;
+    this.details = fields || {};
   }
 }
 
-async function api(method, url, body) {
-  const res = await fetch(url, {
-    method,
-    headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-    credentials: 'same-origin',
-  });
-  const data = res.headers.get('content-type')?.includes('json') ? await res.json() : {};
-  if (res.status === 401 && !['/api/me', '/api/login', '/api/me/password'].includes(url)) {
+/** Call a database function. Field errors come back as JSON in the error's "details". */
+async function rpc(fn, args = {}) {
+  const { data, error } = await sb.rpc(fn, args);
+  if (!error) return data;
+  let fields = {};
+  try { fields = JSON.parse(error.details || '{}') || {}; } catch { /* plain text */ }
+  if (error.code === '28000' || error.code === 'PGRST301' || error.code === 'PGRST303') {
+    // Session is missing or expired: go back to the sign-in page.
     state.user = null;
     location.hash = '#/login';
-    throw new ApiError(401, data);
+  } else if (error.code === '42501' && /waiting for an administrator/.test(error.message) && state.user) {
+    state.user.active = false;
+    setTimeout(render);
   }
-  if (!res.ok) throw new ApiError(res.status, data);
-  return data;
+  throw new ApiError(error.code, error.message, fields);
+}
+
+/** Supabase Auth errors (sign in, sign up, password) as an ApiError. */
+function authError(error) {
+  const known = {
+    invalid_credentials: 'Incorrect email or password',
+    email_not_confirmed: 'Please confirm your email first: open the link we sent you',
+    user_already_exists: 'An account with this email already exists. Sign in instead.',
+    over_email_send_rate_limit: 'Too many emails sent. Please wait a while and try again.',
+  };
+  return new ApiError(error.code, known[error.code] || error.message);
+}
+
+function checkNewPassword(password) {
+  if (String(password || '').length < MIN_PASSWORD) {
+    throw new ApiError('weak_password', 'Password too short', { password: `Use at least ${MIN_PASSWORD} characters` });
+  }
 }
 
 function field(label, input, { hint, full } = {}) {
@@ -201,21 +228,25 @@ function pageHead(title, subtitle, actions, crumbs) {
 }
 
 async function logout() {
-  try { await api('POST', '/api/logout', {}); } catch { /* already signed out */ }
+  try { await sb.auth.signOut(); } catch { /* already signed out */ }
   state.user = null;
   location.hash = '#/login';
+  render();
 }
 
 // ---------- auth views ----------
 
-function authCard(title, intro, form) {
+function authCard(title, intro, ...content) {
   return h('div', { class: 'auth' },
     h('div', { class: 'card' },
       h('div', { class: 'brand' }, h('span', { class: 'logo-mark' }, 'L'), h('span', {}, 'Lowcaps', h('small', {}, 'ERP'))),
       h('h1', {}, title),
       intro && h('p', { class: 'muted' }, intro),
-      form));
+      ...content));
 }
+
+const authLinks = (...links) => h('p', { class: 'auth-links' }, links.flatMap((l, i) => (i ? [' · ', l] : [l])));
+const pageUrl = () => location.origin + location.pathname;
 
 function viewLogin() {
   const form = handleForm(h('form', { class: 'form' },
@@ -223,33 +254,94 @@ function viewLogin() {
     field('Password', input('password', '', { type: 'password', autocomplete: 'current-password', required: true })),
     h('button', { class: 'btn btn-primary', type: 'submit' }, 'Sign in')),
   async data => {
-    const { user } = await api('POST', '/api/login', data);
-    state.user = user;
+    const { error } = await sb.auth.signInWithPassword({ email: data.email.trim(), password: data.password });
+    if (error) throw authError(error);
+    state.user = null;
     location.hash = '#/';
+    render();
   });
-  return authCard('Sign in', 'Use the account your administrator created for you.', form);
+  return authCard('Sign in', null, form,
+    authLinks(h('a', { href: '#/signup' }, 'Create an account'), h('a', { href: '#/forgot' }, 'Forgot password?')));
 }
 
-function viewSetup() {
+function viewSignup() {
   const form = handleForm(h('form', { class: 'form' },
-    field('Your name', input('name', '', { required: true, autocomplete: 'name', autofocus: true })),
-    field('Email', input('email', '', { type: 'email', required: true, autocomplete: 'username' })),
-    field('Password', input('password', '', { type: 'password', required: true, autocomplete: 'new-password', minlength: 10 }),
-      { hint: 'At least 10 characters.' }),
-    h('button', { class: 'btn btn-primary', type: 'submit' }, 'Create admin account')),
+    field('Your name', input('name', '', { required: true, autocomplete: 'name', autofocus: true, maxlength: 100 })),
+    field('Work email', input('email', '', { type: 'email', required: true, autocomplete: 'username' })),
+    field('Password', input('password', '', { type: 'password', required: true, autocomplete: 'new-password', minlength: MIN_PASSWORD }),
+      { hint: `At least ${MIN_PASSWORD} characters.` }),
+    h('button', { class: 'btn btn-primary', type: 'submit' }, 'Create account')),
   async data => {
-    const { user } = await api('POST', '/api/setup', data);
-    state.user = user;
-    toast('Welcome! Your admin account is ready.');
+    checkNewPassword(data.password);
+    const { data: res, error } = await sb.auth.signUp({
+      email: data.email.trim(),
+      password: data.password,
+      options: { data: { name: data.name.trim() }, emailRedirectTo: pageUrl() },
+    });
+    if (error) throw authError(error);
+    if (!res.session) {
+      // "Confirm email" is switched on in Supabase: they must click the link first.
+      form.replaceWith(h('p', {}, `Almost done: we sent a confirmation link to ${data.email.trim()}. Open it, then sign in.`));
+      return;
+    }
+    state.user = null;
+    location.hash = '#/';
+    render();
+  });
+  return authCard('Create an account',
+    'For Lowcaps staff. After you sign up, an administrator needs to give your account access.',
+    form, authLinks(h('a', { href: '#/login' }, 'Already have an account? Sign in')));
+}
+
+function viewForgot() {
+  const form = handleForm(h('form', { class: 'form' },
+    field('Email', input('email', '', { type: 'email', required: true, autocomplete: 'username', autofocus: true })),
+    h('button', { class: 'btn btn-primary', type: 'submit' }, 'Send reset link')),
+  async data => {
+    const { error } = await sb.auth.resetPasswordForEmail(data.email.trim(), { redirectTo: pageUrl() });
+    if (error) throw authError(error);
+    form.replaceWith(h('p', {}, 'If that email has an account, a reset link is on its way. Open it on this device and browser.'));
+  });
+  return authCard('Reset your password', null, form, authLinks(h('a', { href: '#/login' }, 'Back to sign in')));
+}
+
+function viewResetPassword() {
+  const form = handleForm(h('form', { class: 'form' },
+    field('New password', input('password', '', { type: 'password', required: true, autocomplete: 'new-password', minlength: MIN_PASSWORD, autofocus: true }),
+      { hint: `At least ${MIN_PASSWORD} characters.` }),
+    h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save new password')),
+  async data => {
+    checkNewPassword(data.password);
+    const { error } = await sb.auth.updateUser({ password: data.password });
+    if (error) throw authError(error);
+    state.recovering = false;
+    toast('Password changed');
     location.hash = '#/';
   });
-  return authCard('Set up Lowcaps ERP', 'Create the first administrator account. You can add your team afterwards.', form);
+  return authCard('Choose a new password', null, form);
+}
+
+function viewPending() {
+  return authCard('Waiting for access',
+    `Hi ${state.user.name}, your account (${state.user.email}) is set up, but an administrator still needs to give it access to the ERP.`,
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', onclick: () => { state.user = null; render(); } }, 'Check again'),
+      h('button', { class: 'btn btn-secondary', onclick: logout }, 'Sign out')));
+}
+
+function viewNotConfigured() {
+  return authCard('Connect the ERP to Supabase',
+    'This copy of the ERP doesn\'t know which Supabase project to use yet.',
+    h('ol', {},
+      h('li', {}, 'In Supabase, open Project Settings → API and copy the Project URL and the anon (public) key.'),
+      h('li', {}, 'Put them in erp/config.js and publish the change.')),
+    h('p', { class: 'muted' }, 'Full steps: erp/SUPABASE-SETUP.md in the repository.'));
 }
 
 // ---------- dashboard ----------
 
 async function viewDashboard() {
-  const d = await api('GET', '/api/dashboard');
+  const d = await rpc('dashboard');
   const stat = (label, value, href) =>
     h('a', { class: 'card stat', href }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value));
 
@@ -296,13 +388,14 @@ async function viewDashboard() {
 // ---------- customers list ----------
 
 async function loadUsers() {
-  state.users = (await api('GET', '/api/users')).users;
+  state.users = await rpc('list_users');
 }
 
 async function viewCustomers(params) {
   await loadUsers();
   const query = new URLSearchParams(params);
-  const data = await api('GET', '/api/customers?' + query);
+  const filters = { p_q: query.get('q') || null, p_status: query.get('status') || null, p_owner: query.get('owner') || null };
+  const data = await rpc('list_customers', { ...filters, p_sort: query.get('sort') || 'name', p_page: Number(query.get('page')) || 1 });
 
   const setParam = (key, value) => {
     const q = new URLSearchParams(params);
@@ -320,7 +413,7 @@ async function viewCustomers(params) {
   const ownerOptions = [['', 'All owners'], ['me', 'Assigned to me'], ['none', 'Unassigned'],
     ...state.users.filter(u => u.active).map(u => [String(u.id), u.name])];
 
-  const filters = h('div', { class: 'filters' },
+  const filterBar = h('div', { class: 'filters' },
     search,
     select('status', query.get('status'), [['', 'All statuses'], ['lead', 'Leads'], ['active', 'Active'], ['inactive', 'Inactive']],
       { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value) }),
@@ -328,8 +421,6 @@ async function viewCustomers(params) {
     select('sort', query.get('sort') || 'name', [['name', 'Sort: Name'], ['newest', 'Sort: Newest'], ['updated', 'Sort: Recently updated']],
       { 'aria-label': 'Sort', onchange: e => setParam('sort', e.target.value === 'name' ? '' : e.target.value) }));
 
-  const exportQuery = new URLSearchParams(query);
-  exportQuery.delete('page');
 
   const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
   const from = data.total ? (data.page - 1) * data.pageSize + 1 : 0;
@@ -356,17 +447,47 @@ async function viewCustomers(params) {
 
   return layout('customers',
     pageHead('Customers', `${data.total} customer${data.total === 1 ? '' : 's'}`, [
-      h('a', { class: 'btn btn-secondary', href: '/api/customers/export?' + exportQuery, download: true }, 'Export CSV'),
+      h('button', { class: 'btn btn-secondary', onclick: e => exportCsv(e.currentTarget, filters) }, 'Export CSV'),
       h('a', { class: 'btn btn-primary', href: '#/customers/new' }, '+ New customer'),
     ]),
     h('section', { class: 'card' },
-      filters,
+      filterBar,
       table,
       data.total > data.pageSize && h('div', { class: 'pager' },
         h('span', { class: 'muted' }, `Showing ${from}–${to} of ${data.total}`),
         h('div', { class: 'btn-row' },
           h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
           h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
+// Stop spreadsheets from running cell text as a formula; leave plain phone numbers like +971 alone.
+function csvCell(value) {
+  if (value === null || value === undefined) return '';
+  let s = String(value);
+  if (/^[=@\t\r]/.test(s) || (/^[+-]/.test(s) && !/^[+-][\d\s()-]*$/.test(s))) s = "'" + s;
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+async function exportCsv(button, filters) {
+  button.disabled = true;
+  try {
+    const rows = await rpc('export_customers', filters);
+    const header = ['ID', 'Name', 'Type', 'Status', 'TRN', 'Email', 'Phone', 'Address', 'City', 'Country',
+      'Source', 'Services', 'Owner', 'Created'];
+    const keys = ['id', 'name', 'kind', 'status', 'trn', 'email', 'phone', 'address', 'city', 'country',
+      'source', 'services', 'owner', 'created_at'];
+    const csv = [header, ...rows.map(r => keys.map(k => r[k]))].map(r => r.map(csvCell).join(',')).join('\r\n');
+    const url = URL.createObjectURL(new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8' }));
+    const a = h('a', { href: url, download: `customers-${new Date().toISOString().slice(0, 10)}.csv` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 // ---------- customer form ----------
@@ -410,7 +531,7 @@ async function viewCustomerNew() {
   return layout('customers',
     pageHead('New customer', null, null, h('a', { href: '#/customers' }, '← Customers')),
     h('section', { class: 'card' }, customerForm({}, async data => {
-      const { id } = await api('POST', '/api/customers', data);
+      const id = await rpc('save_customer', { p_id: null, p_data: data });
       toast('Customer created');
       location.hash = `#/customers/${id}`;
     })));
@@ -418,11 +539,11 @@ async function viewCustomerNew() {
 
 async function viewCustomerEdit(id) {
   await loadUsers();
-  const { customer: c } = await api('GET', `/api/customers/${id}`);
+  const { customer: c } = await rpc('get_customer', { p_id: id });
   return layout('customers',
     pageHead(`Edit ${c.name}`, null, null, h('a', { href: `#/customers/${id}` }, `← ${c.name}`)),
     h('section', { class: 'card' }, customerForm(c, async data => {
-      await api('PUT', `/api/customers/${id}`, data);
+      await rpc('save_customer', { p_id: id, p_data: data });
       toast('Changes saved');
       location.hash = `#/customers/${id}`;
     })));
@@ -443,8 +564,7 @@ function contactDialog(customerId, contact, refresh) {
       h('button', { class: 'btn btn-primary', type: 'submit' }, contact ? 'Save' : 'Add contact'),
       h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
   async data => {
-    if (contact) await api('PUT', `/api/contacts/${contact.id}`, data);
-    else await api('POST', `/api/customers/${customerId}/contacts`, data);
+    await rpc('save_contact', { p_customer_id: customerId, p_id: contact ? contact.id : null, p_data: data });
     dlg.close();
     toast(contact ? 'Contact saved' : 'Contact added');
     refresh();
@@ -452,7 +572,7 @@ function contactDialog(customerId, contact, refresh) {
 }
 
 async function viewCustomer(id) {
-  const { customer: c, today } = await api('GET', `/api/customers/${id}`);
+  const { customer: c, today } = await rpc('get_customer', { p_id: id });
   const refresh = () => render();
   const isAdmin = state.user.role === 'admin';
 
@@ -487,7 +607,7 @@ async function viewCustomer(id) {
               class: 'btn btn-danger btn-sm', 'aria-label': `Remove ${k.name}`,
               onclick: async () => {
                 if (!confirmAction(`Remove ${k.name} from contacts?`)) return;
-                await api('DELETE', `/api/contacts/${k.id}`).catch(e => toast(e.message, true));
+                await rpc('delete_contact', { p_id: k.id }).catch(e => toast(e.message, true));
                 refresh();
               },
             }, 'Remove')))))
@@ -514,7 +634,7 @@ async function viewCustomer(id) {
     dueField,
     h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save entry'))),
   async data => {
-    await api('POST', `/api/customers/${id}/activities`, { ...data, kind });
+    await rpc('add_activity', { p_customer_id: id, p_data: { ...data, kind } });
     toast(`${KIND_LABEL[kind]} saved`);
     refresh();
   });
@@ -533,7 +653,7 @@ async function viewCustomer(id) {
         a.kind === 'follow_up' && h('button', {
           class: 'btn btn-secondary btn-sm',
           onclick: async () => {
-            await api('PATCH', `/api/activities/${a.id}`, { done: !a.done }).catch(e => toast(e.message, true));
+            await rpc('set_follow_up_done', { p_id: a.id, p_done: !a.done }).catch(e => toast(e.message, true));
             refresh();
           },
         }, a.done ? 'Reopen' : 'Mark done'),
@@ -541,7 +661,7 @@ async function viewCustomer(id) {
           class: 'btn btn-danger btn-sm', 'aria-label': 'Delete entry',
           onclick: async () => {
             if (!confirmAction('Delete this entry?')) return;
-            await api('DELETE', `/api/activities/${a.id}`).catch(e => toast(e.message, true));
+            await rpc('delete_activity', { p_id: a.id }).catch(e => toast(e.message, true));
             refresh();
           },
         }, 'Delete')));
@@ -561,7 +681,7 @@ async function viewCustomer(id) {
         onclick: async () => {
           if (!confirmAction(`Delete ${c.name}? This also deletes its contacts and activity, and cannot be undone.`)) return;
           try {
-            await api('DELETE', `/api/customers/${id}`);
+            await rpc('delete_customer', { p_id: id });
             toast('Customer deleted');
             location.hash = '#/customers';
           } catch (e) { toast(e.message, true); }
@@ -580,34 +700,25 @@ async function viewCustomer(id) {
 
 // ---------- users (admin) ----------
 
-function userDialog(user, refresh) {
-  const u = user || {};
-  const fields = user
-    ? [
-        field('Name', input('name', u.name, { required: true })),
-        field('Role', select('role', u.role, [['staff', 'Staff'], ['admin', 'Administrator']])),
-        h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: !!u.active }), 'Account active (can sign in)'),
-        field('New password', input('password', '', { type: 'password', autocomplete: 'new-password' }),
-          { hint: 'Leave blank to keep the current password. Changing it signs the user out everywhere.' }),
-      ]
-    : [
-        field('Name', input('name', '', { required: true })),
-        field('Email', input('email', '', { type: 'email', required: true })),
-        field('Role', select('role', 'staff', [['staff', 'Staff'], ['admin', 'Administrator']]),
-          { hint: 'Administrators can manage users and delete customers.' }),
-        field('Temporary password', input('password', '', { type: 'password', required: true, autocomplete: 'new-password', minlength: 10 }),
-          { hint: 'At least 10 characters. Ask them to change it under Account.' }),
-      ];
-  const dlg = openDialog(user ? `Edit ${u.name}` : 'Add user', handleForm(h('form', { class: 'form' },
-    ...fields,
+function userDialog(u, refresh) {
+  const isSelf = u.id === state.user.id;
+  const dlg = openDialog(`Edit ${u.name}`, handleForm(h('form', { class: 'form' },
+    h('p', { class: 'muted' }, u.email),
+    field('Name', input('name', u.name, { required: true, maxlength: 100 })),
+    field('Role', select('role', u.role, [['staff', 'Staff'], ['admin', 'Administrator']], { disabled: isSelf }),
+      { hint: 'Administrators can manage users and delete customers.' }),
+    h('label', { class: 'check' },
+      h('input', { type: 'checkbox', name: 'active', checked: !!u.active, disabled: isSelf }), 'Has access to the ERP'),
+    isSelf && h('p', { class: 'muted' }, 'You can\'t remove your own admin access or turn off your own account.'),
     h('div', { class: 'btn-row' },
-      h('button', { class: 'btn btn-primary', type: 'submit' }, user ? 'Save' : 'Add user'),
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
       h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
   async data => {
-    if (user) await api('PUT', `/api/users/${u.id}`, data);
-    else await api('POST', '/api/users', data);
+    await rpc('admin_update_user', {
+      p_id: u.id, p_name: data.name, p_role: isSelf ? u.role : data.role, p_active: isSelf ? true : data.active,
+    });
     dlg.close();
-    toast(user ? 'User saved' : 'User added');
+    toast('User saved');
     refresh();
   }));
 }
@@ -616,35 +727,59 @@ async function viewUsers() {
   if (state.user.role !== 'admin') return viewNotFound();
   await loadUsers();
   const refresh = () => render();
+  const giveAccess = async u => {
+    try {
+      await rpc('admin_update_user', { p_id: u.id, p_name: u.name, p_role: u.role, p_active: true });
+      toast(`${u.name} now has access`);
+      refresh();
+    } catch (e) { toast(e.message, true); }
+  };
+  const waiting = state.users.filter(u => !u.active).length;
   return layout('users',
-    pageHead('Users', 'Staff who can sign in to the ERP.',
-      h('button', { class: 'btn btn-primary', onclick: () => userDialog(null, refresh) }, '+ Add user')),
+    pageHead('Users', 'Staff create their own account on the sign-in page ("Create an account"). Then give them access here.'),
+    waiting > 0 && h('p', { class: 'notice' }, `${waiting} account${waiting > 1 ? 's' : ''} without access. Only give access to people you recognise.`),
     h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Email'), h('th', {}, 'Role'), h('th', {}, 'Status'), h('th', {}, ''))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Email'), h('th', {}, 'Role'), h('th', {}, 'Access'), h('th', {}, ''))),
       h('tbody', {}, state.users.map(u => h('tr', {},
         h('td', {}, h('strong', {}, u.name), u.id === state.user.id && h('span', { class: 'muted' }, ' (you)')),
         h('td', {}, u.email),
         h('td', {}, u.role === 'admin' ? 'Administrator' : 'Staff'),
-        h('td', {}, u.active ? h('span', { class: 'badge badge-active' }, 'Active') : h('span', { class: 'badge badge-inactive' }, 'Deactivated')),
-        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => userDialog(u, refresh) }, 'Edit')))))))));
+        h('td', {}, u.active ? h('span', { class: 'badge badge-active' }, 'Yes') : h('span', { class: 'badge badge-lead' }, 'No access')),
+        h('td', {}, h('div', { class: 'btn-row' },
+          !u.active && h('button', { class: 'btn btn-primary btn-sm', onclick: () => giveAccess(u) }, 'Give access'),
+          h('button', { class: 'btn btn-secondary btn-sm', onclick: () => userDialog(u, refresh) }, 'Edit'))))))))));
 }
 
 // ---------- account ----------
 
 function viewAccount() {
-  const form = handleForm(h('form', { class: 'form narrow' },
+  const nameForm = handleForm(h('form', { class: 'form narrow' },
+    field('Name', input('name', state.user.name, { required: true, maxlength: 100 })),
+    h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save name'))),
+  async data => {
+    await rpc('update_my_name', { p_name: data.name });
+    state.user.name = data.name.trim();
+    toast('Name saved');
+    render();
+  });
+  const pwForm = handleForm(h('form', { class: 'form narrow' },
     field('Current password', input('current', '', { type: 'password', required: true, autocomplete: 'current-password' })),
-    field('New password', input('password', '', { type: 'password', required: true, autocomplete: 'new-password', minlength: 10 }),
-      { hint: 'At least 10 characters.' }),
+    field('New password', input('password', '', { type: 'password', required: true, autocomplete: 'new-password', minlength: MIN_PASSWORD }),
+      { hint: `At least ${MIN_PASSWORD} characters.` }),
     h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Change password'))),
   async data => {
-    await api('PUT', '/api/me/password', data);
-    form.reset();
+    checkNewPassword(data.password);
+    const check = await sb.auth.signInWithPassword({ email: state.user.email, password: data.current });
+    if (check.error) throw new ApiError('invalid_credentials', 'Current password is wrong', { current: 'Current password is wrong' });
+    const { error } = await sb.auth.updateUser({ password: data.password });
+    if (error) throw authError(error);
+    pwForm.reset();
     toast('Password changed');
   });
   return layout(null,
-    pageHead('Account', `${state.user.name} · ${state.user.email}`),
-    h('section', { class: 'card' }, h('h2', {}, 'Change password'), form));
+    pageHead('Account', state.user.email),
+    h('section', { class: 'card' }, h('h2', {}, 'Your name'), nameForm),
+    h('section', { class: 'card' }, h('h2', {}, 'Change password'), pwForm));
 }
 
 function viewComingSoon() {
@@ -671,19 +806,25 @@ async function render() {
   const params = Object.fromEntries(new URLSearchParams(queryPart));
 
   try {
-    if (!state.user) {
-      try { state.user = (await api('GET', '/api/me')).user; } catch { /* not signed in */ }
-    }
     let view;
-    if (!state.user) {
-      const { needsSetup } = await api('GET', '/api/setup');
-      view = needsSetup ? viewSetup() : viewLogin();
-      if (needsSetup && path !== '/setup') history.replaceState(null, '', '#/setup');
-      else if (!needsSetup && path !== '/login') history.replaceState(null, '', '#/login');
+    if (!sb) {
+      view = viewNotConfigured();
     } else {
+      if (!state.user) {
+        const { data } = await sb.auth.getSession();  // also finishes any sign-in link in the URL
+        // Remove ?code=... left by a confirmation or reset link now that Supabase has used it.
+        if (location.search) history.replaceState(null, '', location.pathname + location.hash);
+        state.user = data.session ? await rpc('me') : null;
+      }
+      const publicPages = { '/login': viewLogin, '/signup': viewSignup, '/forgot': viewForgot };
       let m;
-      if (path === '/login' || path === '/setup') { location.hash = '#/'; return; }
-      if (path === '/') view = await viewDashboard();
+      if (state.recovering && state.user) view = viewResetPassword();
+      else if (!state.user) {
+        view = (publicPages[path] || viewLogin)();
+        if (!publicPages[path]) history.replaceState(null, '', '#/login');
+      } else if (!state.user.active) view = viewPending();
+      else if (publicPages[path]) { location.hash = '#/'; return; }
+      else if (path === '/') view = await viewDashboard();
       else if (path === '/customers') view = await viewCustomers(params);
       else if (path === '/customers/new') view = await viewCustomerNew();
       else if ((m = path.match(/^\/customers\/(\d+)$/))) view = await viewCustomer(Number(m[1]));
@@ -703,8 +844,8 @@ async function render() {
       if (q && caret != null) q.setSelectionRange(caret, caret);
     }
   } catch (err) {
-    if (seq !== renderSeq || err.status === 401) return;
-    if (err.status === 404 && state.user) {
+    if (seq !== renderSeq || err.code === '28000') return;
+    if (err.code === 'P0002' && state.user) {
       app.replaceChildren(layout(null, pageHead('Not found', err.message),
         h('section', { class: 'card' }, h('a', { href: '#/customers' }, 'Back to customers'))));
       return;
@@ -717,4 +858,16 @@ async function render() {
 }
 
 window.addEventListener('hashchange', render);
+if (sb) {
+  sb.auth.onAuthStateChange(event => {
+    if (event === 'PASSWORD_RECOVERY') {
+      // Opened a password-reset link: ask for a new password before anything else.
+      state.recovering = true;
+      state.user = null;
+      setTimeout(render);
+    } else if (event === 'SIGNED_OUT') {
+      state.user = null;
+    }
+  });
+}
 render();

@@ -2,7 +2,7 @@
 
 Website for **Lowcaps**, a logistics company in Khor Fakkan, UAE, providing shipping, clearing and customs services. Built with plain HTML, CSS and JavaScript (no build step).
 
-The `erp/` folder holds **Lowcaps ERP**, the internal system for staff (customers/CRM to start with). It runs separately from the website and needs a Node.js server. See [`erp/README.md`](erp/README.md).
+The `erp/` folder holds **Lowcaps ERP**, the internal system for staff (customers/CRM to start with). It runs on Supabase (free) and is published by GitHub Pages together with the website, at `<site address>/erp/`. Setup: [`erp/SUPABASE-SETUP.md`](erp/SUPABASE-SETUP.md).
 
 ## Still to fill in
 

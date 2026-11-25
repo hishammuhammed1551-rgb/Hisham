@@ -238,3 +238,6 @@ dialog::backdrop { background: rgba(10, 20, 14, 0.45); }
 .form.narrow { max-width: 420px; }
 .grid > .card + .card { margin-top: 0; }
 .topbar svg { width: 20px; height: 20px; display: block; }
+.auth-links { margin: 1rem 0 0; font-size: 0.875rem; color: var(--color-muted); }
+.auth ol { padding-left: 1.2rem; margin: 0 0 1rem; }
+.notice { background: color-mix(in srgb, var(--color-warning) 12%, var(--color-bg)); border: 1px solid color-mix(in srgb, var(--color-warning) 35%, transparent); border-radius: var(--radius); padding: 0.6rem 0.9rem; font-size: 0.875rem; margin: 0 0 1rem; }
