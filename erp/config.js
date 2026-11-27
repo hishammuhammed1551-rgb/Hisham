@@ -3,7 +3,7 @@
 // Find them in Supabase: Project Settings → API (Project URL, and the "anon" / "publishable" key).
 // NEVER put the "service_role" / "secret" key here.
 window.LOWCAPS_CONFIG = {
-  supabaseUrl: 'https://YOUR-PROJECT.supabase.co',
-  supabaseKey: 'YOUR-ANON-KEY',
+  supabaseUrl: 'https://uhtoxhvyqeldrhiigvjh.supabase.co',
+  supabaseKey: 'sb_publishable_M5s-eGIczpyrZ8QR7zUniA__fxs-QeX',
   minPasswordLength: 10, // keep in step with Authentication → Password security in Supabase
 };
