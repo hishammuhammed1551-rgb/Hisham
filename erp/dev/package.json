@@ -1,0 +1,13 @@
+{
+  "name": "lowcaps-erp-dev",
+  "private": true,
+  "description": "Local test harness for Lowcaps ERP: real PostgreSQL plus a small stand-in for Supabase's auth and RPC endpoints.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "2.118.0",
+    "pg": "8.16.3"
+  }
+}
