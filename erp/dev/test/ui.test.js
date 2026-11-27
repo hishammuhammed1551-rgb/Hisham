@@ -176,3 +176,87 @@ test('shows setup instructions when config.js has not been filled in', { skip: !
   await page.waitForSelector('text=Connect the ERP to Supabase');
   assert.deepEqual(errors, []);
 });
+
+async function signIn(page, email) {
+  await page.goto(base + '#/login');
+  await page.waitForSelector('h1:text("Sign in")');
+  await page.fill('[name=email]', email);
+  await page.fill('[name=password]', 'demo-password-123');
+  await page.click('button[type=submit]');
+  await page.waitForSelector('text=Hello,');
+}
+
+test('tasks: a manager assigns work, the team member updates it', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  const staff = await newPage(errors);
+  await signIn(admin, 'admin@lowcaps.test');
+  await signIn(staff, 'sami@lowcaps.test');
+
+  // Team members don't see the manager-only menu or buttons
+  assert.equal(await staff.isVisible('a:text("Types of work")'), false);
+  await staff.goto(base + '#/tasks');
+  await staff.waitForSelector('h1:text("Tasks")');
+  assert.equal(await staff.isVisible('text=+ New task'), false);
+
+  // Manager-only: add a type of work
+  await admin.goto(base + '#/work-types');
+  await admin.fill('[name=name]', 'Warehousing');
+  await admin.click('button:text("Add")');
+  await admin.waitForSelector('a.row-link:text("Warehousing")');
+
+  // Create a task from the customer page, assigned to Sami
+  await admin.goto(base + '#/customers');
+  await admin.click('a.row-link:text("Gulf Traders LLC")');
+  await admin.click('a:text("+ New task")');
+  await admin.waitForSelector('h1:text("New task")');
+  assert.equal(await admin.$eval('[name=customer_id]', el => el.selectedOptions[0].textContent), 'Gulf Traders LLC');
+  await admin.fill('[name=title]', 'Clear container MSKU1234567');
+  await admin.selectOption('[name=work_type_id]', { label: 'Customs clearance' });
+  await admin.selectOption('[name=assigned_to]', { label: 'Sami Staff' });
+  await admin.fill('[name=due_date]', '2020-01-15');
+  await admin.selectOption('[name=priority]', 'urgent');
+  await admin.fill('[name=description]', 'BL no. MEDU123456. Customer sends invoice + packing list.');
+  await admin.click('button:text("Create task")');
+  await admin.waitForSelector('text=Assigned to Sami Staff');
+  assert.ok(await admin.isVisible('text=Overdue · 15 Jan 2020'));
+
+  // Sami sees it on the dashboard and moves it along
+  await staff.goto(base + '#/');
+  await staff.click('.list a.row-link:text("Clear container MSKU1234567")');
+  await staff.waitForSelector('h2:text("Status")');
+  assert.equal(await staff.isVisible('a:text("Edit")'), false, 'team members cannot edit the task itself');
+  await staff.selectOption('[name=status]', 'waiting');
+  await staff.fill('[name=note]', 'Waiting for the packing list');
+  await staff.click('button:text("Update status")');
+  await staff.waitForSelector('strong:text("New → Waiting")');
+  await staff.fill('[name=body]', 'Customer says it arrives tomorrow');
+  await staff.click('button:text("Post comment")');
+  await staff.waitForSelector('.list .body:text("Customer says it arrives tomorrow")');
+  if (SHOTS) await staff.screenshot({ path: `${SHOTS}/task.png`, fullPage: true });
+
+  // Manager sees it in the task list, filtered
+  await admin.goto(base + '#/tasks?assignee=me');
+  await admin.waitForSelector('text=No tasks match these filters.');
+  await admin.goto(base + '#/tasks');
+  await admin.waitForSelector('a.row-link:text("Clear container MSKU1234567")');
+  assert.ok(await admin.isVisible('td .badge:text("Waiting")'));
+  assert.ok(await admin.isVisible('td .badge:text("Urgent")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/tasks.png` });
+
+  // Promote Sami to manager: the manager tools appear for him
+  await admin.goto(base + '#/users');
+  await admin.click('tr:has-text("Sami Staff") button:text("Edit")');
+  await admin.selectOption('dialog [name=role]', 'manager');
+  await admin.click('dialog button[type=submit]');
+  await admin.waitForSelector('td:text("Manager")');
+  await staff.goto(base + '#/');
+  await staff.reload();
+  await staff.waitForSelector('a:text("Types of work")');
+  if (SHOTS) {
+    await admin.goto(base + '#/');
+    await admin.waitForSelector('h2:text("My tasks")');
+    await admin.screenshot({ path: `${SHOTS}/dashboard-tasks.png` });
+  }
+  assert.deepEqual(errors, []);
+});

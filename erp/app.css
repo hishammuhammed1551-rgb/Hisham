@@ -241,3 +241,18 @@ dialog::backdrop { background: rgba(10, 20, 14, 0.45); }
 .auth-links { margin: 1rem 0 0; font-size: 0.875rem; color: var(--color-muted); }
 .auth ol { padding-left: 1.2rem; margin: 0 0 1rem; }
 .notice { background: color-mix(in srgb, var(--color-warning) 12%, var(--color-bg)); border: 1px solid color-mix(in srgb, var(--color-warning) 35%, transparent); border-radius: var(--radius); padding: 0.6rem 0.9rem; font-size: 0.875rem; margin: 0 0 1rem; }
+
+/* tasks */
+.badge-stack { display: flex; flex-direction: column; align-items: flex-end; gap: 0.3rem; }
+.task-new { border-color: var(--color-border); color: var(--color-text); }
+.task-in_progress { background: color-mix(in srgb, var(--color-primary) 16%, transparent); color: var(--color-primary-dark); }
+.task-waiting { background: color-mix(in srgb, var(--color-warning) 14%, transparent); color: var(--color-warning); }
+.task-done { background: color-mix(in srgb, var(--color-success) 14%, transparent); color: var(--color-success); }
+.task-cancelled { background: var(--color-surface-alt); color: var(--color-muted); text-decoration: line-through; }
+.prio-high { background: color-mix(in srgb, var(--color-warning) 14%, transparent); color: var(--color-warning); }
+.prio-urgent { background: color-mix(in srgb, var(--color-error) 12%, transparent); color: var(--color-error); }
+.notice-inline { margin: 0.75rem 0 0; }
+.inline-form { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; }
+.inline-form .field { flex: 1 1 260px; }
+.list a.row-link { font-weight: 600; text-decoration: none; color: var(--color-text); }
+.list a.row-link:hover { color: var(--color-primary); text-decoration: underline; }

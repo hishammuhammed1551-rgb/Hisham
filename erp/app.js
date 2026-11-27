@@ -46,6 +46,8 @@ const ICONS = {
   email: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
   follow_up: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   menu: '<path d="M3 6h18M3 12h18M3 18h18"/>',
+  task: '<path d="m9 11 3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
+  tag: '<path d="M3 12V3h9l9 9-9 9z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
 };
 const icon = name => h('span', {
   class: 'icon',
@@ -57,6 +59,23 @@ const STATUS_LABEL = { lead: 'Lead', active: 'Active', inactive: 'Inactive' };
 const SERVICES = ['Shipping', 'Clearing', 'Customs'];
 
 const statusBadge = s => h('span', { class: `badge badge-${s}` }, STATUS_LABEL[s] || s);
+
+const ROLE_LABEL = { admin: 'Administrator', manager: 'Manager', staff: 'Team member' };
+const ROLE_OPTIONS = [['staff', 'Team member'], ['manager', 'Manager'], ['admin', 'Administrator']];
+const TASK_STATUS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', done: 'Done', cancelled: 'Cancelled' };
+const PRIORITY = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
+const UPDATE_ICON = { created: 'note', comment: 'note', status: 'task', assigned: 'users' };
+const isManager = () => ['admin', 'manager'].includes(state.user?.role);
+const isOpenTask = status => ['new', 'in_progress', 'waiting'].includes(status);
+const taskStatusBadge = st => h('span', { class: `badge task-${st}` }, TASK_STATUS[st] || st);
+const priorityBadge = pr => (pr === 'high' || pr === 'urgent'
+  ? h('span', { class: `badge prio-${pr}` }, PRIORITY[pr])
+  : h('span', { class: 'muted' }, PRIORITY[pr] || pr));
+function dueBadge(due, status, today) {
+  if (!due) return h('span', { class: 'muted' }, 'No due date');
+  const overdue = isOpenTask(status) && due < today;
+  return h('span', { class: `badge ${overdue ? 'badge-overdue' : 'badge-plain'}` }, `${overdue ? 'Overdue · ' : 'Due '}${fmtDate(due)}`);
+}
 
 function fmtDate(value, withTime = false) {
   if (!value) return '';
@@ -202,15 +221,16 @@ function layout(active, ...content) {
       h('nav', { class: 'nav', 'aria-label': 'Main' },
         link('#/', 'home', 'Dashboard', 'dashboard'),
         link('#/customers', 'users', 'Customers', 'customers'),
+        link('#/tasks', 'task', 'Tasks', 'tasks'),
         h('div', { class: 'nav-heading' }, 'Next modules'),
-        soon('box', 'Shipments & jobs'),
         soon('invoice', 'Quotes & invoices'),
         soon('chart', 'Expenses & reports'),
-        isAdmin && h('div', { class: 'nav-heading' }, 'Admin'),
+        isManager() && h('div', { class: 'nav-heading' }, 'Manage'),
+        isManager() && link('#/work-types', 'tag', 'Types of work', 'work-types'),
         isAdmin && link('#/users', 'key', 'Users', 'users')),
       h('div', { class: 'sidebar-user' },
         h('strong', {}, state.user.name),
-        h('span', { class: 'muted' }, state.user.role === 'admin' ? 'Administrator' : 'Staff'),
+        h('span', { class: 'muted' }, ROLE_LABEL[state.user.role] || state.user.role),
         h('div', { class: 'row' },
           h('a', { href: '#/account' }, 'Account'),
           h('button', { onclick: logout }, 'Sign out')))),
@@ -356,15 +376,32 @@ async function viewDashboard() {
     : h('p', { class: 'empty' }, overdue ? 'Nothing overdue.' : 'Nothing due in the next 7 days.');
 
   return layout('dashboard',
-    pageHead(`Hello, ${state.user.name.split(' ')[0]}`, `Here's where your customers stand today, ${fmtDate(d.today)}.`,
-      h('a', { class: 'btn btn-primary', href: '#/customers/new' }, '+ New customer')),
+    pageHead(`Hello, ${state.user.name.split(' ')[0]}`, `Here's where things stand today, ${fmtDate(d.today)}.`, [
+      isManager() && h('a', { class: 'btn btn-secondary', href: '#/tasks/new' }, '+ New task'),
+      h('a', { class: 'btn btn-primary', href: '#/customers/new' }, '+ New customer'),
+    ]),
     h('div', { class: 'grid stats' },
       stat('Active customers', d.counts.active, '#/customers?status=active'),
       stat('Open leads', d.counts.lead, '#/customers?status=lead'),
-      stat('Assigned to me', d.myCustomers, '#/customers?owner=me'),
-      stat('Added this month', d.newThisMonth, '#/customers?sort=newest')),
+      stat('My open tasks', d.myOpenTasks, '#/tasks?assignee=me'),
+      isManager()
+        ? stat('Overdue tasks (team)', d.overdueTasks, '#/tasks')
+        : stat('Customers I own', d.myCustomers, '#/customers?owner=me')),
     h('div', { class: 'grid two-col' },
       h('div', {},
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'My tasks'),
+            h('a', { class: 'btn btn-secondary btn-sm', href: '#/tasks?assignee=me' }, 'See all')),
+          d.myTasks.length
+            ? h('ul', { class: 'list' }, d.myTasks.map(t => h('li', {},
+                h('span', { class: 'kind-icon' }, icon('task')),
+                h('div', { class: 'grow' },
+                  h('a', { class: 'row-link', href: `#/tasks/${t.id}` }, t.title),
+                  h('div', { class: 'meta' }, [t.customer_name, t.work_type, TASK_STATUS[t.status]].filter(Boolean).join(' · '))),
+                dueBadge(t.due_date, t.status, d.today))))
+            : h('p', { class: 'empty' }, 'No open tasks assigned to you.'),
+          isManager() && d.unassignedTasks > 0 && h('p', { class: 'notice notice-inline' },
+            h('a', { href: '#/tasks?assignee=none' }, `${d.unassignedTasks} open task${d.unassignedTasks > 1 ? 's have' : ' has'} no one assigned`))),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', {}, 'Overdue follow-ups'),
             d.overdue.length > 0 && h('span', { class: 'badge badge-overdue' }, d.overdue.length)),
@@ -613,6 +650,17 @@ async function viewCustomer(id) {
             }, 'Remove')))))
       : h('p', { class: 'empty' }, 'No contacts yet.'));
 
+  const tasksCard = h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', {}, 'Tasks'),
+      isManager() && h('a', { class: 'btn btn-secondary btn-sm', href: `#/tasks/new?customer=${id}` }, '+ New task')),
+    c.tasks.length
+      ? h('ul', { class: 'list' }, c.tasks.map(t => h('li', {},
+          h('div', { class: 'grow' },
+            h('a', { class: 'row-link', href: `#/tasks/${t.id}` }, t.title),
+            h('div', { class: 'meta' }, `${t.work_type || 'No type of work'} · ${t.assignee_name || 'Unassigned'}`)),
+          h('div', { class: 'badge-stack' }, taskStatusBadge(t.status), isOpenTask(t.status) && t.due_date && dueBadge(t.due_date, t.status, today)))))
+      : h('p', { class: 'empty' }, 'No tasks for this customer yet.'));
+
   // Activity: log form + timeline with filter tabs
   let kind = 'note';
   const due = input('due_at', '', { type: 'date', min: today });
@@ -676,10 +724,10 @@ async function viewCustomer(id) {
   return layout('customers',
     pageHead(c.name, null, [
       h('a', { class: 'btn btn-secondary', href: `#/customers/${id}/edit` }, 'Edit'),
-      isAdmin && h('button', {
+      isManager() && h('button', {
         class: 'btn btn-danger',
         onclick: async () => {
-          if (!confirmAction(`Delete ${c.name}? This also deletes its contacts and activity, and cannot be undone.`)) return;
+          if (!confirmAction(`Delete ${c.name}? This also deletes its contacts and activity log (its tasks are kept). It cannot be undone.`)) return;
           try {
             await rpc('delete_customer', { p_id: id });
             toast('Customer deleted');
@@ -694,8 +742,253 @@ async function viewCustomer(id) {
           h('div', { class: 'card-head' }, h('h2', {}, 'Details')),
           h('dl', { class: 'facts' }, facts.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
           c.notes && [h('h3', { class: 'notes-heading' }, 'Notes'), h('p', { class: 'prewrap' }, c.notes)]),
-        contacts),
+        contacts,
+        tasksCard),
       activity));
+}
+
+// ---------- tasks ----------
+
+async function viewTasks(params) {
+  const query = new URLSearchParams(params);
+  const [workTypes] = await Promise.all([rpc('list_work_types'), loadUsers()]);
+  const status = query.get('status') || 'open';
+  const data = await rpc('list_tasks', {
+    p_q: query.get('q') || null, p_status: status, p_assignee: query.get('assignee') || null,
+    p_work_type: Number(query.get('type')) || null, p_page: Number(query.get('page')) || 1,
+  });
+
+  const setParam = (key, value) => {
+    const q = new URLSearchParams(params);
+    if (value) q.set(key, value); else q.delete(key);
+    if (key !== 'page') q.delete('page');
+    location.hash = '#/tasks' + (q.toString() ? '?' + q : '');
+  };
+  let searchTimer;
+  const filterBar = h('div', { class: 'filters' },
+    input('q', query.get('q'), {
+      type: 'search', placeholder: 'Search task or customer…', 'aria-label': 'Search tasks',
+      oninput: e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => setParam('q', e.target.value.trim()), 350); },
+    }),
+    select('status', status, [['open', 'Open tasks'], ['all', 'All tasks'], ...Object.entries(TASK_STATUS)],
+      { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value === 'open' ? '' : e.target.value) }),
+    select('assignee', query.get('assignee'), [['', 'Anyone'], ['me', 'Assigned to me'], ['none', 'Unassigned'],
+      ...state.users.filter(u => u.active).map(u => [u.id, u.name])],
+      { 'aria-label': 'Assigned to', onchange: e => setParam('assignee', e.target.value) }),
+    select('type', query.get('type'), [['', 'All types of work'], ...workTypes.map(w => [String(w.id), w.name])],
+      { 'aria-label': 'Type of work', onchange: e => setParam('type', e.target.value) }));
+
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  const from = data.total ? (data.page - 1) * data.pageSize + 1 : 0;
+  const to = Math.min(data.page * data.pageSize, data.total);
+  const filtered = ['q', 'assignee', 'type'].some(k => query.get(k)) || status !== 'open';
+
+  const table = data.tasks.length
+    ? h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {},
+          h('th', {}, 'Task'), h('th', { class: 'hide-sm' }, 'Type of work'), h('th', {}, 'Assigned to'),
+          h('th', {}, 'Due'), h('th', { class: 'hide-sm' }, 'Priority'), h('th', {}, 'Status'))),
+        h('tbody', {}, data.tasks.map(t => h('tr', {},
+          h('td', {},
+            h('a', { class: 'row-link', href: `#/tasks/${t.id}` }, t.title),
+            t.customer_name && h('div', { class: 'meta muted' }, t.customer_name)),
+          h('td', { class: 'hide-sm' }, t.work_type || h('span', { class: 'muted' }, '—')),
+          h('td', {}, t.assignee_name || h('span', { class: 'muted' }, 'Unassigned')),
+          h('td', {}, t.due_date ? dueBadge(t.due_date, t.status, data.today) : h('span', { class: 'muted' }, '—')),
+          h('td', { class: 'hide-sm' }, priorityBadge(t.priority)),
+          h('td', {}, taskStatusBadge(t.status)))))))
+    : h('p', { class: 'empty' }, filtered ? 'No tasks match these filters.'
+        : isManager() ? 'No open tasks. Create one with "+ New task".' : 'No open tasks.');
+
+  return layout('tasks',
+    pageHead('Tasks', `${data.total} ${status === 'open' ? 'open ' : ''}task${data.total === 1 ? '' : 's'}`,
+      isManager() && h('a', { class: 'btn btn-primary', href: '#/tasks/new' }, '+ New task')),
+    h('section', { class: 'card' },
+      filterBar,
+      table,
+      data.total > data.pageSize && h('div', { class: 'pager' },
+        h('span', { class: 'muted' }, `Showing ${from}–${to} of ${data.total}`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
+async function loadTaskOptions() {
+  const [customers, workTypes] = await Promise.all([rpc('customer_options'), rpc('list_work_types'), loadUsers()]);
+  return { customers, workTypes };
+}
+
+function taskForm(t, opts, onSubmit, cancelHref) {
+  const people = [['', 'Unassigned'], ...state.users
+    .filter(u => u.active || u.id === t.assigned_to)
+    .map(u => [u.id, u.role === 'staff' ? u.name : `${u.name} (${ROLE_LABEL[u.role]})`])];
+  const customers = [['', 'No customer'], ...opts.customers.map(c => [String(c.id), c.name])];
+  const types = [['', '—'], ...opts.workTypes.filter(w => w.active || w.id === t.work_type_id).map(w => [String(w.id), w.name])];
+  return handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Task', input('title', t.title, { required: true, maxlength: 200, placeholder: 'e.g. Clear container MSKU1234567' }), { full: true }),
+      field('Customer', select('customer_id', t.customer_id ? String(t.customer_id) : '', customers)),
+      field('Type of work', select('work_type_id', t.work_type_id ? String(t.work_type_id) : '', types)),
+      field('Assign to', select('assigned_to', t.assigned_to || '', people)),
+      field('Due date', input('due_date', t.due_date, { type: 'date' })),
+      field('Priority', select('priority', t.priority || 'normal', Object.entries(PRIORITY))),
+      field('Status', select('status', t.status || 'new', Object.entries(TASK_STATUS))),
+      field('Description', textarea('description', t.description, { rows: 5, maxlength: 5000,
+        placeholder: 'What needs doing, documents, references (BL / AWB / container no.)…' }), { full: true })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, t.id ? 'Save changes' : 'Create task'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  onSubmit);
+}
+
+async function viewTaskNew(params) {
+  if (!isManager()) return viewNotFound();
+  const opts = await loadTaskOptions();
+  const customerId = Number(params.customer) || null;
+  return layout('tasks',
+    pageHead('New task', null, null, h('a', { href: customerId ? `#/customers/${customerId}` : '#/tasks' }, '← Back')),
+    h('section', { class: 'card' }, taskForm({ customer_id: customerId }, opts, async data => {
+      const id = await rpc('save_task', { p_id: null, p_data: data });
+      toast('Task created');
+      location.hash = `#/tasks/${id}`;
+    }, customerId ? `#/customers/${customerId}` : '#/tasks')));
+}
+
+async function viewTaskEdit(id) {
+  if (!isManager()) return viewNotFound();
+  const [{ task: t }, opts] = await Promise.all([rpc('get_task', { p_id: id }), loadTaskOptions()]);
+  return layout('tasks',
+    pageHead(`Edit task`, null, null, h('a', { href: `#/tasks/${id}` }, `← ${t.title}`)),
+    h('section', { class: 'card' }, taskForm(t, opts, async data => {
+      await rpc('save_task', { p_id: id, p_data: data });
+      toast('Changes saved');
+      location.hash = `#/tasks/${id}`;
+    }, `#/tasks/${id}`)));
+}
+
+async function viewTask(id) {
+  const { task: t, today } = await rpc('get_task', { p_id: id });
+  const refresh = () => render();
+  const canChangeStatus = isManager() || t.assigned_to === state.user.id;
+
+  const facts = [
+    ['Customer', t.customer_id ? h('a', { href: `#/customers/${t.customer_id}` }, t.customer_name) : h('span', { class: 'muted' }, 'None')],
+    ['Type of work', t.work_type || h('span', { class: 'muted' }, 'Not set')],
+    ['Assigned to', t.assignee_name || h('span', { class: 'muted' }, 'Unassigned')],
+    ['Priority', priorityBadge(t.priority)],
+    ['Due', dueBadge(t.due_date, t.status, today)],
+    ['Created', `${fmtDate(t.created_at, true)}${t.created_by_name ? ' by ' + t.created_by_name : ''}`],
+    t.completed_at && ['Completed', fmtDate(t.completed_at, true)],
+  ].filter(Boolean);
+
+  const statusCard = h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', {}, 'Status')),
+    canChangeStatus
+      ? handleForm(h('form', { class: 'form' },
+          field('Move to', select('status', t.status, Object.entries(TASK_STATUS))),
+          field('Note (optional)', textarea('note', '', { rows: 2, maxlength: 5000, placeholder: 'e.g. Waiting for the customer to send the BL' })),
+          h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Update status'))),
+        async data => {
+          if (data.status === t.status && !data.note.trim()) return;
+          if (data.status === t.status) {
+            await rpc('add_task_comment', { p_id: id, p_body: data.note });
+          } else {
+            await rpc('update_task_status', { p_id: id, p_status: data.status, p_note: data.note || null });
+          }
+          toast(data.status === t.status ? 'Note added' : `Moved to ${TASK_STATUS[data.status]}`);
+          refresh();
+        })
+      : h('p', { class: 'muted' },
+          `Only ${t.assignee_name || 'the person this task is assigned to'} or a manager can change the status. You can still add a comment.`));
+
+  const commentForm = handleForm(h('form', { class: 'form' },
+    field('Add a comment', textarea('body', '', { rows: 3, required: true, maxlength: 5000, placeholder: 'Progress, questions, document numbers…' })),
+    h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Post comment'))),
+  async data => {
+    await rpc('add_task_comment', { p_id: id, p_body: data.body });
+    toast('Comment added');
+    refresh();
+  });
+
+  const history = h('ul', { class: 'list' }, t.updates.map(u => h('li', {},
+    h('span', { class: 'kind-icon' }, icon(UPDATE_ICON[u.kind] || 'note')),
+    h('div', { class: 'grow' },
+      u.kind === 'status'
+        ? h('div', {}, h('strong', {}, `${TASK_STATUS[u.from_status] || u.from_status} → ${TASK_STATUS[u.to_status] || u.to_status}`))
+        : u.kind !== 'comment' && h('div', {}, h('strong', {}, u.body)),
+      (u.kind === 'comment' || (u.kind === 'status' && u.body)) && h('div', { class: 'body' }, u.body),
+      h('div', { class: 'meta' }, `${u.user_name || 'Unknown'} · ${fmtDate(u.created_at, true)}`)))));
+
+  return layout('tasks',
+    pageHead(t.title, null, isManager() && [
+      h('a', { class: 'btn btn-secondary', href: `#/tasks/${id}/edit` }, 'Edit'),
+      h('button', {
+        class: 'btn btn-danger',
+        onclick: async () => {
+          if (!confirmAction(`Delete the task "${t.title}"? This cannot be undone.`)) return;
+          try {
+            await rpc('delete_task', { p_id: id });
+            toast('Task deleted');
+            location.hash = '#/tasks';
+          } catch (e) { toast(e.message, true); }
+        },
+      }, 'Delete'),
+    ], [h('a', { href: '#/tasks' }, '← Tasks'), ' ', taskStatusBadge(t.status)]),
+    h('div', { class: 'grid detail-layout' },
+      h('div', {},
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Details')),
+          h('dl', { class: 'facts' }, facts.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+          t.description && [h('h3', { class: 'notes-heading' }, 'Description'), h('p', { class: 'prewrap' }, t.description)]),
+        statusCard),
+      h('section', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', {}, 'Updates')),
+        commentForm,
+        h('hr', { class: 'divider' }),
+        history)));
+}
+
+// ---------- types of work (managers) ----------
+
+function workTypeDialog(w, refresh) {
+  const dlg = openDialog(`Edit "${w.name}"`, handleForm(h('form', { class: 'form' },
+    field('Name', input('name', w.name, { required: true, maxlength: 100 })),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: w.active }),
+      'In use (switch off to hide it when creating new tasks)'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('save_work_type', { p_id: w.id, p_name: data.name, p_active: data.active });
+    dlg.close();
+    toast('Saved');
+    refresh();
+  }));
+}
+
+async function viewWorkTypes() {
+  if (!isManager()) return viewNotFound();
+  const types = await rpc('list_work_types');
+  const refresh = () => render();
+  const addForm = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'inline-form' },
+      field('New type of work', input('name', '', { required: true, maxlength: 100, placeholder: 'e.g. Warehousing' })),
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Add'))),
+  async data => {
+    await rpc('save_work_type', { p_id: null, p_name: data.name, p_active: true });
+    toast(`Added "${data.name.trim()}"`);
+    refresh();
+  });
+  return layout('work-types',
+    pageHead('Types of work', 'The choices managers pick from when creating a task.'),
+    h('section', { class: 'card' }, addForm),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Open tasks'), h('th', {}, 'Status'), h('th', {}, ''))),
+      h('tbody', {}, types.map(w => h('tr', {},
+        h('td', {}, h('a', { class: 'row-link', href: `#/tasks?type=${w.id}&status=all` }, w.name)),
+        h('td', {}, w.open_tasks),
+        h('td', {}, w.active ? h('span', { class: 'badge badge-active' }, 'In use') : h('span', { class: 'badge badge-inactive' }, 'Switched off')),
+        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => workTypeDialog(w, refresh) }, 'Edit')))))))));
 }
 
 // ---------- users (admin) ----------
@@ -705,8 +998,8 @@ function userDialog(u, refresh) {
   const dlg = openDialog(`Edit ${u.name}`, handleForm(h('form', { class: 'form' },
     h('p', { class: 'muted' }, u.email),
     field('Name', input('name', u.name, { required: true, maxlength: 100 })),
-    field('Role', select('role', u.role, [['staff', 'Staff'], ['admin', 'Administrator']], { disabled: isSelf }),
-      { hint: 'Administrators can manage users and delete customers.' }),
+    field('Role', select('role', u.role, ROLE_OPTIONS, { disabled: isSelf }),
+      { hint: 'Managers create and assign tasks and can delete customers. Administrators can also manage users.' }),
     h('label', { class: 'check' },
       h('input', { type: 'checkbox', name: 'active', checked: !!u.active, disabled: isSelf }), 'Has access to the ERP'),
     isSelf && h('p', { class: 'muted' }, 'You can\'t remove your own admin access or turn off your own account.'),
@@ -743,7 +1036,7 @@ async function viewUsers() {
       h('tbody', {}, state.users.map(u => h('tr', {},
         h('td', {}, h('strong', {}, u.name), u.id === state.user.id && h('span', { class: 'muted' }, ' (you)')),
         h('td', {}, u.email),
-        h('td', {}, u.role === 'admin' ? 'Administrator' : 'Staff'),
+        h('td', {}, ROLE_LABEL[u.role] || u.role),
         h('td', {}, u.active ? h('span', { class: 'badge badge-active' }, 'Yes') : h('span', { class: 'badge badge-lead' }, 'No access')),
         h('td', {}, h('div', { class: 'btn-row' },
           !u.active && h('button', { class: 'btn btn-primary btn-sm', onclick: () => giveAccess(u) }, 'Give access'),
@@ -786,7 +1079,7 @@ function viewComingSoon() {
   return layout(null,
     pageHead('Coming soon', null),
     h('section', { class: 'card' },
-      h('p', {}, 'Shipments & jobs, quotes & invoices, and expenses & reports are planned as the next ERP modules. They will link to the customers you add now.'),
+      h('p', {}, 'Quotes & invoices and expenses & reports are planned as the next ERP modules. They will link to the customers and tasks you add now.'),
       h('a', { class: 'btn btn-secondary', href: '#/customers' }, 'Go to customers')));
 }
 
@@ -831,6 +1124,11 @@ async function render() {
       else if ((m = path.match(/^\/customers\/(\d+)\/edit$/))) view = await viewCustomerEdit(Number(m[1]));
       else if (path === '/users') view = await viewUsers();
       else if (path === '/account') view = viewAccount();
+      else if (path === '/tasks') view = await viewTasks(params);
+      else if (path === '/tasks/new') view = await viewTaskNew(params);
+      else if ((m = path.match(/^\/tasks\/(\d+)$/))) view = await viewTask(Number(m[1]));
+      else if ((m = path.match(/^\/tasks\/(\d+)\/edit$/))) view = await viewTaskEdit(Number(m[1]));
+      else if (path === '/work-types') view = await viewWorkTypes();
       else if (path === '/coming-soon') view = viewComingSoon();
       else view = viewNotFound();
     }
@@ -847,7 +1145,7 @@ async function render() {
     if (seq !== renderSeq || err.code === '28000') return;
     if (err.code === 'P0002' && state.user) {
       app.replaceChildren(layout(null, pageHead('Not found', err.message),
-        h('section', { class: 'card' }, h('a', { href: '#/customers' }, 'Back to customers'))));
+        h('section', { class: 'card' }, h('a', { href: '#/' }, 'Back to the dashboard'))));
       return;
     }
     console.error(err);

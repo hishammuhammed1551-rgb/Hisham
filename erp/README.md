@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.2 contains the Customers (CRM) module**; shipments, invoicing and expenses are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.3 has Customers (CRM) and Tasks**; quotes/invoicing and expenses are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -8,14 +8,18 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
 
 ## What it does
 
-- **Staff accounts.** Staff create their own account; it has no access until an administrator approves it under **Users**. Admins can rename people, make them admins, or take access away (effective immediately).
+- **Accounts and roles.** People create their own account; it has no access until an administrator approves it under **Users**, where admins also set each person's role or take access away (effective immediately):
+  - **Team member:** sees everything, adds and edits leads and customers, logs activity, comments on any task, and moves the status of tasks assigned to them.
+  - **Manager:** everything a team member can do, plus creating, assigning, editing and deleting tasks, managing the **Types of work** list, and deleting customers.
+  - **Administrator:** everything, plus managing users.
+- **Tasks.** A manager creates a task (title, customer, type of work, description, due date, priority) and assigns it to someone. It moves through New → In progress → Waiting → Done (or Cancelled), with a history of comments, status changes and re-assignments. Tasks show on a Tasks page (filter by status, person, type of work), on each customer's page, and as **My tasks** on the dashboard.
 - **Customers.** Company or individual, status (lead / active / inactive), UAE TRN (checked as 15 digits), contact details, address, how they found Lowcaps, which services they want (shipping, clearing, customs), notes, and the staff member who owns the account.
 - **Contacts.** Several people per customer, one marked as the main contact.
 - **Activity log.** Notes, calls, meetings and emails on each customer, plus follow-ups with a due date that can be marked done.
 - **Dashboard.** Active customers, open leads, customers assigned to you, new this month, overdue follow-ups, follow-ups due this week, and recent activity.
 - **Search and filters** across names, email, phone, TRN, city and contact people; filter by status and owner; **export to CSV** (opens in Excel).
 
-Staff can add and edit customers. Only admins can delete a customer (which also deletes its contacts and activity) or manage users. Staff can delete only their own activity entries.
+Deleting a customer also deletes its contacts and activity log; its tasks are kept without a customer. Team members can delete only their own activity entries.
 
 ## How it's built
 

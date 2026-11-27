@@ -21,7 +21,7 @@ function run(bin, args) {
   return execFileSync(cmd, args, { stdio: 'pipe' });
 }
 
-async function startLocalDb({ port = 54329, dir } = {}) {
+async function startLocalDb({ port = 54329, dir, schemas = [SCHEMA] } = {}) {
   const dataDir = dir || fs.mkdtempSync(path.join(os.tmpdir(), 'lowcaps-pg-'));
   if (process.getuid && process.getuid() === 0) execFileSync('chown', ['-R', 'postgres:postgres', dataDir]);
 
@@ -31,7 +31,7 @@ async function startLocalDb({ port = 54329, dir } = {}) {
 
   const pool = new Pool({ host: '127.0.0.1', port, user: 'postgres', database: 'postgres', max: 5 });
   await pool.query(fs.readFileSync(EMULATION, 'utf8'));
-  await pool.query(fs.readFileSync(SCHEMA, 'utf8'));
+  for (const file of schemas) await pool.query(fs.readFileSync(file, 'utf8'));
 
   return {
     pool,

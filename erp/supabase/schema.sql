@@ -22,7 +22,7 @@ create table if not exists public.profiles (
   id         uuid primary key references auth.users (id) on delete cascade,
   name       text not null check (char_length(name) between 1 and 100),
   email      text not null,
-  role       text not null default 'staff' check (role in ('admin', 'staff')),
+  role       text not null default 'staff' check (role in ('admin', 'manager', 'staff')),
   active     boolean not null default false,   -- new sign-ups wait for an admin's approval
   created_at timestamptz not null default now()
 );
@@ -77,12 +77,67 @@ create index if not exists contacts_customer_idx   on public.contacts (customer_
 create index if not exists activities_customer_idx on public.activities (customer_id);
 create index if not exists activities_open_due_idx on public.activities (due_at) where kind = 'follow_up' and not done;
 
+-- Kinds of work a task can be (editable by managers in the ERP).
+create table if not exists public.work_types (
+  id         bigint generated always as identity primary key,
+  name       text not null check (char_length(btrim(name)) between 1 and 100),
+  active     boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists work_types_name_key on public.work_types (lower(name));
+
+-- A piece of work a manager assigns to a team member.
+create table if not exists public.tasks (
+  id           bigint generated always as identity primary key,
+  title        text not null check (char_length(btrim(title)) between 1 and 200),
+  description  text check (char_length(description) <= 5000),
+  customer_id  bigint references public.customers (id) on delete set null,
+  work_type_id bigint references public.work_types (id) on delete set null,
+  assigned_to  uuid references public.profiles (id) on delete set null,
+  priority     text not null default 'normal' check (priority in ('low', 'normal', 'high', 'urgent')),
+  status       text not null default 'new' check (status in ('new', 'in_progress', 'waiting', 'done', 'cancelled')),
+  due_date     date,
+  created_by   uuid references public.profiles (id) on delete set null,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  completed_at timestamptz
+);
+create index if not exists tasks_assigned_idx on public.tasks (assigned_to);
+create index if not exists tasks_customer_idx on public.tasks (customer_id);
+create index if not exists tasks_status_idx   on public.tasks (status);
+
+-- History of a task: comments, status changes and (re)assignments.
+create table if not exists public.task_updates (
+  id          bigint generated always as identity primary key,
+  task_id     bigint not null references public.tasks (id) on delete cascade,
+  user_id     uuid references public.profiles (id) on delete set null,
+  kind        text not null check (kind in ('created', 'comment', 'status', 'assigned')),
+  body        text check (char_length(body) <= 5000),
+  from_status text,
+  to_status   text,
+  created_at  timestamptz not null default now()
+);
+create index if not exists task_updates_task_idx on public.task_updates (task_id);
+
+-- Databases set up before managers existed: allow the new role.
+alter table public.profiles drop constraint if exists profiles_role_check;
+alter table public.profiles add constraint profiles_role_check check (role in ('admin', 'manager', 'staff'));
+
+-- Starting list of work types (only when the list is empty).
+insert into public.work_types (name)
+select x from unnest(array['Sea freight', 'Air freight', 'Land transport', 'Customs clearance', 'Documentation', 'Other']) as x
+where not exists (select 1 from public.work_types);
+
 -- Lock the tables: only the API functions below (which run as the table owner) can use them.
 alter table public.profiles   enable row level security;
 alter table public.customers  enable row level security;
 alter table public.contacts   enable row level security;
 alter table public.activities enable row level security;
-revoke all on public.profiles, public.customers, public.contacts, public.activities from public, anon, authenticated;
+alter table public.work_types   enable row level security;
+alter table public.tasks        enable row level security;
+alter table public.task_updates enable row level security;
+revoke all on public.profiles, public.customers, public.contacts, public.activities,
+              public.work_types, public.tasks, public.task_updates from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
 -- New sign-ups get a profile that has no access until an admin approves it
@@ -125,6 +180,11 @@ create trigger lowcaps_on_auth_user_email_changed
 create or replace function private.today() returns date
 language sql stable as $$ select (now() at time zone 'Asia/Dubai')::date $$;
 
+create or replace function private.priority_rank(p text) returns int
+language sql immutable as $$
+  select case p when 'urgent' then 4 when 'high' then 3 when 'normal' then 2 else 1 end
+$$;
+
 -- The caller's profile; raises unless they are signed in and approved.
 create or replace function private.current_member() returns public.profiles
 language plpgsql stable security definer set search_path = '' as $$
@@ -137,6 +197,17 @@ begin
   end if;
   if not me.active then
     raise exception 'Your account is waiting for an administrator to give it access' using errcode = '42501';
+  end if;
+  return me;
+end $$;
+
+create or replace function private.current_manager() returns public.profiles
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  if me.role not in ('admin', 'manager') then
+    raise exception 'Only managers can do this' using errcode = '42501';
   end if;
   return me;
 end $$;
@@ -154,7 +225,7 @@ end $$;
 
 -- Validate an input object against rules and return the cleaned values.
 -- Raises one error listing every bad field, as JSON in the error "detail", e.g. {"email":"Invalid email address"}.
--- rule keys: type (text|enum|bool|date|uuid), required, max, values, format (email|phone|trn), default
+-- rule keys: type (text|enum|bool|date|uuid|int), required, max, values, format (email|phone|trn), default
 create or replace function private.clean(input jsonb, rules jsonb) returns jsonb
 language plpgsql immutable as $$
 declare
@@ -209,6 +280,11 @@ begin
         errs := errs || jsonb_build_object(f, 'Use a date like 2026-01-31');
         continue;
       end if;
+    end if;
+
+    if r ->> 'type' = 'int' and v !~ '^\d{1,18}$' then
+      errs := errs || jsonb_build_object(f, 'Invalid');
+      continue;
     end if;
 
     if r ->> 'type' = 'uuid' and v !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
@@ -327,7 +403,23 @@ begin
         join public.customers c on c.id = a.customer_id
         left join public.profiles u on u.id = a.user_id
         where a.kind <> 'follow_up'
-        order by a.created_at desc, a.id desc limit 8) x), '[]')
+        order by a.created_at desc, a.id desc limit 8) x), '[]'),
+    'myTasks', coalesce((
+      select json_agg(x order by x.ord) from (
+        select t2.id, t2.title, t2.status, t2.priority, t2.due_date, t2.customer_id,
+               c.name as customer_name, w.name as work_type,
+               row_number() over (order by t2.due_date nulls last, private.priority_rank(t2.priority) desc, t2.id) as ord
+        from public.tasks t2
+        left join public.customers c on c.id = t2.customer_id
+        left join public.work_types w on w.id = t2.work_type_id
+        where t2.assigned_to = me.id and t2.status in ('new', 'in_progress', 'waiting')
+        order by ord limit 10) x), '[]'),
+    'myOpenTasks', (select count(*) from public.tasks
+                    where assigned_to = me.id and status in ('new', 'in_progress', 'waiting')),
+    'overdueTasks', (select count(*) from public.tasks
+                     where status in ('new', 'in_progress', 'waiting') and due_date < t),
+    'unassignedTasks', (select count(*) from public.tasks
+                        where status in ('new', 'in_progress', 'waiting') and assigned_to is null)
   );
 end $$;
 
@@ -400,7 +492,16 @@ begin
       'activities', coalesce((
         select jsonb_agg(to_jsonb(a) || jsonb_build_object('user_name', u.name) order by a.created_at desc, a.id desc)
         from public.activities a left join public.profiles u on u.id = a.user_id
-        where a.customer_id = c.id), '[]')))
+        where a.customer_id = c.id), '[]'),
+      'tasks', coalesce((
+        select jsonb_agg(jsonb_build_object(
+            'id', t.id, 'title', t.title, 'status', t.status, 'priority', t.priority, 'due_date', t.due_date,
+            'assigned_to', t.assigned_to, 'assignee_name', u.name, 'work_type', w.name)
+          order by t.status in ('done', 'cancelled'), t.due_date nulls last, t.id desc)
+        from public.tasks t
+        left join public.profiles u on u.id = t.assigned_to
+        left join public.work_types w on w.id = t.work_type_id
+        where t.customer_id = c.id), '[]')))
   into result
   from public.customers c
   left join public.profiles o  on o.id = c.owner_id
@@ -466,7 +567,7 @@ end $$;
 create or replace function public.delete_customer(p_id bigint) returns void
 language plpgsql security definer set search_path = '' as $$
 declare
-  me public.profiles := private.current_admin();
+  me public.profiles := private.current_manager();
 begin
   delete from public.customers where id = p_id;
   if not found then
@@ -587,7 +688,7 @@ begin
   delete from public.activities where id = p_id;
 end $$;
 
--- Staff see colleagues' names (for picking an owner); admins also see emails, roles and who is waiting.
+-- Everyone sees colleagues' names and roles (for picking an owner or assignee); admins also see emails and who is waiting.
 create or replace function public.list_users() returns json
 language plpgsql stable security definer set search_path = '' as $$
 declare
@@ -598,7 +699,7 @@ begin
         'id', id, 'name', name, 'email', email, 'role', role, 'active', active, 'created_at', created_at)
         order by active, lower(name)) from public.profiles), '[]');
   end if;
-  return coalesce((select json_agg(json_build_object('id', id, 'name', name, 'active', active)
+  return coalesce((select json_agg(json_build_object('id', id, 'name', name, 'role', role, 'active', active)
       order by lower(name)) from public.profiles where active), '[]');
 end $$;
 
@@ -609,7 +710,7 @@ declare
   d  jsonb := private.clean(
     jsonb_build_object('name', p_name, 'role', p_role),
     '{"name": {"type": "text", "required": true, "max": 100},
-      "role": {"type": "enum", "required": true, "values": ["admin", "staff"]}}');
+      "role": {"type": "enum", "required": true, "values": ["admin", "manager", "staff"]}}');
 begin
   if p_id = me.id and (d ->> 'role' <> 'admin' or not coalesce(p_active, false)) then
     raise exception 'You cannot remove your own admin access or turn off your own account' using errcode = '22023';
@@ -630,6 +731,294 @@ begin
     raise exception 'Please sign in' using errcode = '28000';
   end if;
   update public.profiles set name = d ->> 'name' where id = auth.uid();
+end $$;
+
+-- -------------------------------------------------------------------------------------
+-- API: tasks and work types
+-- -------------------------------------------------------------------------------------
+
+-- Tasks matching the list filters.
+--   status:   'open' (new, in progress, waiting), 'all', or one status
+--   assignee: '' (anyone), 'me', 'none', or a user id
+create or replace function private.filtered_tasks(
+  p_q text, p_status text, p_assignee text, p_work_type bigint, p_customer_id bigint, p_me uuid
+) returns setof public.tasks
+language plpgsql stable set search_path = '' as $$
+declare
+  pat        text;
+  v_assignee uuid;
+  v_status   text := coalesce(nullif(p_status, ''), 'open');
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  if p_assignee ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    v_assignee := p_assignee::uuid;
+  elsif p_assignee = 'me' then
+    v_assignee := p_me;
+  end if;
+
+  return query
+  select t.* from public.tasks t
+  left join public.customers c on c.id = t.customer_id
+  where (pat is null or t.title ilike pat or t.description ilike pat or c.name ilike pat)
+    and (case v_status
+           when 'open' then t.status in ('new', 'in_progress', 'waiting')
+           when 'all' then true
+           else t.status = v_status
+         end)
+    and (case
+           when v_assignee is not null then t.assigned_to = v_assignee
+           when p_assignee = 'none' then t.assigned_to is null
+           else true
+         end)
+    and (p_work_type is null or t.work_type_id = p_work_type)
+    and (p_customer_id is null or t.customer_id = p_customer_id);
+end $$;
+
+create or replace function public.list_tasks(
+  p_q text default null, p_status text default 'open', p_assignee text default null,
+  p_work_type bigint default null, p_customer_id bigint default null, p_page int default 1
+) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_member();
+  page_size constant int := 25;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  total     bigint;
+  v_rows    json;
+begin
+  select count(*) into total
+  from private.filtered_tasks(p_q, p_status, p_assignee, p_work_type, p_customer_id, me.id);
+
+  select coalesce(json_agg(x order by x.ord), '[]') into v_rows from (
+    select t.id, t.title, t.status, t.priority, t.due_date, t.updated_at, t.customer_id, t.assigned_to,
+           c.name as customer_name, w.name as work_type, u.name as assignee_name,
+           row_number() over (order by t.status in ('done', 'cancelled'), t.due_date nulls last,
+                              private.priority_rank(t.priority) desc, t.id desc) as ord
+    from private.filtered_tasks(p_q, p_status, p_assignee, p_work_type, p_customer_id, me.id) t
+    left join public.customers c on c.id = t.customer_id
+    left join public.work_types w on w.id = t.work_type_id
+    left join public.profiles u on u.id = t.assigned_to
+    order by ord
+    limit page_size offset (pg - 1) * page_size
+  ) x;
+
+  return json_build_object('tasks', v_rows, 'total', total, 'page', pg, 'pageSize', page_size,
+                           'today', private.today());
+end $$;
+
+create or replace function public.get_task(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_member();
+  result json;
+begin
+  select json_build_object(
+    'today', private.today(),
+    'task', to_jsonb(t) || jsonb_build_object(
+      'customer_name', c.name,
+      'work_type', w.name,
+      'assignee_name', u.name,
+      'created_by_name', cb.name,
+      'updates', coalesce((
+        select jsonb_agg(to_jsonb(x) || jsonb_build_object('user_name', xu.name) order by x.created_at desc, x.id desc)
+        from public.task_updates x left join public.profiles xu on xu.id = x.user_id
+        where x.task_id = t.id), '[]')))
+  into result
+  from public.tasks t
+  left join public.customers c  on c.id = t.customer_id
+  left join public.work_types w on w.id = t.work_type_id
+  left join public.profiles u   on u.id = t.assigned_to
+  left join public.profiles cb  on cb.id = t.created_by
+  where t.id = p_id;
+
+  if result is null then
+    raise exception 'Task not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+-- Create (p_id null) or edit a task. Managers and admins only. Returns its id.
+create or replace function public.save_task(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  d   jsonb := private.clean(p_data, '{
+    "title":        {"type": "text", "required": true, "max": 200},
+    "description":  {"type": "text", "max": 5000},
+    "customer_id":  {"type": "int"},
+    "work_type_id": {"type": "int"},
+    "assigned_to":  {"type": "uuid"},
+    "priority":     {"type": "enum", "values": ["low", "normal", "high", "urgent"], "default": "normal"},
+    "status":       {"type": "enum", "values": ["new", "in_progress", "waiting", "done", "cancelled"], "default": "new"},
+    "due_date":     {"type": "date"}
+  }');
+  v_old       public.tasks;
+  v_id      bigint;
+  assignee  uuid := (d ->> 'assigned_to')::uuid;
+  errs      jsonb := '{}';
+begin
+  if p_id is not null then
+    select * into v_old from public.tasks where id = p_id;
+    if v_old.id is null then
+      raise exception 'Task not found' using errcode = 'P0002';
+    end if;
+  end if;
+
+  if d ->> 'customer_id' is not null
+     and not exists (select 1 from public.customers where id = (d ->> 'customer_id')::bigint) then
+    errs := errs || '{"customer_id": "Pick a customer from the list"}';
+  end if;
+  if d ->> 'work_type_id' is not null
+     and not exists (select 1 from public.work_types where id = (d ->> 'work_type_id')::bigint
+                     and (active or id is not distinct from v_old.work_type_id)) then
+    errs := errs || '{"work_type_id": "Pick a type of work from the list"}';
+  end if;
+  if assignee is not null and assignee is distinct from v_old.assigned_to
+     and not exists (select 1 from public.profiles where id = assignee and active) then
+    errs := errs || '{"assigned_to": "Pick a team member who has access"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  if p_id is null then
+    insert into public.tasks (title, description, customer_id, work_type_id, assigned_to, priority, status,
+                              due_date, created_by, completed_at)
+    values (d ->> 'title', d ->> 'description', (d ->> 'customer_id')::bigint, (d ->> 'work_type_id')::bigint,
+            assignee, d ->> 'priority', d ->> 'status', (d ->> 'due_date')::date, me.id,
+            case when d ->> 'status' = 'done' then now() end)
+    returning id into v_id;
+    insert into public.task_updates (task_id, user_id, kind, body)
+    values (v_id, me.id, 'created', 'Created the task');
+    if assignee is not null then
+      insert into public.task_updates (task_id, user_id, kind, body)
+      values (v_id, me.id, 'assigned', 'Assigned to ' || (select name from public.profiles where id = assignee));
+    end if;
+    return v_id;
+  end if;
+
+  update public.tasks set
+    title = d ->> 'title', description = d ->> 'description',
+    customer_id = (d ->> 'customer_id')::bigint, work_type_id = (d ->> 'work_type_id')::bigint,
+    assigned_to = assignee, priority = d ->> 'priority', status = d ->> 'status',
+    due_date = (d ->> 'due_date')::date, updated_at = now(),
+    completed_at = case when d ->> 'status' = 'done' then coalesce(v_old.completed_at, now()) end
+  where id = p_id;
+
+  if v_old.status <> d ->> 'status' then
+    insert into public.task_updates (task_id, user_id, kind, from_status, to_status)
+    values (p_id, me.id, 'status', v_old.status, d ->> 'status');
+  end if;
+  if v_old.assigned_to is distinct from assignee then
+    insert into public.task_updates (task_id, user_id, kind, body)
+    values (p_id, me.id, 'assigned', coalesce('Assigned to ' || (select name from public.profiles where id = assignee), 'Unassigned'));
+  end if;
+  return p_id;
+end $$;
+
+-- Move a task to another status, with an optional note. The assigned person, managers and admins can.
+create or replace function public.update_task_status(p_id bigint, p_status text, p_note text default null) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_member();
+  d    jsonb := private.clean(jsonb_build_object('status', p_status, 'note', p_note), '{
+    "status": {"type": "enum", "required": true, "values": ["new", "in_progress", "waiting", "done", "cancelled"]},
+    "note":   {"type": "text", "max": 5000}
+  }');
+  v_old  public.tasks;
+begin
+  select * into v_old from public.tasks where id = p_id;
+  if v_old.id is null then
+    raise exception 'Task not found' using errcode = 'P0002';
+  end if;
+  if me.role not in ('admin', 'manager') and v_old.assigned_to is distinct from me.id then
+    raise exception 'Only the person this task is assigned to, or a manager, can change its status' using errcode = '42501';
+  end if;
+  if v_old.status = d ->> 'status' then
+    return;
+  end if;
+
+  update public.tasks set status = d ->> 'status', updated_at = now(),
+    completed_at = case when d ->> 'status' = 'done' then now() end
+  where id = p_id;
+  insert into public.task_updates (task_id, user_id, kind, body, from_status, to_status)
+  values (p_id, me.id, 'status', d ->> 'note', v_old.status, d ->> 'status');
+end $$;
+
+-- Anyone with access can comment on a task.
+create or replace function public.add_task_comment(p_id bigint, p_body text) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_member();
+  d      jsonb := private.clean(jsonb_build_object('body', p_body), '{"body": {"type": "text", "required": true, "max": 5000}}');
+  new_id bigint;
+begin
+  if not exists (select 1 from public.tasks where id = p_id) then
+    raise exception 'Task not found' using errcode = 'P0002';
+  end if;
+  insert into public.task_updates (task_id, user_id, kind, body)
+  values (p_id, me.id, 'comment', d ->> 'body')
+  returning id into new_id;
+  update public.tasks set updated_at = now() where id = p_id;
+  return new_id;
+end $$;
+
+create or replace function public.delete_task(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  delete from public.tasks where id = p_id;
+  if not found then
+    raise exception 'Task not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Customers for the task form's customer picker.
+create or replace function public.customer_options() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  return coalesce((select json_agg(json_build_object('id', id, 'name', name, 'status', status) order by lower(name), id)
+                   from public.customers), '[]');
+end $$;
+
+create or replace function public.list_work_types() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  return coalesce((select json_agg(json_build_object(
+      'id', w.id, 'name', w.name, 'active', w.active,
+      'open_tasks', (select count(*) from public.tasks t where t.work_type_id = w.id and t.status in ('new', 'in_progress', 'waiting')))
+    order by not w.active, lower(w.name)) from public.work_types w), '[]');
+end $$;
+
+-- Add (p_id null) or rename / switch on or off a type of work. Managers and admins only.
+create or replace function public.save_work_type(p_id bigint, p_name text, p_active boolean default true) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  d      jsonb := private.clean(jsonb_build_object('name', p_name), '{"name": {"type": "text", "required": true, "max": 100}}');
+  v_id   bigint;
+begin
+  begin
+    if p_id is null then
+      insert into public.work_types (name, active) values (d ->> 'name', coalesce(p_active, true)) returning id into v_id;
+      return v_id;
+    end if;
+    update public.work_types set name = d ->> 'name', active = coalesce(p_active, true) where id = p_id;
+    if not found then
+      raise exception 'Type of work not found' using errcode = 'P0002';
+    end if;
+    return p_id;
+  exception when unique_violation then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = '{"name": "This type of work already exists"}';
+  end;
 end $$;
 
 -- -------------------------------------------------------------------------------------
@@ -657,7 +1046,16 @@ begin
     'public.delete_activity(bigint)',
     'public.list_users()',
     'public.admin_update_user(uuid, text, text, boolean)',
-    'public.update_my_name(text)'
+    'public.update_my_name(text)',
+    'public.list_tasks(text, text, text, bigint, bigint, int)',
+    'public.get_task(bigint)',
+    'public.save_task(bigint, jsonb)',
+    'public.update_task_status(bigint, text, text)',
+    'public.add_task_comment(bigint, text)',
+    'public.delete_task(bigint)',
+    'public.customer_options()',
+    'public.list_work_types()',
+    'public.save_work_type(bigint, text, boolean)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);

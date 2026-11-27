@@ -210,7 +210,7 @@ test('activities, follow-ups and the dashboard', async () => {
   assert.equal((await call(admin.sb, 'delete_activity', { p_id: adminNote.data })).error, null, 'admins can delete any entry');
 });
 
-test('only admins delete customers or manage users; turning a user off blocks them at once', async () => {
+test('staff cannot delete customers; only admins manage users; turning a user off blocks them at once', async () => {
   assert.equal((await call(staff.sb, 'delete_customer', { p_id: customerId })).error.code, '42501');
 
   const selfDemote = await call(admin.sb, 'admin_update_user', { p_id: admin.id, p_name: 'Aisha Admin', p_role: 'staff', p_active: true });
