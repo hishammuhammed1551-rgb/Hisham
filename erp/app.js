@@ -297,6 +297,8 @@ function layout(active, ...content) {
         isManager() && link('#/finance/petty-cash', 'cash', 'Petty cash', 'finance-petty'),
         isManager() && link('#/finance/vat', 'tag', 'VAT return', 'finance-vat'),
         isManager() && link('#/finance/journals', 'note', 'Journal entries', 'finance-journals'),
+        isManager() && link('#/finance/recurring-journals', 'renew', 'Recurring journals', 'finance-recurring-journals'),
+        isManager() && link('#/finance/schedules', 'follow_up', 'Accruals & prepayments', 'finance-schedules'),
         isManager() && link('#/finance/reports', 'chart', 'Reports', 'finance-reports'),
         isManager() && link('#/finance/accounts', 'tag', 'Chart of accounts', 'finance-accounts'),
         h('div', { class: 'nav-heading' }, 'HR'),
@@ -1143,9 +1145,11 @@ async function viewTask(id) {
 
 // ---------- types of work (managers) ----------
 
-function workTypeDialog(w, refresh, accounts = []) {
+function workTypeDialog(w, refresh, accounts = [], departments = []) {
   const dlg = openDialog(`Edit "${w.name}"`, handleForm(h('form', { class: 'form' },
     field('Name', input('name', w.name, { required: true, maxlength: 100 })),
+    departments.length > 0 && field('Department', select('department_id', w.department_id ? String(w.department_id) : '', [['', 'None'],
+      ...departments.filter(d => d.active || d.id === w.department_id).map(d => [String(d.id), d.name])])),
     accounts.length > 0 && field('Income account', accountSelect('revenue_account_id', w.revenue_account_id, accounts, {}, a => a.type === 'income'),
       { hint: 'Tax invoices for tasks of this type are posted to this account (empty: "Other operating revenue").' }),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: w.active }),
@@ -1156,6 +1160,7 @@ function workTypeDialog(w, refresh, accounts = []) {
   async data => {
     await rpc('save_work_type', { p_id: w.id, p_name: data.name, p_active: data.active });
     if ('revenue_account_id' in data) await rpc('set_work_type_account', { p_id: w.id, p_account_id: data.revenue_account_id || null });
+    if ('department_id' in data) await rpc('set_work_type_department', { p_id: w.id, p_department: data.department_id || null });
     dlg.close();
     toast('Saved');
     refresh();
@@ -1164,7 +1169,8 @@ function workTypeDialog(w, refresh, accounts = []) {
 
 async function viewWorkTypes() {
   if (!isManager()) return viewNotFound();
-  const [types, renewalTypes, accounts] = await Promise.all([rpc('list_work_types'), rpc('list_renewal_types'), rpc('list_accounts', { p_include_inactive: false })]);
+  const [types, renewalTypes, accounts, departments] = await Promise.all([rpc('list_work_types'), rpc('list_renewal_types'),
+    rpc('list_accounts', { p_include_inactive: false }), rpc('list_departments')]);
   const refresh = () => render();
   const addForm = handleForm(h('form', { class: 'form' },
     h('div', { class: 'inline-form' },
@@ -1180,12 +1186,14 @@ async function viewWorkTypes() {
     renewalTypesCard(renewalTypes, refresh),
     h('section', { class: 'card' }, h('h2', {}, 'Types of work'), addForm),
     h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Open tasks'), h('th', {}, 'Status'), h('th', {}, ''))),
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', { class: 'hide-sm' }, 'Department'), h('th', {}, 'Open tasks'), h('th', {}, 'Status'), h('th', {}, ''))),
       h('tbody', {}, types.map(w => h('tr', {},
         h('td', {}, h('a', { class: 'row-link', href: `#/tasks?type=${w.id}&status=all` }, w.name)),
+        h('td', { class: 'hide-sm' }, (departments.find(d => d.id === w.department_id) || {}).name || h('span', { class: 'muted' }, '—')),
         h('td', {}, w.open_tasks),
         h('td', {}, w.active ? h('span', { class: 'badge badge-active' }, 'In use') : h('span', { class: 'badge badge-inactive' }, 'Switched off')),
-        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => workTypeDialog(w, refresh, accounts) }, 'Edit')))))))));
+        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => workTypeDialog(w, refresh, accounts, departments) }, 'Edit')))))))),
+    departmentsCard(departments, refresh));
 }
 
 // ---------- invoices ----------
@@ -3038,7 +3046,8 @@ function downloadTablePdf(filename, title, subtitle, header, rows, numCols = [])
 function exportButtons(name, title, subtitle, header, rows, numCols) {
   const plain = rows.map(r => r.map(c => (c && typeof c === 'object' ? c.text : c)));
   return [
-    h('button', { class: 'btn btn-secondary btn-sm', onclick: () => downloadCsv(`${name}.csv`, header, plain) }, icon('download'), 'Excel (CSV)'),
+    h('button', { class: 'btn btn-secondary btn-sm', onclick: () => downloadXlsx(`${name}.xlsx`, title, subtitle, header, rows, numCols) }, icon('download'), 'Excel'),
+    h('button', { class: 'btn btn-secondary btn-sm', onclick: () => downloadCsv(`${name}.csv`, header, plain) }, icon('download'), 'CSV'),
     h('button', { class: 'btn btn-secondary btn-sm', onclick: () => downloadTablePdf(`${name}.pdf`, title, subtitle, header, rows, numCols) }, icon('download'), 'PDF'),
   ];
 }
@@ -3075,6 +3084,10 @@ async function viewFinance() {
     ]),
     o.recurring_due > 0 && h('p', { class: 'notice' }, `${o.recurring_due} recurring invoice${o.recurring_due === 1 ? ' is' : 's are'} due. `,
       h('button', { class: 'btn btn-primary btn-sm', onclick: () => runRecurring(null) }, 'Create the draft invoices'), ' ', h('a', { href: '#/finance/recurring' }, 'See them')),
+    o.journals_due > 0 && h('p', { class: 'notice' }, `${o.journals_due} recurring journal${o.journals_due === 1 ? ' is' : 's are'} due. `,
+      h('button', { class: 'btn btn-primary btn-sm', onclick: () => runRecurringJournals(null) }, 'Post them'), ' ', h('a', { href: '#/finance/recurring-journals' }, 'See them')),
+    o.schedules_due > 0 && h('p', { class: 'notice' }, `${o.schedules_due} month${o.schedules_due === 1 ? '' : 's'} of accruals or prepayments to post. `,
+      h('button', { class: 'btn btn-primary btn-sm', onclick: () => runSchedules(null) }, 'Post them'), ' ', h('a', { href: '#/finance/schedules' }, 'See them')),
     o.unreconciled > 0 && h('p', { class: 'notice' }, `${o.unreconciled} bank statement line${o.unreconciled === 1 ? '' : 's'} not matched yet. `,
       h('a', { href: '#/finance/reconcile' }, 'Reconcile')),
     h('div', { class: 'grid stats' },
@@ -3209,47 +3222,9 @@ async function viewJournals(params) {
 
 async function viewJournalNew(params) {
   const opening = params.kind === 'opening';
-  const [accounts, customers] = await Promise.all([rpc('list_accounts', { p_include_inactive: false }), rpc('customer_options')]);
-  const tbody = h('tbody', {});
-  const totals = h('p', { class: 'journal-totals' });
+  const [accounts, customers, tags] = await Promise.all([rpc('list_accounts', { p_include_inactive: false }), rpc('customer_options'), rpc('profit_tags')]);
   const usable = opening ? a => ['asset', 'liability', 'equity'].includes(a.type) : () => true;
-  const recalc = () => {
-    let dr = 0; let cr = 0;
-    for (const row of tbody.rows) {
-      dr += Number(row.querySelector('.j-dr').value) || 0;
-      cr += Number(row.querySelector('.j-cr').value) || 0;
-    }
-    dr = round2(dr); cr = round2(cr);
-    const diff = round2(dr - cr);
-    totals.replaceChildren(`Debits ${money(dr)} · Credits ${money(cr)} · `,
-      diff === 0 && dr > 0 ? h('strong', { class: 'ok' }, 'Balanced ✓') : h('strong', { class: 'bad' }, `Difference ${money(Math.abs(diff))}`));
-    return diff;
-  };
-  const addLine = (l = {}) => {
-    const custCell = h('td', {});
-    const acct = accountSelect('', l.account_id, accounts, { class: 'j-acct', 'aria-label': 'Account', required: true }, usable);
-    const showCustomer = () => {
-      const a = accounts.find(x => String(x.id) === acct.value);
-      custCell.replaceChildren(a && ['receivable', 'customer_advance'].includes(a.subtype)
-        ? select('', l.customer_id ? String(l.customer_id) : '', [['', 'Customer (optional)'], ...customers.map(c => [String(c.id), c.name])],
-          { class: 'j-cust', 'aria-label': 'Customer' })
-        : '');
-    };
-    acct.addEventListener('change', showCustomer);
-    const dr = h('input', { class: 'j-dr', type: 'number', min: '0', step: '0.01', value: l.debit ?? '', 'aria-label': 'Debit', placeholder: '0.00', oninput: recalc });
-    const cr = h('input', { class: 'j-cr', type: 'number', min: '0', step: '0.01', value: l.credit ?? '', 'aria-label': 'Credit', placeholder: '0.00', oninput: recalc });
-    const row = h('tr', {},
-      h('td', {}, acct),
-      h('td', {}, h('input', { class: 'j-desc', value: l.description ?? '', maxlength: 300, 'aria-label': 'Line description', placeholder: 'Optional' })),
-      custCell, h('td', {}, dr), h('td', {}, cr),
-      h('td', {}, h('button', { class: 'btn btn-danger btn-sm', type: 'button', 'aria-label': 'Remove line',
-        onclick: () => { if (tbody.rows.length > 2) { row.remove(); recalc(); } } }, '×')));
-    tbody.append(row);
-    showCustomer();
-    recalc();
-    return row;
-  };
-  addLine(); addLine();
+  const { tbody, totals, addLine, recalc } = journalLinesEditor(accounts, customers, { usable });
   const openingEquity = accounts.find(a => a.system_key === 'opening_equity');
   const balanceOpening = () => {
     const diff = recalc();
@@ -3276,6 +3251,8 @@ async function viewJournalNew(params) {
       field('Kind', kind),
       field('Description', input('memo', opening ? 'Opening balances' : '', { required: true, maxlength: 500, placeholder: 'e.g. Office rent for December' }), { full: true }),
       field('Reference (optional)', input('reference', '', { maxlength: 100, placeholder: 'e.g. invoice or contract number' })),
+      !opening && field('Department (optional)', select('department_id', '', [['', 'None'], ...tags.departments.map(d => [String(d.id), d.name])]),
+        { hint: 'For profitability by department (income and expense lines).' }),
       reverseField),
     h('div', { class: 'field', 'data-field': 'lines' },
       h('label', {}, 'Lines'),
@@ -3450,10 +3427,10 @@ async function viewReports(params) {
   const from = params.from || `${t.slice(0, 4)}-01-01`;
   const to = params.to || t;
   const go = changes => {
-    const n = new URLSearchParams({ report, from, to, ...changes });
+    const n = new URLSearchParams({ report, from, to, ...(params.by ? { by: params.by } : {}), ...(params.detail ? { detail: params.detail } : {}), ...changes });
     location.hash = '#/finance/reports?' + n;
   };
-  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['tb', 'Trial balance'], ['ar', 'Receivables ageing'], ['ap', 'Payables ageing']].map(([k, label]) =>
+  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['cf', 'Cash flow'], ['tb', 'Trial balance'], ['profit', 'Profitability'], ['ar', 'Receivables ageing'], ['ap', 'Payables ageing']].map(([k, label]) =>
     h('button', { type: 'button', 'aria-pressed': String(report === k), onclick: () => go({ report: k }) }, label)));
   const dates = h('div', { class: 'filters report-dates' },
     !['bs', 'ap', 'ar'].includes(report) && input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go({ from: e.target.value }) }),
@@ -3468,13 +3445,18 @@ async function viewReports(params) {
   let title = '';
   let subtitle = '';
 
-  if (report === 'ap') {
+  if (report === 'cf') {
+    ({ title, subtitle, header, exportRows, numCols, body } = await cashFlowReport(from, to));
+  } else if (report === 'profit') {
+    ({ title, subtitle, header, exportRows, numCols, body } = await profitabilityReport(from, to, params.by || 'customer', go));
+  } else if (report === 'ap') {
     ({ title, subtitle, header, exportRows, numCols, body } = await payablesAgeing(to));
   } else if (report === 'ar') {
     ({ title, subtitle, header, exportRows, numCols, body } = await receivablesAgeing(to));
   } else if (report === 'tb') {
-    const tb = await rpc('trial_balance', { p_from: from, p_to: to });
-    title = 'Trial balance';
+    const detail = params.detail === '1';
+    const [tb, parties] = await Promise.all([rpc('trial_balance', { p_from: from, p_to: to }), detail ? rpc('trial_balance_parties', { p_from: from, p_to: to }) : []]);
+    title = detail ? 'Detailed trial balance' : 'Trial balance';
     subtitle = `${fmtDate(tb.from)} – ${fmtDate(tb.to)}`;
     header = ['Code', 'Account', 'Opening', 'Debit', 'Credit', 'Closing debit', 'Closing credit'];
     numCols = [2, 3, 4, 5, 6];
@@ -3485,17 +3467,28 @@ async function viewReports(params) {
       if (closing > 0) tot.cdr += closing; else tot.ccr -= closing;
       return { r, closing };
     });
-    exportRows = [...rows.map(({ r, closing }) => [r.code, r.name, dc(r.opening), amt0(r.debit), amt0(r.credit), closing > 0 ? amount(closing) : '', closing < 0 ? amount(-closing) : '']),
+    const subRows = r => parties.filter(p => p.account_id === r.id).map(p => {
+      const c = round2(Number(p.opening) + Number(p.debit) - Number(p.credit));
+      return { p, c };
+    });
+    exportRows = [...rows.flatMap(({ r, closing }) => [[r.code, r.name, dc(r.opening), amt0(r.debit), amt0(r.credit), closing > 0 ? amount(closing) : '', closing < 0 ? amount(-closing) : ''],
+      ...subRows(r).map(({ p, c }) => ['', `    ${p.name}`, dc(p.opening), amt0(p.debit), amt0(p.credit), c > 0 ? amount(c) : '', c < 0 ? amount(-c) : ''])]),
       [{ text: 'Total' }, '', '', { text: amount(tot.dr) }, { text: amount(tot.cr) }, { text: amount(tot.cdr) }, { text: amount(tot.ccr) }]];
     const balanced = round2(tot.cdr) === round2(tot.ccr);
     body = [
       h('p', { class: balanced ? 'muted' : 'form-error' }, balanced ? 'Debits equal credits ✓' : `Out of balance by ${money(Math.abs(tot.cdr - tot.ccr))}`),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: detail, onchange: e => go({ detail: e.target.checked ? '1' : '' }) }),
+        'Show customers and suppliers under receivables, advances and payables'),
       h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
         h('thead', {}, h('tr', {}, header.map((x, i) => h('th', { class: numCols.includes(i) ? 'num' : '' }, x)))),
         h('tbody', {}, rows.map(({ r, closing }) => h('tr', {},
           h('td', {}, r.code), h('td', {}, ledgerLink(r, r.name)), h('td', { class: 'num' }, dc(r.opening)),
           h('td', { class: 'num' }, amt0(r.debit)), h('td', { class: 'num' }, amt0(r.credit)),
-          h('td', { class: 'num' }, closing > 0 ? amount(closing) : ''), h('td', { class: 'num' }, closing < 0 ? amount(-closing) : ''))),
+          h('td', { class: 'num' }, closing > 0 ? amount(closing) : ''), h('td', { class: 'num' }, closing < 0 ? amount(-closing) : ''))).flatMap((tr, i) => [tr,
+          ...subRows(rows[i].r).map(({ p, c }) => h('tr', { class: 'sub-row' }, h('td', {}),
+            h('td', {}, p.party_id ? h('a', { href: p.party_type === 'supplier' ? `#/finance/suppliers/${p.party_id}/statement` : `#/finance/customers/${p.party_id}/statement` }, p.name) : p.name),
+            h('td', { class: 'num' }, dc(p.opening)), h('td', { class: 'num' }, amt0(p.debit)), h('td', { class: 'num' }, amt0(p.credit)),
+            h('td', { class: 'num' }, c > 0 ? amount(c) : ''), h('td', { class: 'num' }, c < 0 ? amount(-c) : '')))]),
           h('tr', { class: 'total-row' }, h('td', {}, 'Total'), h('td', {}), h('td', {}), h('td', { class: 'num' }, amount(tot.dr)), h('td', { class: 'num' }, amount(tot.cr)),
             h('td', { class: 'num' }, amount(tot.cdr)), h('td', { class: 'num' }, amount(tot.ccr))))))];
   } else if (report === 'pl') {
@@ -3703,7 +3696,7 @@ async function viewBills(params) {
           h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
 }
 
-function billForm(b, kind, suppliers, accounts, onSubmit, cancelHref) {
+function billForm(b, kind, suppliers, accounts, onSubmit, cancelHref, tags = null) {
   const tbody = h('tbody', {});
   const totals = h('dl', { class: 'inv-form-totals' });
   const supplierSel = select('supplier_id', b.supplier_id ? String(b.supplier_id) : '', [['', 'Pick a supplier…'],
@@ -3766,6 +3759,9 @@ function billForm(b, kind, suppliers, accounts, onSubmit, cancelHref) {
       h('div', { class: 'inv-edit-foot' }, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => addLine() }, '+ Add line'), totals),
       h('div', { class: 'hint' }, 'Untick "Recov." when the VAT can\'t be reclaimed (e.g. entertainment, some motor costs): it is added to the cost instead. ',
         'Reverse charge: for services or goods bought from abroad; you account for the 5% VAT yourself and, if recoverable, reclaim it in the same return.')),
+    tags && h('details', { class: 'tag-box', open: !!(b.customer_id || b.work_type_id || b.department_id) },
+      h('summary', {}, 'Profitability: client, service, department (optional)'),
+      h('div', { class: 'form-grid' }, profitTagFields(tags, b))),
     field('Notes (optional)', textarea('notes', b.notes, { rows: 2, maxlength: 1000 })),
     h('div', { class: 'btn-row' },
       h('button', { class: 'btn btn-primary', type: 'submit' }, b.id ? 'Save changes' : 'Save as draft'),
@@ -3782,7 +3778,7 @@ function billForm(b, kind, suppliers, accounts, onSubmit, cancelHref) {
 
 async function viewBillNew(params) {
   const kind = params.kind === 'credit_note' ? 'credit_note' : 'bill';
-  const [suppliers, accounts] = await Promise.all([rpc('supplier_options'), rpc('list_accounts', { p_include_inactive: false })]);
+  const [suppliers, accounts, tags] = await Promise.all([rpc('supplier_options'), rpc('list_accounts', { p_include_inactive: false }), rpc('profit_tags')]);
   const back = params.supplier ? `#/finance/suppliers/${params.supplier}` : '#/finance/bills';
   return layout('finance-bills',
     pageHead(kind === 'bill' ? 'New bill' : 'New supplier credit note', 'Saved as a draft first; post it to put it in the books.', null, h('a', { href: back }, '← Back')),
@@ -3791,21 +3787,22 @@ async function viewBillNew(params) {
       const id = await rpc('save_bill', { p_id: null, p_data: data });
       toast('Draft saved. Check it, then Post.');
       location.hash = `#/finance/bills/${id}`;
-    }, back)));
+    }, back, tags)));
 }
 
 async function viewBillEdit(id) {
-  const [{ bill: b }, suppliers, accounts] = await Promise.all([rpc('get_bill', { p_id: id }), rpc('supplier_options'), rpc('list_accounts', { p_include_inactive: false })]);
+  const [{ bill: b }, suppliers, accounts, tags] = await Promise.all([rpc('get_bill', { p_id: id }), rpc('supplier_options'), rpc('list_accounts', { p_include_inactive: false }), rpc('profit_tags')]);
   return layout('finance-bills', pageHead(`Edit ${b.number}`, b.supplier_name, null, h('a', { href: `#/finance/bills/${id}` }, '← Back')),
     h('section', { class: 'card' }, billForm(b, b.kind, suppliers, accounts, async data => {
       await rpc('save_bill', { p_id: id, p_data: data });
       toast('Saved');
       location.hash = `#/finance/bills/${id}`;
-    }, `#/finance/bills/${id}`)));
+    }, `#/finance/bills/${id}`, tags)));
 }
 
 async function viewBill(id) {
-  const { bill: b, today, open_items: open } = await rpc('get_bill', { p_id: id });
+  const [{ bill: b, today, open_items: open }, tags] = await Promise.all([rpc('get_bill', { p_id: id }), rpc('profit_tags')]);
+  const tagName = (list, v) => (list.find(x => x.id === v) || {}).name;
   const refresh = () => render();
   const act = (fn, args, msg) => async () => { try { await rpc(fn, args); toast(msg); refresh(); } catch (err) { toast(err.message, true); } };
   const bal = round2(b.total - b.amount_allocated);
@@ -3836,7 +3833,9 @@ async function viewBill(id) {
     b.status === 'draft' && h('p', { class: 'notice' }, 'Draft: not in the books yet. Check it, then click Post.'),
     h('section', { class: 'card' },
       h('dl', { class: 'facts' }, [['Supplier', h('a', { href: `#/finance/suppliers/${b.supplier_id}` }, b.supplier_name)], ['Supplier TRN', b.supplier_trn],
-        ['Their number', b.supplier_ref], ['Date', fmtDate(b.bill_date)], ['Due', b.due_date && fmtDate(b.due_date)], ['Notes', b.notes]]
+        ['Their number', b.supplier_ref], ['Date', fmtDate(b.bill_date)], ['Due', b.due_date && fmtDate(b.due_date)],
+        ['For customer', tagName(tags.customers, b.customer_id)], ['Type of work', tagName(tags.work_types, b.work_type_id)],
+        ['Department', tagName(tags.departments, b.department_id)], ['Notes', b.notes]]
         .filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
       h('div', { class: 'table-wrap' }, h('table', {},
         h('thead', {}, h('tr', {}, h('th', {}, 'Description'), h('th', { class: 'hide-sm' }, 'Account'), h('th', {}, 'VAT'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'VAT'))),
@@ -4542,7 +4541,7 @@ async function viewCustomerStatement(id, params) {
       input('to', st.to, { type: 'date', 'aria-label': 'To', onchange: e => go('to', e.target.value) }),
       h('button', { class: 'btn btn-primary', onclick: email }, 'Email statement'),
       h('button', { class: 'btn btn-secondary', onclick: pdf }, icon('download'), 'Statement PDF'),
-      downloadCsvButton(fileName, header, rows),
+      ...downloadCsvButton(fileName, header, rows, 'Statement of account', subtitle),
     ], [h('a', { href: `#/customers/${id}` }, `← ${st.customer.name}`)]),
     h('dl', { class: 'pay-summary' },
       h('div', {}, h('dt', {}, 'Opening'), h('dd', {}, money(st.opening))),
@@ -4569,9 +4568,10 @@ async function viewCustomerStatement(id, params) {
           : h('p', { class: 'empty' }, 'None.'))));
 }
 
-function downloadCsvButton(name, header, rows) {
+function downloadCsvButton(name, header, rows, title = name, subtitle = '') {
   const plain = rows.map(r => r.map(c => (c && typeof c === 'object' ? c.text : c)));
-  return h('button', { class: 'btn btn-secondary', onclick: () => downloadCsv(`${name}.csv`, header, plain) }, icon('download'), 'Excel (CSV)');
+  return [h('button', { class: 'btn btn-secondary', onclick: () => downloadXlsx(`${name}.xlsx`, title, subtitle, header, rows, [3, 4, 5]) }, icon('download'), 'Excel'),
+    h('button', { class: 'btn btn-secondary', onclick: () => downloadCsv(`${name}.csv`, header, plain) }, icon('download'), 'CSV')];
 }
 
 async function receivablesAgeing(to) {
@@ -4935,7 +4935,7 @@ async function viewReconcile(params) {
 
 // ---------- petty cash ----------
 
-function pettyExpenseDialog(boxId, accounts) {
+function pettyExpenseDialog(boxId, accounts, tags) {
   const vatSel = select('vat_code', 'standard', Object.entries(VAT_CODES).map(([k, v]) => [k, k === 'out_of_scope' ? 'No VAT' : v]));
   const totalIn = input('total', '', { type: 'number', min: '0.01', step: '0.01', required: true });
   const rec = h('input', { type: 'checkbox', name: 'recoverable', checked: true });
@@ -4956,7 +4956,8 @@ function pettyExpenseDialog(boxId, accounts) {
       field('Date', input('spent_on', localToday(), { type: 'date', max: localToday(), required: true })),
       field('Amount paid (AED, incl. VAT)', totalIn),
       field('VAT on the receipt', vatSel),
-      field('Receipt number (optional)', input('receipt_ref', '', { maxlength: 100 }))),
+      field('Receipt number (optional)', input('receipt_ref', '', { maxlength: 100 })),
+      ...profitTagFields(tags, {}, { customer: false, workType: false })),
     h('label', { class: 'check' }, rec, 'VAT recoverable (a proper tax invoice or receipt with the seller\'s TRN)'),
     vatNote,
     h('input', { type: 'hidden', name: 'account_id', value: String(boxId) }),
@@ -4994,8 +4995,8 @@ async function viewPettyCash(params) {
   const t = localToday();
   const from = params.from || `${t.slice(0, 7)}-01`;
   const to = params.to || t;
-  const [pc, accounts, cash] = await Promise.all([rpc('petty_cash', { p_from: from, p_to: to, p_account: Number(params.account) || null }),
-    rpc('list_accounts', { p_include_inactive: false }), rpc('cash_accounts')]);
+  const [pc, accounts, cash, tags] = await Promise.all([rpc('petty_cash', { p_from: from, p_to: to, p_account: Number(params.account) || null }),
+    rpc('list_accounts', { p_include_inactive: false }), rpc('cash_accounts'), rpc('profit_tags')]);
   const box = pc.accounts.find(a => a.id === pc.account_id) || pc.accounts[0];
   const go = (k, v) => { const n = new URLSearchParams({ from, to, ...params }); n.set(k, v); location.hash = '#/finance/petty-cash?' + n; };
   const posted = pc.expenses.filter(e => e.status === 'posted');
@@ -5008,7 +5009,7 @@ async function viewPettyCash(params) {
   return layout('finance-petty',
     pageHead('Petty cash', subtitle, [
       h('button', { class: 'btn btn-secondary', onclick: () => topUpDialog(box, cash.filter(a => a.subtype === 'bank' && a.active)) }, 'Top up'),
-      h('button', { class: 'btn btn-primary', onclick: () => pettyExpenseDialog(box.id, accounts) }, '+ Expense'),
+      h('button', { class: 'btn btn-primary', onclick: () => pettyExpenseDialog(box.id, accounts, tags) }, '+ Expense'),
     ]),
     h('div', { class: 'filters report-dates' },
       pc.accounts.length > 1 && select('account', String(box.id), pc.accounts.map(a => [String(a.id), `${a.code} · ${a.name}`]), { 'aria-label': 'Cash box', onchange: e => go('account', e.target.value) }),
@@ -5044,6 +5045,468 @@ async function viewPettyCash(params) {
       h('ul', { class: 'list' }, pc.money_in.map(m => h('li', {},
         h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/journals/${m.id}` }, m.number), h('div', { class: 'meta' }, `${fmtDate(m.entry_date)} · ${m.memo || ''}`)),
         h('strong', {}, money(m.amount)))))));
+}
+
+// ---------- Excel export (.xlsx, built in the browser) ----------
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+/** A zip file (stored, no compression) from [{name, text}]. */
+function zipFiles(files) {
+  const enc = new TextEncoder();
+  const parts = []; const central = []; let offset = 0;
+  const u16 = n => [n & 0xFF, (n >>> 8) & 0xFF];
+  const u32 = n => [n & 0xFF, (n >>> 8) & 0xFF, (n >>> 16) & 0xFF, (n >>> 24) & 0xFF];
+  for (const f of files) {
+    const name = enc.encode(f.name); const data = enc.encode(f.text); const crc = crc32(data);
+    const head = [...u32(0x04034b50), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length), ...u16(name.length), ...u16(0)];
+    parts.push(new Uint8Array(head), name, data);
+    central.push(new Uint8Array([...u32(0x02014b50), ...u16(20), ...u16(20), ...u16(0x0800), ...u16(0), ...u16(0), ...u16(0x21), ...u32(crc), ...u32(data.length), ...u32(data.length),
+      ...u16(name.length), ...u16(0), ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(offset)]), name);
+    offset += head.length + name.length + data.length;
+  }
+  const size = central.reduce((t, p) => t + p.length, 0);
+  const end = new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0), ...u16(files.length), ...u16(files.length), ...u32(size), ...u32(offset), ...u16(0)]);
+  return new Blob([...parts, ...central, end], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+}
+
+const xmlEsc = s => String(s ?? '').replace(/[<>&"]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' })[c]).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+
+/** Report rows to an Excel workbook: title, subtitle, a bold header, numbers as real numbers in numCols, {text} cells bold. */
+function buildXlsx(title, subtitle, header, rows, numCols = []) {
+  const col = i => { let s = ''; i += 1; while (i) { const m = (i - 1) % 26; s = String.fromCharCode(65 + m) + s; i = Math.floor((i - 1) / 26); } return s; };
+  const cell = (r, c, v, bold) => {
+    const ref = `${col(c)}${r}`;
+    const raw = v && typeof v === 'object' ? v.text : v;
+    const isBold = bold || (v && typeof v === 'object');
+    const num = numCols.includes(c) && raw !== '' && raw != null ? Number(String(raw).replace(/,/g, '').replace(/^\((.*)\)$/, '-$1').replace(/ Cr$/, '')) * (/ Cr$/.test(String(raw)) ? -1 : 1) : NaN;
+    if (Number.isFinite(num)) return `<c r="${ref}" s="${isBold ? 3 : 2}"><v>${num}</v></c>`;
+    if (raw === '' || raw == null) return '';
+    return `<c r="${ref}" t="inlineStr"${isBold ? ' s="1"' : ''}><is><t xml:space="preserve">${xmlEsc(raw)}</t></is></c>`;
+  };
+  const lines = [[title], [subtitle], [], header, ...rows];
+  const sheetRows = lines.map((r, i) => `<row r="${i + 1}">${r.map((v, c) => cell(i + 1, c, v, i === 0 || i === 3)).join('')}</row>`).join('');
+  const widths = header.map((h0, c) => Math.min(60, Math.max(10, String(h0).length + 2, ...rows.map(r => String(r[c] && typeof r[c] === 'object' ? r[c].text : r[c] ?? '').length + 2))));
+  const sheet = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join('')}</cols><sheetData>${sheetRows}</sheetData></worksheet>`;
+  return zipFiles([
+    { name: '[Content_Types].xml', text: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>' },
+    { name: '_rels/.rels', text: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+    { name: 'xl/workbook.xml', text: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${xmlEsc(title.replace(/[\\/?*[\]:]/g, ' ').slice(0, 31))}" sheetId="1" r:id="rId1"/></sheets></workbook>` },
+    { name: 'xl/_rels/workbook.xml.rels', text: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>' },
+    { name: 'xl/styles.xml', text: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0.00;-#,##0.00"/></numFmts><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="4"><xf/><xf fontId="1" applyFont="1"/><xf numFmtId="164" applyNumberFormat="1"/><xf numFmtId="164" fontId="1" applyNumberFormat="1" applyFont="1"/></cellXfs></styleSheet>' },
+    { name: 'xl/worksheets/sheet1.xml', text: sheet },
+  ]);
+}
+
+function downloadXlsx(filename, title, subtitle, header, rows, numCols) {
+  try {
+    const url = URL.createObjectURL(buildXlsx(title, subtitle, header, rows, numCols));
+    const a = h('a', { href: url, download: filename });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (err) { toast('Could not create the Excel file: ' + err.message, true); }
+}
+
+// ---------- tags for profitability ----------
+
+/** Optional customer / type of work / department selects (department follows the type of work unless chosen). */
+function profitTagFields(tags, value = {}, { customer = true, workType = true } = {}) {
+  const dep = select('department_id', value.department_id ? String(value.department_id) : '', [['', 'None'], ...tags.departments.map(d => [String(d.id), d.name])]);
+  const wt = workType && select('work_type_id', value.work_type_id ? String(value.work_type_id) : '', [['', 'None'], ...tags.work_types.map(w => [String(w.id), w.name])], {
+    onchange: e => { const w = tags.work_types.find(x => String(x.id) === e.target.value); if (w && w.department_id && !dep.value) dep.value = String(w.department_id); },
+  });
+  return [
+    customer && field('For customer (optional)', select('customer_id', value.customer_id ? String(value.customer_id) : '', [['', 'None'], ...tags.customers.map(c => [String(c.id), c.name])]),
+      { hint: 'A cost of that customer\'s job: counts in profitability by client.' }),
+    wt && field('Type of work (optional)', wt),
+    field('Department (optional)', dep),
+  ].filter(Boolean);
+}
+
+// ---------- journal lines editor ----------
+
+/** Editable journal lines (account, description, customer on receivable lines, debit, credit) with a running balance check. */
+function journalLinesEditor(accounts, customers, { usable = () => true, initial = [] } = {}) {
+  const tbody = h('tbody', {});
+  const totals = h('p', { class: 'journal-totals' });
+  const recalc = () => {
+    let dr = 0; let cr = 0;
+    for (const row of tbody.rows) {
+      dr += Number(row.querySelector('.j-dr').value) || 0;
+      cr += Number(row.querySelector('.j-cr').value) || 0;
+    }
+    dr = round2(dr); cr = round2(cr);
+    const diff = round2(dr - cr);
+    totals.replaceChildren(`Debits ${money(dr)} · Credits ${money(cr)} · `,
+      diff === 0 && dr > 0 ? h('strong', { class: 'ok' }, 'Balanced ✓') : h('strong', { class: 'bad' }, `Difference ${money(Math.abs(diff))}`));
+    return diff;
+  };
+  const addLine = (l = {}) => {
+    const custCell = h('td', {});
+    const acct = accountSelect('', l.account_id, accounts, { class: 'j-acct', 'aria-label': 'Account', required: true }, usable);
+    const showCustomer = () => {
+      const a = accounts.find(x => String(x.id) === acct.value);
+      custCell.replaceChildren(a && ['receivable', 'customer_advance'].includes(a.subtype)
+        ? select('', l.customer_id ? String(l.customer_id) : '', [['', 'Customer (optional)'], ...customers.map(c => [String(c.id), c.name])],
+          { class: 'j-cust', 'aria-label': 'Customer' })
+        : '');
+    };
+    acct.addEventListener('change', showCustomer);
+    const dr = h('input', { class: 'j-dr', type: 'number', min: '0', step: '0.01', value: Number(l.debit) ? l.debit : '', 'aria-label': 'Debit', placeholder: '0.00', oninput: recalc });
+    const cr = h('input', { class: 'j-cr', type: 'number', min: '0', step: '0.01', value: Number(l.credit) ? l.credit : '', 'aria-label': 'Credit', placeholder: '0.00', oninput: recalc });
+    const row = h('tr', {},
+      h('td', {}, acct),
+      h('td', {}, h('input', { class: 'j-desc', value: l.description ?? '', maxlength: 300, 'aria-label': 'Line description', placeholder: 'Optional' })),
+      custCell, h('td', {}, dr), h('td', {}, cr),
+      h('td', {}, h('button', { class: 'btn btn-danger btn-sm', type: 'button', 'aria-label': 'Remove line',
+        onclick: () => { if (tbody.rows.length > 2) { row.remove(); recalc(); } } }, '×')));
+    tbody.append(row);
+    showCustomer();
+    recalc();
+    return row;
+  };
+  (initial.length ? initial : [{}, {}]).forEach(l => addLine(l));
+  const read = () => [...tbody.rows].map(r => ({
+    account_id: r.querySelector('.j-acct').value, description: r.querySelector('.j-desc').value,
+    debit: r.querySelector('.j-dr').value, credit: r.querySelector('.j-cr').value,
+    customer_id: r.querySelector('.j-cust') ? r.querySelector('.j-cust').value : null,
+  }));
+  const table = h('div', { class: 'table-wrap' }, h('table', { class: 'inv-edit journal-edit' },
+    h('thead', {}, h('tr', {}, h('th', {}, 'Account'), h('th', {}, 'Line description'), h('th', {}, 'Customer'),
+      h('th', {}, 'Debit (AED)'), h('th', {}, 'Credit (AED)'), h('th', {}, ''))),
+    tbody));
+  return { tbody, totals, table, addLine, recalc, read };
+}
+
+// ---------- recurring journals ----------
+
+async function runRecurringJournals(rid) {
+  try {
+    const res = await rpc('run_recurring_journals', { p_id: rid || null });
+    toast(res.created.length ? `Posted ${res.created.length} entr${res.created.length === 1 ? 'y' : 'ies'}: ${res.created.map(c => c.number).join(', ')}` : 'Nothing due');
+    render();
+  } catch (err) { toast(err.message, true); }
+}
+
+async function viewRecurringJournals() {
+  const data = await rpc('list_recurring_journals');
+  const due = data.rows.filter(r => r.due).length;
+  return layout('finance-recurring-journals',
+    pageHead('Recurring journals', 'The same entry every period: rent or salary accruals, depreciation, standing orders, loan instalments.', [
+      due > 0 && h('button', { class: 'btn btn-primary', onclick: () => runRecurringJournals(null) }, `Post due entries (${due})`),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/recurring-journals/new' }, '+ Recurring journal'),
+    ]),
+    h('section', { class: 'card' },
+      data.rows.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Description'), h('th', { class: 'hide-sm' }, 'Repeats'), h('th', {}, 'Next'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Status'))),
+            h('tbody', {}, data.rows.map(r => h('tr', { class: r.active ? '' : 'row-off' },
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/recurring-journals/${r.id}` }, r.memo),
+                r.last_journal_number && h('div', { class: 'meta muted' }, `Last: ${r.last_journal_number}`)),
+              h('td', { class: 'hide-sm' }, EVERY[r.every_months]),
+              h('td', {}, r.active ? fmtDate(r.next_date) : '—'),
+              h('td', { class: 'num' }, money(r.amount)),
+              h('td', {}, recurringBadge(r)))))))
+        : h('p', { class: 'empty' }, 'No recurring journals yet.')),
+    h('p', { class: 'muted' }, 'Due entries are posted when you click "Post due entries" (also offered on the Finance overview). Each can be reversed like any manual entry.'));
+}
+
+function recurringJournalForm(r, accounts, customers, tags, onSubmit, cancelHref) {
+  const ed = journalLinesEditor(accounts, customers, { initial: r.lines || [], usable: a => a.type !== 'equity' || a.subtype === 'equity' });
+  return handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Description', input('memo', r.memo, { required: true, maxlength: 500, placeholder: 'e.g. Office rent accrual for {period}' }), { full: true,
+        hint: '{period} becomes the month, e.g. "November 2026".' }),
+      field('Repeats', select('every_months', String(r.every_months || 1), Object.entries(EVERY))),
+      field('Next entry date', input('next_date', r.next_date || localToday(), { type: 'date', required: true })),
+      field('Stop after (optional)', input('end_date', r.end_date, { type: 'date' })),
+      field('Reference (optional)', input('reference', r.reference, { maxlength: 100 })),
+      field('Department (optional)', select('department_id', r.department_id ? String(r.department_id) : '', [['', 'None'], ...tags.departments.map(d => [String(d.id), d.name])]),
+        { hint: 'Tags the income and expense lines for profitability by department.' })),
+    h('div', { class: 'field', 'data-field': 'lines' }, h('label', {}, 'Lines'), ed.table,
+      h('div', { class: 'inv-edit-foot' }, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => ed.addLine() }, '+ Add line'), ed.totals)),
+    r.id && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: r.active !== false }), 'Active'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, r.id ? 'Save changes' : 'Save'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  data => { data.lines = ed.read(); if (!r.id) data.active = true; return onSubmit(data); });
+}
+
+async function viewRecurringJournalNew() {
+  const [accounts, customers, tags] = await Promise.all([rpc('list_accounts', { p_include_inactive: false }), rpc('customer_options'), rpc('profit_tags')]);
+  return layout('finance-recurring-journals', pageHead('New recurring journal', null, null, h('a', { href: '#/finance/recurring-journals' }, '← Recurring journals')),
+    h('section', { class: 'card' }, recurringJournalForm({}, accounts, customers, tags, async data => {
+      const rid = await rpc('save_recurring_journal', { p_id: null, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/recurring-journals/${rid}`;
+    }, '#/finance/recurring-journals')));
+}
+
+async function viewRecurringJournalEdit(id) {
+  const [{ recurring: r }, accounts, customers, tags] = await Promise.all([rpc('get_recurring_journal', { p_id: id }),
+    rpc('list_accounts', { p_include_inactive: false }), rpc('customer_options'), rpc('profit_tags')]);
+  return layout('finance-recurring-journals', pageHead(`Edit "${r.memo}"`, null, null, h('a', { href: `#/finance/recurring-journals/${id}` }, '← Back')),
+    h('section', { class: 'card' }, recurringJournalForm(r, accounts, customers, tags, async data => {
+      await rpc('save_recurring_journal', { p_id: id, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/recurring-journals/${id}`;
+    }, `#/finance/recurring-journals/${id}`)));
+}
+
+async function viewRecurringJournal(id) {
+  const { recurring: r, today } = await rpc('get_recurring_journal', { p_id: id });
+  const due = r.active && r.next_date <= today;
+  return layout('finance-recurring-journals',
+    pageHead(r.memo, EVERY[r.every_months], [
+      due && h('button', { class: 'btn btn-primary', onclick: () => runRecurringJournals(r.id) }, 'Post due entry now'),
+      h('a', { class: 'btn btn-secondary', href: `#/finance/recurring-journals/${r.id}/edit` }, 'Edit'),
+      h('button', { class: 'btn btn-danger', onclick: async () => {
+        if (!confirmAction('Delete this recurring journal? Entries already posted stay.')) return;
+        try { await rpc('delete_recurring_journal', { p_id: r.id }); toast('Deleted'); location.hash = '#/finance/recurring-journals'; } catch (err) { toast(err.message, true); }
+      } }, 'Delete'),
+    ], [h('a', { href: '#/finance/recurring-journals' }, '← Recurring journals'), ' ', recurringBadge({ ...r, due })]),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [['Next entry', r.active ? fmtDate(r.next_date) : 'Stopped'], ['Stops after', r.end_date && fmtDate(r.end_date)],
+        ['Reference', r.reference], ['Department', r.department_name]].filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Account'), h('th', {}, 'Description'), h('th', { class: 'num' }, 'Debit'), h('th', { class: 'num' }, 'Credit'))),
+        h('tbody', {}, r.lines.map(l => h('tr', {}, h('td', {}, `${l.code} · ${l.account}`, l.customer_name && h('div', { class: 'meta muted' }, l.customer_name)),
+          h('td', {}, l.description || ''), h('td', { class: 'num' }, amt0(l.debit)), h('td', { class: 'num' }, amt0(l.credit)))))))),
+    h('section', { class: 'card' }, h('h2', {}, 'Entries posted'),
+      r.journals.length ? h('ul', { class: 'list' }, r.journals.map(j => h('li', { class: j.reversed ? 'done' : '' },
+        h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/journals/${j.id}` }, j.number), h('div', { class: 'meta' }, `${fmtDate(j.entry_date)} · ${j.memo}`)),
+        j.reversed && h('span', { class: 'badge inv-cancelled' }, 'Reversed'))))
+        : h('p', { class: 'empty' }, 'None yet.')));
+}
+
+// ---------- accruals and prepayments schedules ----------
+
+const SCHEDULE_KIND = { prepayment: 'Prepayment', accrual: 'Accrual' };
+
+async function runSchedules(sid) {
+  try {
+    const res = await rpc('run_schedules', { p_id: sid || null });
+    toast(res.created.length ? `Posted ${res.created.length} month${res.created.length === 1 ? '' : 's'}` : 'Nothing due');
+    render();
+  } catch (err) { toast(err.message, true); }
+}
+
+async function viewSchedules() {
+  const data = await rpc('list_schedules');
+  const due = data.rows.reduce((t, r) => t + Number(r.due), 0);
+  return layout('finance-schedules',
+    pageHead('Accruals & prepayments', 'Spread a cost over the months it belongs to.', [
+      due > 0 && h('button', { class: 'btn btn-primary', onclick: () => runSchedules(null) }, `Post ended months (${due})`),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/schedules/new?kind=prepayment' }, '+ Prepayment'),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/schedules/new?kind=accrual' }, '+ Accrual'),
+    ]),
+    h('section', { class: 'card' },
+      data.rows.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Type'), h('th', { class: 'hide-sm' }, 'Expense account'), h('th', { class: 'num' }, 'Total'),
+              h('th', { class: 'num' }, 'Posted'), h('th', {}, 'Status'))),
+            h('tbody', {}, data.rows.map(r => h('tr', { class: r.active ? '' : 'row-off' },
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/schedules/${r.id}` }, r.name),
+                h('div', { class: 'meta muted' }, `${r.months} months from ${new Date(r.start_month + 'T00:00:00').toLocaleString('en-GB', { month: 'short', year: 'numeric' })}`)),
+              h('td', {}, SCHEDULE_KIND[r.kind]), h('td', { class: 'hide-sm' }, r.expense_account),
+              h('td', { class: 'num' }, money(r.total)), h('td', { class: 'num' }, `${money(r.posted)} (${r.months_posted}/${r.months})`),
+              h('td', {}, !r.active ? h('span', { class: 'badge inv-cancelled' }, 'Stopped')
+                : Number(r.due) > 0 ? h('span', { class: 'badge badge-overdue' }, `${r.due} to post`)
+                  : Number(r.months_posted) >= r.months ? h('span', { class: 'badge inv-paid' }, 'Complete') : h('span', { class: 'badge inv-sent' }, 'Up to date')))))))
+        : h('p', { class: 'empty' }, 'None yet.')),
+    h('p', { class: 'muted' }, 'Prepayment: record the payment or bill to "Prepaid expenses" first (e.g. a year of insurance); each month-end posts one month to the expense. Accrual: builds up the cost each month in "Accrued expenses" before the bill arrives (e.g. the annual audit fee); post the bill to "Accrued expenses" when it comes.'));
+}
+
+function scheduleForm(s, kind, accounts, tags, onSubmit, cancelHref) {
+  const isPre = kind === 'prepayment';
+  const total = input('total', s.total, { type: 'number', min: '0.01', step: '0.01', required: true });
+  const months = input('months', s.months || 12, { type: 'number', min: 1, max: 120, required: true });
+  const each = h('p', { class: 'muted' });
+  const upd = () => { const t = Number(total.value); const m = Number(months.value); each.textContent = t > 0 && m > 0 ? `${money(round2(t / m))} a month` : ''; };
+  total.addEventListener('input', upd); months.addEventListener('input', upd); upd();
+  return handleForm(h('form', { class: 'form' },
+    h('input', { type: 'hidden', name: 'kind', value: kind }),
+    h('div', { class: 'form-grid' },
+      field('Name', input('name', s.name, { required: true, maxlength: 200, placeholder: isPre ? 'e.g. Vehicle insurance 2026' : 'e.g. Annual audit fee 2026' }), { full: true }),
+      field(isPre ? 'Amount paid in advance (AED, excl. VAT)' : 'Expected total cost (AED, excl. VAT)', total),
+      field('Over how many months', months),
+      field('First month', input('start_month', s.start_month ? s.start_month.slice(0, 7) : localToday().slice(0, 7), { type: 'month', required: true })),
+      field('Expense account', accountSelect('expense_account_id', s.expense_account_id, accounts, { required: true }, a => a.type === 'expense')),
+      field(isPre ? 'Prepaid account' : 'Accrued expenses account', accountSelect('balance_account_id', s.balance_account_id || (accounts.find(a => a.system_key === (isPre ? 'prepaid' : 'accruals')) || {}).id,
+        accounts, { required: true }, a => (isPre ? a.type === 'asset' && a.subtype === 'current_asset' : a.type === 'liability' && a.subtype === 'current_liability'))),
+      field('Department (optional)', select('department_id', s.department_id ? String(s.department_id) : '', [['', 'None'], ...tags.departments.map(d => [String(d.id), d.name])])),
+      field('Notes (optional)', textarea('notes', s.notes, { rows: 2, maxlength: 1000 }), { full: true })),
+    each,
+    s.id && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: s.active !== false }), 'Active'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, s.id ? 'Save changes' : 'Save'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  data => { data.start_month = `${data.start_month}-01`; if (!s.id) data.active = true; return onSubmit(data); });
+}
+
+async function viewScheduleNew(params) {
+  const kind = params.kind === 'accrual' ? 'accrual' : 'prepayment';
+  const [accounts, tags] = await Promise.all([rpc('list_accounts', { p_include_inactive: false }), rpc('profit_tags')]);
+  return layout('finance-schedules', pageHead(kind === 'prepayment' ? 'New prepayment' : 'New accrual', null, null, h('a', { href: '#/finance/schedules' }, '← Accruals & prepayments')),
+    h('section', { class: 'card' }, scheduleForm({}, kind, accounts, tags, async data => {
+      const sid = await rpc('save_schedule', { p_id: null, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/schedules/${sid}`;
+    }, '#/finance/schedules')));
+}
+
+async function viewScheduleEdit(id) {
+  const [{ schedule: s }, accounts, tags] = await Promise.all([rpc('get_schedule', { p_id: id }), rpc('list_accounts', { p_include_inactive: false }), rpc('profit_tags')]);
+  return layout('finance-schedules', pageHead(`Edit ${s.name}`, null, null, h('a', { href: `#/finance/schedules/${id}` }, '← Back')),
+    h('section', { class: 'card' }, scheduleForm(s, s.kind, accounts, tags, async data => {
+      await rpc('save_schedule', { p_id: id, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/schedules/${id}`;
+    }, `#/finance/schedules/${id}`)));
+}
+
+async function viewSchedule(id) {
+  const { schedule: s, plan, today } = await rpc('get_schedule', { p_id: id });
+  const due = s.active ? plan.filter(p => !p.posting_id && p.post_on <= today).length : 0;
+  const posted = plan.filter(p => p.posting_id).reduce((t, p) => t + Number(p.amount), 0);
+  const monthName = d => new Date(d + 'T00:00:00').toLocaleString('en-GB', { month: 'long', year: 'numeric' });
+  const header = ['Month', 'Posted on', 'Amount', s.kind === 'prepayment' ? 'Still prepaid after' : 'Left to accrue after', 'Entry'];
+  const rows = plan.map(p => [monthName(p.period), fmtDate(p.post_on), amount(p.amount), amount(p.balance_after), p.journal_number || '']);
+  return layout('finance-schedules',
+    pageHead(s.name, `${SCHEDULE_KIND[s.kind]} · ${money(s.total)} over ${s.months} months`, [
+      due > 0 && h('button', { class: 'btn btn-primary', onclick: () => runSchedules(s.id) }, `Post ended months (${due})`),
+      ...exportButtons(`Schedule-${s.name.replace(/[^A-Za-z0-9]+/g, '-')}`, `${SCHEDULE_KIND[s.kind]} schedule: ${s.name}`, `${s.expense_account} · ${money(s.total)} over ${s.months} months`, header, rows, [2, 3]),
+      h('a', { class: 'btn btn-secondary', href: `#/finance/schedules/${s.id}/edit` }, 'Edit'),
+      !plan.some(p => p.posting_id) && h('button', { class: 'btn btn-danger', onclick: async () => {
+        if (!confirmAction(`Delete "${s.name}"?`)) return;
+        try { await rpc('delete_schedule', { p_id: s.id }); toast('Deleted'); location.hash = '#/finance/schedules'; } catch (err) { toast(err.message, true); }
+      } }, 'Delete'),
+    ], [h('a', { href: '#/finance/schedules' }, '← Accruals & prepayments'), ' ', !s.active && h('span', { class: 'badge inv-cancelled' }, 'Stopped')]),
+    h('dl', { class: 'pay-summary' },
+      h('div', {}, h('dt', {}, 'Total'), h('dd', {}, money(s.total))),
+      h('div', {}, h('dt', {}, 'Expensed so far'), h('dd', {}, money(posted))),
+      h('div', {}, h('dt', {}, s.kind === 'prepayment' ? 'Still prepaid' : 'Still to accrue'), h('dd', {}, money(s.total - posted)))),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [['Expense account', s.expense_account], [s.kind === 'prepayment' ? 'Prepaid account' : 'Accrued expenses account', s.balance_account],
+        ['Department', s.department_name], ['Notes', s.notes]].filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+        h('thead', {}, h('tr', {}, header.map((x, i) => h('th', { class: [2, 3].includes(i) ? 'num' : '' }, x)), h('th', {}, ''))),
+        h('tbody', {}, plan.map(p => h('tr', {},
+          h('td', {}, monthName(p.period)), h('td', {}, fmtDate(p.post_on)), h('td', { class: 'num' }, amount(p.amount)), h('td', { class: 'num' }, amount(p.balance_after)),
+          h('td', {}, p.journal_id ? h('a', { href: `#/finance/journals/${p.journal_id}` }, p.journal_number)
+            : p.post_on <= today ? h('span', { class: 'badge badge-overdue' }, 'To post') : h('span', { class: 'muted' }, 'Later')),
+          h('td', {}, p.posting_id && h('button', { class: 'btn btn-secondary btn-sm', onclick: async () => {
+            if (!confirmAction(`Undo ${monthName(p.period)}? Its entry is reversed.`)) return;
+            try { await rpc('undo_schedule_posting', { p_id: p.posting_id }); toast('Undone'); render(); } catch (err) { toast(err.message, true); }
+          } }, 'Undo')))))))));
+}
+
+// ---------- departments (on the Types page) ----------
+
+function departmentDialog(d, refresh) {
+  const dlg = openDialog(d.id ? `Edit "${d.name}"` : 'Add department', handleForm(h('form', { class: 'form' },
+    field('Name', input('name', d.name, { required: true, maxlength: 100 })),
+    d.id && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: d.active }), 'In use'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('save_department', { p_id: d.id || null, p_name: data.name, p_active: d.id ? data.active : true });
+    dlg.close();
+    toast('Saved');
+    refresh();
+  }));
+}
+
+function departmentsCard(departments, refresh) {
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', {}, 'Departments'),
+      h('button', { class: 'btn btn-secondary btn-sm', onclick: () => departmentDialog({}, refresh) }, '+ Add department')),
+    h('p', { class: 'muted' }, 'For profitability by department. Each type of work belongs to a department (Edit it below); bills, journals and petty cash can be given one too.'),
+    h('ul', { class: 'list' }, departments.map(d => h('li', { class: d.active ? '' : 'done' },
+      h('div', { class: 'grow' }, h('div', { class: 'body' }, d.name), h('div', { class: 'meta' }, d.work_types.length ? d.work_types.join(', ') : 'No types of work')),
+      !d.active && h('span', { class: 'badge badge-inactive' }, 'Switched off'),
+      h('button', { class: 'btn btn-secondary btn-sm', onclick: () => departmentDialog(d, refresh) }, 'Edit')))));
+}
+
+// ---------- reports: cash flow, profitability ----------
+
+async function cashFlowReport(from, to) {
+  const cf = await rpc('cash_flow', { p_from: from, p_to: to });
+  const rows = [];
+  const add = (label, amt, kind) => rows.push({ label, amt, kind });
+  add('Cash flows from operating activities', null, 'section');
+  add('Profit for the period', cf.profit);
+  cf.adjustments.forEach(x => add(`Add back: ${x.name} (non-cash)`, x.amount));
+  cf.working_capital.forEach(x => add(`Change in ${x.name}`, x.amount));
+  add('Net cash from operating activities', cf.operating_total, 'total');
+  add('Cash flows from investing activities', null, 'section');
+  cf.investing.forEach(x => add(`${Number(x.amount) < 0 ? 'Purchase of' : 'Sale of'} ${x.name}`, x.amount));
+  if (!cf.investing.length) add('None', 0);
+  add('Net cash from investing activities', cf.investing_total, 'total');
+  add('Cash flows from financing activities', null, 'section');
+  cf.financing.forEach(x => add(x.name, x.amount));
+  if (!cf.financing.length) add('None', 0);
+  add('Net cash from financing activities', cf.financing_total, 'total');
+  const net = round2(Number(cf.operating_total) + Number(cf.investing_total) + Number(cf.financing_total));
+  add('Net change in cash and bank', net, 'grand');
+  add('Cash and bank at the start', cf.cash_start);
+  add('Cash and bank at the end', cf.cash_end, 'grand');
+  const ok = round2(Number(cf.cash_start) + net) === round2(Number(cf.cash_end));
+  return {
+    title: 'Cash flow statement', subtitle: `${fmtDate(cf.from)} – ${fmtDate(cf.to)} · indirect method`,
+    header: ['', 'AED'], numCols: [1],
+    exportRows: rows.map(r => (r.kind ? [{ text: r.label }, r.amt == null ? '' : { text: amount(r.amt) }] : [r.label, amount(r.amt)])),
+    body: [
+      h('div', { class: 'table-wrap' }, h('table', { class: 'report report-narrow' }, h('tbody', {}, rows.map(r =>
+        h('tr', { class: r.kind === 'section' ? 'section-row' : r.kind === 'total' ? 'total-row' : r.kind === 'grand' ? 'grand-row' : '' },
+          h('td', {}, r.label), h('td', { class: 'num' }, r.amt == null ? '' : amount(r.amt))))))),
+      h('p', { class: ok ? 'muted' : 'form-error' }, ok ? 'Agrees with the cash and bank balances ✓' : 'Does not agree with the cash and bank balances: check entries between cash and opening balances.'),
+      h('p', { class: 'hint' }, 'Opening balance entries are treated as cash at the start, not as cash flows. Cheques in hand count as receivables until cleared.')],
+  };
+}
+
+const PROFIT_BY = { customer: 'Client', work_type: 'Service', department: 'Department' };
+
+async function profitabilityReport(from, to, by, go) {
+  const p = await rpc('profitability', { p_from: from, p_to: to, p_by: by });
+  const pct = (a, b) => (Number(b) ? `${Math.round(Number(a) / Number(b) * 1000) / 10}%` : '—');
+  const tot = { revenue: 0, direct: 0, other: 0 };
+  const rows = p.rows.map(r => {
+    const gp = Number(r.revenue) - Number(r.direct_costs);
+    const np = gp - Number(r.other_expenses);
+    tot.revenue += Number(r.revenue); tot.direct += Number(r.direct_costs); tot.other += Number(r.other_expenses);
+    return { r, gp, np };
+  });
+  const tgp = tot.revenue - tot.direct; const tnp = tgp - tot.other;
+  const header = [PROFIT_BY[by], 'Revenue', 'Direct costs', 'Gross profit', 'Gross margin', 'Other expenses', 'Net profit'];
+  const exportRows = [...rows.map(({ r, gp, np }) => [r.name, amount(r.revenue), amount(r.direct_costs), amount(gp), pct(gp, r.revenue), amount(r.other_expenses), amount(np)]),
+    [{ text: 'Total' }, { text: amount(tot.revenue) }, { text: amount(tot.direct) }, { text: amount(tgp) }, { text: pct(tgp, tot.revenue) }, { text: amount(tot.other) }, { text: amount(tnp) }]];
+  return {
+    title: `Profitability by ${PROFIT_BY[by].toLowerCase()}`, subtitle: `${fmtDate(p.from)} – ${fmtDate(p.to)}`, header, exportRows, numCols: [1, 2, 3, 5, 6],
+    body: [
+      h('div', { class: 'tabs tabs-sub' }, Object.entries(PROFIT_BY).map(([k, label]) => h('button', { type: 'button', 'aria-pressed': String(by === k), onclick: () => go({ by: k }) }, `By ${label.toLowerCase()}`))),
+      rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+        h('thead', {}, h('tr', {}, header.map((x, i) => h('th', { class: i ? 'num' : '' }, x)))),
+        h('tbody', {}, rows.map(({ r, gp, np }) => h('tr', { class: r.key == null ? 'row-off' : '' },
+          h('td', {}, by === 'customer' && r.key != null ? h('a', { class: 'row-link', href: `#/finance/customers/${r.key}/statement` }, r.name) : r.name),
+          h('td', { class: 'num' }, amount(r.revenue)), h('td', { class: 'num' }, amount(r.direct_costs)), h('td', { class: 'num' }, amount(gp)),
+          h('td', { class: 'num' }, pct(gp, r.revenue)), h('td', { class: 'num' }, amount(r.other_expenses)),
+          h('td', { class: 'num' }, h('strong', { class: np < 0 ? 'text-bad' : '' }, amount(np))))),
+          h('tr', { class: 'total-row' }, h('td', {}, 'Total'), h('td', { class: 'num' }, amount(tot.revenue)), h('td', { class: 'num' }, amount(tot.direct)),
+            h('td', { class: 'num' }, amount(tgp)), h('td', { class: 'num' }, pct(tgp, tot.revenue)), h('td', { class: 'num' }, amount(tot.other)), h('td', { class: 'num' }, amount(tnp))))))
+        : h('p', { class: 'empty' }, 'No income or expenses in this period.'),
+      h('p', { class: 'hint' }, 'Revenue comes from tax invoices and credit notes (client, and the task\'s type of work and its department). Costs count where a bill, journal or petty cash expense was given a client, type of work or department; the rest is under "Not assigned". The total equals the profit and loss.')],
+  };
 }
 
 // ---------- users (admin) ----------
@@ -5232,6 +5695,14 @@ async function render() {
       else if ((m = path.match(/^\/finance\/recurring\/(\d+)\/edit$/))) view = await viewRecurringEdit(Number(m[1]));
       else if (path === '/finance/reconcile') view = await viewReconcile(params);
       else if (path === '/finance/petty-cash') view = await viewPettyCash(params);
+      else if (path === '/finance/recurring-journals') view = await viewRecurringJournals();
+      else if (path === '/finance/recurring-journals/new') view = await viewRecurringJournalNew();
+      else if ((m = path.match(/^\/finance\/recurring-journals\/(\d+)$/))) view = await viewRecurringJournal(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/recurring-journals\/(\d+)\/edit$/))) view = await viewRecurringJournalEdit(Number(m[1]));
+      else if (path === '/finance/schedules') view = await viewSchedules();
+      else if (path === '/finance/schedules/new') view = await viewScheduleNew(params);
+      else if ((m = path.match(/^\/finance\/schedules\/(\d+)$/))) view = await viewSchedule(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/schedules\/(\d+)\/edit$/))) view = await viewScheduleEdit(Number(m[1]));
       else if (path === '/renewals') view = await viewRenewals(params);
       else if (path === '/renewals/new') view = await viewRenewalNew(params);
       else if ((m = path.match(/^\/renewals\/(\d+)$/))) view = await viewRenewal(Number(m[1]));

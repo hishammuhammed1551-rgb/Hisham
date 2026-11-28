@@ -728,7 +728,7 @@ test('finance: postings from invoices, opening balances, journals, reversal, ban
   await admin.waitForSelector('h2:text("Profit and loss")');
   assert.ok(await admin.isVisible('a.row-link:text("6400 · Bank charges")'));
   assert.ok(await admin.isVisible('tr.grand-row:has-text("Gross profit")'));
-  const [csv] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text("Excel (CSV)")')]);
+  const [csv] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text-is("CSV")')]);
   assert.match(fs.readFileSync(await csv.path(), 'utf8'), /^﻿Account,AED\r\nRevenue,/);
   if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-pl.png`, fullPage: true });
   await admin.click('.tabs button:text("Balance sheet")');
@@ -840,7 +840,7 @@ test('payables and VAT: supplier, bill with reverse charge, duplicate check, pay
   await admin.waitForSelector('text=Matches the ledger ✓');
   assert.ok(await admin.isVisible('tr:has(td:text-is("10")) >> text=50.00'));
   assert.ok(await admin.isVisible('a:text("GF-1001")') || await admin.isVisible('a:has-text("BILL-")'));
-  const [csv] = await Promise.all([admin.waitForEvent('download'), admin.locator('.card-head button:text("Excel (CSV)")').click()]);
+  const [csv] = await Promise.all([admin.waitForEvent('download'), admin.locator('.card-head button:text-is("CSV")').click()]);
   assert.match(fs.readFileSync(await csv.path(), 'utf8'), /Date,Document,Party,TRN/);
   if (SHOTS) await admin.screenshot({ path: `${SHOTS}/vat-return.png`, fullPage: true });
   admin.once('dialog', d => d.accept());
@@ -968,5 +968,96 @@ test('receivables: credit note, receipt voucher with an advance, statement, agei
 
   await admin.goto(base + '#/finance');
   await admin.waitForSelector('h2:text("Recent entries")');
+  assert.deepEqual(errors, []);
+});
+
+test('finance phase 4: cash flow, profitability, detailed trial balance, Excel export, recurring journal, prepayment schedule, departments, bill tags', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await signIn(admin, 'admin@lowcaps.test');
+  const today = await admin.evaluate(() => new Date().toLocaleDateString('en-CA'));
+
+  // Departments on the Types page; a type of work moved to another department
+  await admin.goto(base + '#/work-types');
+  await admin.waitForSelector('h2:text("Departments")');
+  assert.ok(await admin.isVisible('.list .meta:text("Air freight, Sea freight")'));
+  await admin.click('tr:has-text("Documentation") button:text("Edit")');
+  await admin.selectOption('dialog [name=department_id]', { label: 'Administration' });
+  await admin.click('dialog button:text("Save")');
+  await admin.waitForSelector('tr:has-text("Documentation") td:text("Administration")');
+
+  // A bill tagged to a client's job counts in profitability by client
+  await admin.goto(base + '#/finance/bills/new');
+  await admin.selectOption('[name=supplier_id]', { label: 'Gulf Freight Lines LLC' });
+  await admin.fill('[name=supplier_ref]', 'GF-2002');
+  await admin.locator('.l-desc').nth(0).fill('Trucking for Gulf Traders container');
+  await admin.locator('.b-acct').nth(0).selectOption({ label: '5120 · Transport subcontractors' });
+  await admin.locator('.l-price').nth(0).fill('300');
+  await admin.click('.tag-box summary');
+  await admin.selectOption('[name=customer_id]', { label: 'Gulf Traders LLC' });
+  await admin.selectOption('[name=work_type_id]', { label: 'Land transport' });
+  assert.equal(await admin.$eval('[name=department_id]', el => el.selectedOptions[0].textContent), 'Transport', 'department follows the type of work');
+  await admin.click('button:text("Save as draft")');
+  await admin.waitForSelector('dt:text("For customer")');
+  await admin.click('button:text-is("Post")');
+  await admin.waitForSelector('text=Posted to the books');
+
+  // Reports: profitability, cash flow, detailed trial balance, Excel
+  await admin.goto(base + '#/finance/reports?report=profit');
+  await admin.waitForSelector('h2:text("Profitability by client")');
+  const gulf = admin.locator('tr:has(a.row-link:text("Gulf Traders LLC"))');
+  assert.ok(await gulf.isVisible());
+  assert.ok(Number((await gulf.locator('td').nth(2).textContent()).replace(/,/g, '')) >= 300, 'direct costs include the tagged bill');
+  await admin.click('.tabs-sub button:text("By service")');
+  await admin.waitForSelector('h2:text("Profitability by service")');
+  assert.ok(await admin.isVisible('td:text("Land transport")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/profitability.png`, fullPage: true });
+  const [xlsx] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text-is("Excel")')]);
+  assert.match(xlsx.suggestedFilename(), /^Profitability-by-service-.*\.xlsx$/);
+  const bytes = fs.readFileSync(await xlsx.path());
+  assert.equal(bytes.subarray(0, 2).toString(), 'PK', 'a zip (xlsx) file');
+  assert.ok(bytes.includes('Profitability by service') && bytes.includes('Land transport'));
+
+  await admin.click('.tabs button:text("Cash flow")');
+  await admin.waitForSelector('h2:text("Cash flow statement")');
+  await admin.waitForSelector('text=Agrees with the cash and bank balances ✓');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/cash-flow.png`, fullPage: true });
+  await admin.click('.tabs button:text("Trial balance")');
+  await admin.click('label:has-text("Show customers and suppliers") input');
+  await admin.waitForSelector('h2:text("Detailed trial balance")');
+  assert.ok(await admin.isVisible('tr.sub-row a:text("Gulf Traders LLC")'));
+  assert.ok(await admin.isVisible('text=Debits equal credits ✓'));
+
+  // Recurring journal: monthly depreciation
+  await admin.goto(base + '#/finance/recurring-journals/new');
+  await admin.fill('[name=memo]', 'Depreciation {period}');
+  await admin.locator('.j-acct').nth(0).selectOption({ label: '6700 · Depreciation' });
+  await admin.locator('.j-dr').nth(0).fill('250');
+  await admin.locator('.j-acct').nth(1).selectOption({ label: '1690 · Accumulated depreciation' });
+  await admin.locator('.j-cr').nth(1).fill('250');
+  await admin.waitForSelector('.journal-totals .ok:text("Balanced")');
+  await admin.click('button:text("Save")');
+  await admin.waitForSelector('h1:text("Depreciation {period}")');
+  await admin.click('button:text("Post due entry now")');
+  await admin.waitForSelector('text=Posted 1 entry');
+  const month = new Date(today + 'T00:00:00Z').toLocaleString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  await admin.waitForSelector(`.list .meta:has-text("Depreciation ${month}")`);
+
+  // Prepayment schedule: a year of insurance from two months ago
+  const start = new Date(Date.UTC(Number(today.slice(0, 4)), Number(today.slice(5, 7)) - 3, 1)).toISOString().slice(0, 7);
+  await admin.goto(base + '#/finance/schedules/new?kind=prepayment');
+  await admin.fill('[name=name]', 'Vehicle insurance');
+  await admin.fill('[name=total]', '12000');
+  await admin.fill('[name=start_month]', start);
+  await admin.selectOption('[name=expense_account_id]', { label: '6300 · Vehicle fuel & maintenance' });
+  await admin.waitForSelector('text=AED 1,000.00 a month');
+  await admin.click('button:text("Save")');
+  await admin.waitForSelector('h1:text("Vehicle insurance")');
+  assert.equal(await admin.locator('tbody tr').count(), 12);
+  await admin.click('button:has-text("Post ended months")');
+  await admin.waitForSelector('text=/Posted \\d+ months?/');
+  assert.ok(await admin.isVisible('tbody tr >> nth=0 >> a:has-text("JV-")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/schedule.png`, fullPage: true });
+
   assert.deepEqual(errors, []);
 });

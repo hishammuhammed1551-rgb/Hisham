@@ -729,6 +729,92 @@ create table if not exists public.petty_cash_expenses (
 );
 create index if not exists petty_cash_expenses_date_idx on public.petty_cash_expenses (spent_on);
 
+-- -------------------------------------------------------------------------------------
+-- Finance phase 4: departments and profitability tags, recurring journals,
+-- accruals and prepayments schedules
+-- -------------------------------------------------------------------------------------
+
+alter table public.journals drop constraint if exists journals_source_type_check;
+alter table public.journals add constraint journals_source_type_check check (source_type in ('invoice', 'payment', 'bill', 'supplier_payment',
+  'credit_note', 'receipt', 'petty_cash', 'schedule'));
+
+create table if not exists public.departments (
+  id         bigint generated always as identity primary key,
+  name       text not null check (char_length(btrim(name)) between 1 and 100),
+  active     boolean not null default true,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists departments_name_key on public.departments (lower(name));
+
+alter table public.work_types add column if not exists department_id bigint references public.departments (id) on delete set null;
+
+-- Standard departments (on first install of this phase); linked to the standard types of work near the end of this file.
+insert into public.departments (name)
+select x from unnest(array['Freight forwarding', 'Customs clearance', 'Transport', 'PRO services', 'Administration']) x
+where not exists (select 1 from public.departments);
+
+-- Profitability tags on income and expense lines.
+alter table public.journal_lines add column if not exists work_type_id bigint references public.work_types (id) on delete set null;
+alter table public.journal_lines add column if not exists department_id bigint references public.departments (id) on delete set null;
+create index if not exists journal_lines_customer_idx on public.journal_lines (customer_id) where customer_id is not null;
+
+-- Optional tags on bills (a cost for a customer's job, a service, a department) and petty cash.
+alter table public.bills add column if not exists customer_id bigint references public.customers (id) on delete set null;
+alter table public.bills add column if not exists work_type_id bigint references public.work_types (id) on delete set null;
+alter table public.bills add column if not exists department_id bigint references public.departments (id) on delete set null;
+alter table public.petty_cash_expenses add column if not exists department_id bigint references public.departments (id) on delete set null;
+
+-- Which accounts are what for the cash flow statement.
+update public.accounts set system_key = 'accum_depreciation' where code = '1690' and system_key is null
+  and not exists (select 1 from public.accounts where system_key = 'accum_depreciation');
+update public.accounts set system_key = 'eosb' where code = '2400' and system_key is null
+  and not exists (select 1 from public.accounts where system_key = 'eosb');
+
+-- Recurring journals: the same entry every period (rent accrual, depreciation, standing orders...).
+-- lines: [{account_id, debit, credit, description, customer_id}]; "{period}" in the memo becomes e.g. "November 2026".
+create table if not exists public.recurring_journals (
+  id              bigint generated always as identity primary key,
+  memo            text not null check (char_length(btrim(memo)) between 1 and 500),
+  reference       text check (char_length(reference) <= 100),
+  every_months    int not null check (every_months in (1, 2, 3, 6, 12)),
+  next_date       date not null,
+  end_date        date,
+  department_id   bigint references public.departments (id) on delete set null,
+  lines           jsonb not null,
+  active          boolean not null default true,
+  last_journal_id bigint references public.journals (id) on delete set null,
+  created_by      uuid references public.profiles (id) on delete set null,
+  created_at      timestamptz not null default now()
+);
+alter table public.journals add column if not exists recurring_journal_id bigint references public.recurring_journals (id) on delete set null;
+
+-- Prepayments (paid in advance, expensed month by month) and accruals (expense built up month by month
+-- before the bill arrives). One posting per month at the month end.
+create table if not exists public.schedules (
+  id                 bigint generated always as identity primary key,
+  kind               text not null check (kind in ('prepayment', 'accrual')),
+  name               text not null check (char_length(btrim(name)) between 1 and 200),
+  total              numeric(14, 2) not null check (total > 0),
+  months             int not null check (months between 1 and 120),
+  start_month        date not null check (extract(day from start_month) = 1),
+  expense_account_id bigint not null references public.accounts (id) on delete restrict,
+  balance_account_id bigint not null references public.accounts (id) on delete restrict,
+  department_id      bigint references public.departments (id) on delete set null,
+  notes              text check (char_length(notes) <= 1000),
+  active             boolean not null default true,
+  created_by         uuid references public.profiles (id) on delete set null,
+  created_at         timestamptz not null default now()
+);
+create table if not exists public.schedule_postings (
+  id          bigint generated always as identity primary key,
+  schedule_id bigint not null references public.schedules (id) on delete cascade,
+  period      date not null,
+  amount      numeric(14, 2) not null,
+  journal_id  bigint references public.journals (id) on delete set null,
+  created_at  timestamptz not null default now(),
+  unique (schedule_id, period)
+);
+
 -- Running totals on each invoice, kept up to date by private.refresh_invoice_payments().
 alter table public.invoices add column if not exists amount_paid numeric(14, 2) not null default 0;
 alter table public.invoices add column if not exists payment_reminded_at timestamptz;
@@ -841,6 +927,10 @@ alter table public.recurring_invoices     enable row level security;
 alter table public.bank_imports           enable row level security;
 alter table public.bank_statement_lines   enable row level security;
 alter table public.petty_cash_expenses    enable row level security;
+alter table public.departments            enable row level security;
+alter table public.recurring_journals     enable row level security;
+alter table public.schedules              enable row level security;
+alter table public.schedule_postings      enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
               public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
@@ -849,7 +939,8 @@ revoke all on public.profiles, public.customers, public.contacts, public.activit
               public.accounts, public.journals, public.journal_lines,
               public.suppliers, public.bills, public.bill_lines, public.supplier_payments, public.bill_allocations,
               public.credit_notes, public.credit_note_lines, public.receipts, public.receivable_allocations, public.recurring_invoices,
-              public.bank_imports, public.bank_statement_lines, public.petty_cash_expenses
+              public.bank_imports, public.bank_statement_lines, public.petty_cash_expenses,
+              public.departments, public.recurring_journals, public.schedules, public.schedule_postings
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -1784,7 +1875,7 @@ declare
   me public.profiles := private.current_member();
 begin
   return coalesce((select json_agg(json_build_object(
-      'id', w.id, 'name', w.name, 'active', w.active, 'revenue_account_id', w.revenue_account_id,
+      'id', w.id, 'name', w.name, 'active', w.active, 'revenue_account_id', w.revenue_account_id, 'department_id', w.department_id,
       'open_tasks', (select count(*) from public.tasks t where t.work_type_id = w.id and t.status in ('new', 'in_progress', 'waiting')))
     order by not w.active, lower(w.name)) from public.work_types w), '[]');
 end $$;
@@ -3510,10 +3601,10 @@ begin
       continue;
     end if;
     n := n + 1;
-    insert into public.journal_lines (journal_id, line_no, account_id, description, debit, credit, customer_id, supplier_id)
+    insert into public.journal_lines (journal_id, line_no, account_id, description, debit, credit, customer_id, supplier_id, work_type_id, department_id)
     values (v_id, n, (ln ->> 'account_id')::bigint, left(ln ->> 'description', 300),
             coalesce((ln ->> 'debit')::numeric, 0), coalesce((ln ->> 'credit')::numeric, 0), (ln ->> 'customer_id')::bigint,
-            (ln ->> 'supplier_id')::bigint);
+            (ln ->> 'supplier_id')::bigint, (ln ->> 'work_type_id')::bigint, (ln ->> 'department_id')::bigint);
   end loop;
   return v_id;
 end $$;
@@ -3538,7 +3629,8 @@ begin
   v_id := private.post_journal(p_date, 'reversal', coalesce(p_memo, 'Reversal of ' || j.number || coalesce(': ' || j.memo, '')),
     j.number, j.source_type, j.source_id,
     (select jsonb_agg(jsonb_build_object('account_id', account_id, 'debit', credit, 'credit', debit,
-                                         'description', description, 'customer_id', customer_id, 'supplier_id', supplier_id) order by line_no)
+                                         'description', description, 'customer_id', customer_id, 'supplier_id', supplier_id,
+                                         'work_type_id', work_type_id, 'department_id', department_id) order by line_no)
      from public.journal_lines where journal_id = p_id), p_user);
   update public.journals set reverses_id = p_id where id = v_id;
   update public.journals set reversed_by_id = v_id where id = p_id;
@@ -3583,6 +3675,8 @@ begin
   end if;
   perform private.post_journal(inv.issue_date, 'invoice', format('Tax invoice %s - %s', inv.number, inv.customer_name),
                                inv.number, 'invoice', p_id, lines, inv.created_by);
+  perform private.tag_journal((select max(id) from public.journals where source_type = 'invoice' and source_id = p_id and kind = 'invoice'),
+                              inv.customer_id, (select work_type_id from public.tasks where id = inv.task_id), null);
 
   for pm in select * from public.payments where invoice_id = p_id and posted_side = 'advance' order by id loop
     if pm.cheque_status is distinct from 'bounced' then
@@ -3809,7 +3903,8 @@ declare
     "kind":       {"type": "enum", "values": ["journal", "adjustment", "accrual", "prepayment", "opening"], "default": "journal"},
     "memo":       {"type": "text", "required": true, "max": 500},
     "reference":  {"type": "text", "max": 100},
-    "reverse_on": {"type": "date"}
+    "reverse_on": {"type": "date"},
+    "department_id": {"type": "int"}
   }');
   ln    jsonb;
   i     int := 0;
@@ -3867,6 +3962,7 @@ begin
     raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"reverse_on": "Must be after the entry date"}';
   end if;
   v_id := private.post_journal((d ->> 'entry_date')::date, d ->> 'kind', d ->> 'memo', d ->> 'reference', null, null, clean, me.id);
+  perform private.tag_journal(v_id, null, null, (d ->> 'department_id')::bigint);
   if d ->> 'reverse_on' is not null then
     perform private.reverse_journal(v_id, (d ->> 'reverse_on')::date, null, me.id);
   end if;
@@ -4168,6 +4264,8 @@ begin
     'advances', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('customer_advances')),
     'payables', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('ap')),
     'recurring_due', (select count(*) from public.recurring_invoices where active and next_date <= t),
+    'journals_due', (select count(*) from public.recurring_journals where active and next_date <= t),
+    'schedules_due', (select coalesce(sum((r ->> 'due')::int), 0) from json_array_elements(public.list_schedules() -> 'rows') r),
     'unreconciled', (select count(*) from public.bank_statement_lines where journal_line_id is null),
     'vat_output_quarter', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l join public.journals j on j.id = l.journal_id
                            where l.account_id = private.acct('vat_output') and j.entry_date between q and t),
@@ -4348,7 +4446,10 @@ declare
     "supplier_ref": {"type": "text", "required": true, "max": 60},
     "bill_date":    {"type": "date", "required": true},
     "due_date":     {"type": "date"},
-    "notes":        {"type": "text", "max": 1000}
+    "notes":        {"type": "text", "max": 1000},
+    "customer_id":  {"type": "int"},
+    "work_type_id": {"type": "int"},
+    "department_id": {"type": "int"}
   }');
   v_old  public.bills;
   v_kind text;
@@ -4436,17 +4537,20 @@ begin
   end if;
 
   if p_id is null then
-    insert into public.bills (kind, number, supplier_id, supplier_ref, bill_date, due_date, notes, subtotal, vat_total, rcm_vat, total, created_by)
+    insert into public.bills (kind, number, supplier_id, supplier_ref, bill_date, due_date, notes, subtotal, vat_total, rcm_vat, total, created_by,
+                              customer_id, work_type_id, department_id)
     values (v_kind, private.next_doc_number(case v_kind when 'bill' then 'bill' else 'supplier_credit' end,
                                            case v_kind when 'bill' then 'BILL' else 'SCN' end, (d ->> 'bill_date')::date),
             (d ->> 'supplier_id')::bigint, btrim(d ->> 'supplier_ref'), (d ->> 'bill_date')::date, (d ->> 'due_date')::date, d ->> 'notes',
-            sub, vat_s, vat_r, sub + vat_s, me.id)
+            sub, vat_s, vat_r, sub + vat_s, me.id,
+            (d ->> 'customer_id')::bigint, (d ->> 'work_type_id')::bigint, (d ->> 'department_id')::bigint)
     returning id into v_id;
   else
     v_id := p_id;
     update public.bills set supplier_id = (d ->> 'supplier_id')::bigint, supplier_ref = btrim(d ->> 'supplier_ref'),
       bill_date = (d ->> 'bill_date')::date, due_date = (d ->> 'due_date')::date, notes = d ->> 'notes',
-      subtotal = sub, vat_total = vat_s, rcm_vat = vat_r, total = sub + vat_s
+      subtotal = sub, vat_total = vat_s, rcm_vat = vat_r, total = sub + vat_s,
+      customer_id = (d ->> 'customer_id')::bigint, work_type_id = (d ->> 'work_type_id')::bigint, department_id = (d ->> 'department_id')::bigint
     where id = v_id;
     delete from public.bill_lines where bill_id = v_id;
   end if;
@@ -4510,6 +4614,8 @@ begin
   perform private.post_journal(b.bill_date, case b.kind when 'bill' then 'bill' else 'supplier_credit' end,
     format('%s %s from %s (%s)', case b.kind when 'bill' then 'Bill' else 'Credit note' end, b.number, s.name, b.supplier_ref),
     b.supplier_ref, 'bill', p_id, lines, me.id);
+  perform private.tag_journal((select max(id) from public.journals where source_type = 'bill' and source_id = p_id),
+                              b.customer_id, b.work_type_id, b.department_id);
   update public.bills set status = 'posted', posted_at = now() where id = p_id;
 end $$;
 
@@ -5192,6 +5298,8 @@ begin
                                        'customer_id', cn.customer_id);
   perform private.post_journal(cn.issue_date, 'credit_note', format('Credit note %s - %s (on %s)', cn.number, cn.customer_name, inv.number),
                                cn.number, 'credit_note', cn.id, lines, me.id);
+  perform private.tag_journal((select max(id) from public.journals where source_type = 'credit_note' and source_id = cn.id and kind = 'credit_note'),
+                              cn.customer_id, (select work_type_id from public.tasks where id = inv.task_id), null);
   update public.credit_notes set status = 'issued', issued_at = now(), supplier = to_jsonb(co) - 'id' - 'updated_at' where id = p_id;
   apply := least(cn.total, inv.total - inv.amount_paid);
   if apply > 0 then
@@ -6084,7 +6192,8 @@ declare
     "expense_account_id": {"type": "int", "required": true},
     "vat_code":           {"type": "enum", "required": true, "values": ["standard", "zero", "exempt", "out_of_scope"]},
     "recoverable":        {"type": "bool"},
-    "receipt_ref":        {"type": "text", "max": 100}
+    "receipt_ref":        {"type": "text", "max": 100},
+    "department_id":      {"type": "int"}
   }');
   box   bigint := coalesce((d ->> 'account_id')::bigint, private.acct('petty_cash'));
   exp   public.accounts;
@@ -6120,9 +6229,9 @@ begin
   net := tot - vat;
   num := private.next_doc_number('petty_cash', 'PC', (d ->> 'spent_on')::date);
   insert into public.petty_cash_expenses (number, account_id, spent_on, payee, payee_trn, description, expense_account_id, vat_code,
-                                          recoverable, net, vat, total, receipt_ref, created_by)
+                                          recoverable, net, vat, total, receipt_ref, created_by, department_id)
   values (num, box, (d ->> 'spent_on')::date, d ->> 'payee', d ->> 'payee_trn', d ->> 'description', exp.id, d ->> 'vat_code',
-          rec or d ->> 'vat_code' <> 'standard', net, vat, tot, d ->> 'receipt_ref', me.id)
+          rec or d ->> 'vat_code' <> 'standard', net, vat, tot, d ->> 'receipt_ref', me.id, (d ->> 'department_id')::bigint)
   returning id into v_id;
   perform private.post_journal((d ->> 'spent_on')::date, 'petty_cash', format('%s %s - %s', num, d ->> 'payee', d ->> 'description'),
     coalesce(d ->> 'receipt_ref', num), 'petty_cash', v_id,
@@ -6131,6 +6240,7 @@ begin
       jsonb_build_object('account_id', private.acct('vat_input'), 'debit', case when rec then vat else 0 end, 'credit', 0, 'description', 'VAT on ' || num),
       jsonb_build_object('account_id', box, 'debit', 0, 'credit', tot, 'description', d ->> 'payee')),
     me.id);
+  perform private.tag_journal((select max(id) from public.journals where source_type = 'petty_cash' and source_id = v_id), null, null, (d ->> 'department_id')::bigint);
   return v_id;
 end $$;
 
@@ -6183,12 +6293,579 @@ begin
       where l.account_id = box and l.debit > 0 and j.entry_date between f and t and coalesce(j.source_type, '') <> 'petty_cash') x), '[]'));
 end $$;
 
+
+-- -------------------------------------------------------------------------------------
+-- API: departments, profitability tags, cash flow, detailed trial balance, profitability,
+-- recurring journals, accruals and prepayments schedules
+-- -------------------------------------------------------------------------------------
+
+-- Tag a journal's income and expense lines (where not tagged yet) with customer, type of work and department.
+-- The department defaults to the type of work's department.
+create or replace function private.tag_journal(p_journal bigint, p_customer bigint, p_work_type bigint, p_department bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  dep bigint := coalesce(p_department, (select department_id from public.work_types where id = p_work_type));
+begin
+  if p_journal is null or (p_customer is null and p_work_type is null and dep is null) then
+    return;
+  end if;
+  update public.journal_lines l set
+    customer_id = coalesce(l.customer_id, p_customer),
+    work_type_id = coalesce(l.work_type_id, p_work_type),
+    department_id = coalesce(l.department_id, dep)
+  from public.accounts a
+  where a.id = l.account_id and a.type in ('income', 'expense') and l.journal_id = p_journal;
+end $$;
+
+create or replace function public.list_departments() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  return coalesce((select json_agg(json_build_object('id', d.id, 'name', d.name, 'active', d.active,
+      'work_types', (select coalesce(json_agg(w.name order by lower(w.name)), '[]') from public.work_types w where w.department_id = d.id))
+    order by not d.active, lower(d.name)) from public.departments d), '[]');
+end $$;
+
+create or replace function public.save_department(p_id bigint, p_name text, p_active boolean default true) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  v_id bigint;
+begin
+  if nullif(btrim(p_name), '') is null or char_length(btrim(p_name)) > 100 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"name": "Enter a name (up to 100 characters)"}';
+  end if;
+  begin
+    if p_id is null then
+      insert into public.departments (name, active) values (btrim(p_name), coalesce(p_active, true)) returning id into v_id;
+    else
+      update public.departments set name = btrim(p_name), active = coalesce(p_active, true) where id = p_id returning id into v_id;
+      if v_id is null then
+        raise exception 'Department not found' using errcode = 'P0002';
+      end if;
+    end if;
+  exception when unique_violation then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"name": "There is already a department with this name"}';
+  end;
+  return v_id;
+end $$;
+
+create or replace function public.set_work_type_department(p_id bigint, p_department bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  if p_department is not null and not exists (select 1 from public.departments where id = p_department) then
+    raise exception 'Department not found' using errcode = 'P0002';
+  end if;
+  update public.work_types set department_id = p_department where id = p_id;
+  if not found then
+    raise exception 'Type of work not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Tags to pick from on forms: customers, types of work, departments.
+create or replace function public.profit_tags() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return json_build_object(
+    'customers', coalesce((select json_agg(json_build_object('id', id, 'name', name) order by lower(name)) from public.customers where status <> 'inactive'), '[]'),
+    'work_types', coalesce((select json_agg(json_build_object('id', id, 'name', name, 'department_id', department_id) order by lower(name)) from public.work_types where active), '[]'),
+    'departments', coalesce((select json_agg(json_build_object('id', id, 'name', name) order by lower(name)) from public.departments where active), '[]'));
+end $$;
+
+-- ---------- reports ----------
+
+-- Cash flow statement (indirect method) for a period: profit, then the cash effect of the movement on every
+-- other balance sheet account, grouped as operating, investing and financing. Opening balance entries are left out.
+create or replace function public.cash_flow(p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  f  date := coalesce(p_from, private.fy_start(private.today()));
+  t  date := coalesce(p_to, private.today());
+begin
+  if t < f then
+    raise exception 'The end date is before the start date' using errcode = '22023';
+  end if;
+  return (
+    with mv as (
+      select a.id, a.code, a.name, a.type, a.subtype, a.system_key,
+             coalesce(sum(l.credit - l.debit) filter (where j.kind <> 'opening'), 0) as effect
+      from public.accounts a
+      join public.journal_lines l on l.account_id = a.id
+      join public.journals j on j.id = l.journal_id
+      where j.entry_date between f and t
+      group by a.id
+    ), classed as (
+      select mv.*, case
+          when type in ('income', 'expense') then 'profit'
+          when subtype in ('cash', 'bank') then 'cash'
+          when system_key = 'accum_depreciation' then 'adjustment'
+          when system_key = 'eosb' then 'adjustment'
+          when subtype = 'fixed_asset' then 'investing'
+          when subtype in ('long_term_liability', 'equity', 'retained_earnings', 'opening_equity') then 'financing'
+          else 'operating' end as grp
+      from mv where effect <> 0
+    ), cash as (
+      select coalesce(sum(l.debit - l.credit) filter (where j.entry_date < f or (j.kind = 'opening' and j.entry_date <= t)), 0) as start_bal,
+             coalesce(sum(l.debit - l.credit) filter (where j.entry_date <= t), 0) as end_bal
+      from public.journal_lines l join public.journals j on j.id = l.journal_id join public.accounts a on a.id = l.account_id
+      where a.subtype in ('cash', 'bank')
+    )
+    select json_build_object('from', f, 'to', t,
+      'profit', coalesce((select sum(effect) from classed where grp = 'profit'), 0),
+      'adjustments', coalesce((select json_agg(json_build_object('code', code, 'name', name, 'amount', effect) order by code) from classed where grp = 'adjustment'), '[]'),
+      'working_capital', coalesce((select json_agg(json_build_object('code', code, 'name', name, 'amount', effect) order by code) from classed where grp = 'operating'), '[]'),
+      'investing', coalesce((select json_agg(json_build_object('code', code, 'name', name, 'amount', effect) order by code) from classed where grp = 'investing'), '[]'),
+      'financing', coalesce((select json_agg(json_build_object('code', code, 'name', name, 'amount', effect) order by code) from classed where grp = 'financing'), '[]'),
+      'operating_total', coalesce((select sum(effect) from classed where grp in ('profit', 'adjustment', 'operating')), 0),
+      'investing_total', coalesce((select sum(effect) from classed where grp = 'investing'), 0),
+      'financing_total', coalesce((select sum(effect) from classed where grp = 'financing'), 0),
+      'cash_start', (select start_bal from cash),
+      'cash_end', (select end_bal from cash),
+      'cash_accounts', coalesce((select json_agg(json_build_object('code', code, 'name', name, 'change', -effect) order by code) from classed where grp = 'cash'), '[]')));
+end $$;
+
+-- Customer and supplier breakdown of receivables, customer advances and payables, for the detailed trial balance.
+create or replace function public.trial_balance_parties(p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  f  date := coalesce(p_from, private.fy_start(private.today()));
+  t  date := coalesce(p_to, private.today());
+begin
+  return coalesce((select json_agg(x order by x.account_id, lower(x.name)) from (
+    select l.account_id,
+           case when a.subtype = 'payable' then 'supplier' else 'customer' end as party_type,
+           coalesce(l.customer_id, l.supplier_id) as party_id,
+           coalesce(c.name, s.name, 'Not linked to a customer or supplier') as name,
+           coalesce(sum(l.debit - l.credit) filter (where j.entry_date < f), 0) as opening,
+           coalesce(sum(l.debit) filter (where j.entry_date >= f), 0) as debit,
+           coalesce(sum(l.credit) filter (where j.entry_date >= f), 0) as credit
+    from public.journal_lines l
+    join public.journals j on j.id = l.journal_id
+    join public.accounts a on a.id = l.account_id
+    left join public.customers c on c.id = l.customer_id and a.subtype <> 'payable'
+    left join public.suppliers s on s.id = l.supplier_id and a.subtype = 'payable'
+    where a.subtype in ('receivable', 'customer_advance', 'payable') and j.entry_date <= t
+    group by l.account_id, a.subtype, coalesce(l.customer_id, l.supplier_id), coalesce(c.name, s.name, 'Not linked to a customer or supplier')
+    having coalesce(sum(l.debit - l.credit) filter (where j.entry_date < f), 0) <> 0
+        or coalesce(sum(l.debit) filter (where j.entry_date >= f), 0) <> 0
+        or coalesce(sum(l.credit) filter (where j.entry_date >= f), 0) <> 0) x), '[]');
+end $$;
+
+-- Profit by customer, type of work or department: income, direct costs (cost of sales) and other expenses
+-- on lines tagged with it. Untagged lines are shown together as "Not assigned".
+create or replace function public.profitability(p_from date, p_to date, p_by text) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  f  date := coalesce(p_from, private.fy_start(private.today()));
+  t  date := coalesce(p_to, private.today());
+  v_by text := coalesce(nullif(p_by, ''), 'customer');
+begin
+  if v_by not in ('customer', 'work_type', 'department') then
+    raise exception 'Unknown grouping' using errcode = '22023';
+  end if;
+  return json_build_object('from', f, 'to', t, 'by', v_by, 'rows', coalesce((select json_agg(x order by x.key is null, x.revenue desc, lower(x.name)) from (
+    select k.key,
+           coalesce(case v_by when 'customer' then (select name from public.customers where id = k.key)
+                            when 'work_type' then (select name from public.work_types where id = k.key)
+                            else (select name from public.departments where id = k.key) end, 'Not assigned') as name,
+           coalesce(sum(l.credit - l.debit) filter (where a.type = 'income'), 0) as revenue,
+           coalesce(sum(l.debit - l.credit) filter (where a.subtype = 'cost_of_sales'), 0) as direct_costs,
+           coalesce(sum(l.debit - l.credit) filter (where a.type = 'expense' and a.subtype <> 'cost_of_sales'), 0) as other_expenses
+    from public.journal_lines l
+    join public.journals j on j.id = l.journal_id
+    join public.accounts a on a.id = l.account_id
+    cross join lateral (select case v_by when 'customer' then l.customer_id when 'work_type' then l.work_type_id else l.department_id end as key) k
+    where a.type in ('income', 'expense') and j.entry_date between f and t
+    group by k.key
+    having sum(l.debit) <> 0 or sum(l.credit) <> 0) x), '[]'));
+end $$;
+
+-- ---------- recurring journals ----------
+
+-- Check journal lines [{account_id, debit, credit, description, customer_id}]: returns {lines, total, error}.
+create or replace function private.check_journal_lines(p_lines jsonb) returns jsonb
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  ln    jsonb;
+  i     int := 0;
+  dr    numeric;
+  cr    numeric;
+  acc   public.accounts;
+  errs  text[] := '{}';
+  res   jsonb := '[]';
+  tdr   numeric := 0;
+  tcr   numeric := 0;
+begin
+  if jsonb_typeof(p_lines) is distinct from 'array' or jsonb_array_length(p_lines) < 2 then
+    return '{"error": "Add at least two lines"}';
+  end if;
+  for ln in select value from jsonb_array_elements(p_lines) loop
+    i := i + 1;
+    begin
+      dr := coalesce(nullif(btrim(ln ->> 'debit'), '')::numeric, 0);
+      cr := coalesce(nullif(btrim(ln ->> 'credit'), '')::numeric, 0);
+    exception when others then
+      errs := errs || format('Line %s: amounts must be numbers', i);
+      continue;
+    end;
+    continue when dr = 0 and cr = 0;
+    select * into acc from public.accounts where id = nullif(ln ->> 'account_id', '')::bigint;
+    if acc.id is null or not acc.active then
+      errs := errs || format('Line %s: pick an account', i);
+    elsif dr < 0 or cr < 0 or (dr > 0 and cr > 0) or scale(dr) > 2 or scale(cr) > 2 then
+      errs := errs || format('Line %s: enter either a debit or a credit, 0 or more, with at most 2 decimals', i);
+    else
+      tdr := tdr + dr;
+      tcr := tcr + cr;
+      res := res || jsonb_build_object('account_id', acc.id, 'debit', dr, 'credit', cr, 'description', nullif(btrim(ln ->> 'description'), ''),
+        'customer_id', case when acc.subtype in ('receivable', 'customer_advance') then nullif(ln ->> 'customer_id', '')::bigint end);
+    end if;
+  end loop;
+  if array_length(errs, 1) > 0 then
+    return jsonb_build_object('error', array_to_string(errs, '. '));
+  elsif tdr = 0 then
+    return '{"error": "Enter the amounts"}';
+  elsif tdr <> tcr then
+    return jsonb_build_object('error', format('Debits (AED %s) and credits (AED %s) differ by AED %s',
+      to_char(tdr, 'FM999,999,999,990.00'), to_char(tcr, 'FM999,999,999,990.00'), to_char(abs(tdr - tcr), 'FM999,999,999,990.00')));
+  end if;
+  return jsonb_build_object('lines', res, 'total', tdr);
+end $$;
+
+create or replace function public.save_recurring_journal(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  d    jsonb := private.clean(p_data, '{
+    "memo":          {"type": "text", "required": true, "max": 500},
+    "reference":     {"type": "text", "max": 100},
+    "every_months":  {"type": "enum", "required": true, "values": ["1", "2", "3", "6", "12"]},
+    "next_date":     {"type": "date", "required": true},
+    "end_date":      {"type": "date"},
+    "department_id": {"type": "int"},
+    "active":        {"type": "bool"}
+  }');
+  chk  jsonb := private.check_journal_lines(p_data -> 'lines');
+  errs jsonb := '{}';
+  v_id bigint;
+begin
+  if chk ? 'error' then
+    errs := errs || jsonb_build_object('lines', chk ->> 'error');
+  end if;
+  if (d ->> 'end_date')::date < (d ->> 'next_date')::date then
+    errs := errs || '{"end_date": "Can''t be before the next date"}';
+  end if;
+  if d ->> 'department_id' is not null and not exists (select 1 from public.departments where id = (d ->> 'department_id')::bigint) then
+    errs := errs || '{"department_id": "Pick a department"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  if p_id is null then
+    insert into public.recurring_journals (memo, reference, every_months, next_date, end_date, department_id, lines, active, created_by)
+    values (d ->> 'memo', d ->> 'reference', (d ->> 'every_months')::int, (d ->> 'next_date')::date, (d ->> 'end_date')::date,
+            (d ->> 'department_id')::bigint, chk -> 'lines', true, me.id)
+    returning id into v_id;
+  else
+    update public.recurring_journals set memo = d ->> 'memo', reference = d ->> 'reference', every_months = (d ->> 'every_months')::int,
+      next_date = (d ->> 'next_date')::date, end_date = (d ->> 'end_date')::date, department_id = (d ->> 'department_id')::bigint,
+      lines = chk -> 'lines', active = (d ->> 'active')::boolean
+    where id = p_id returning id into v_id;
+    if v_id is null then
+      raise exception 'Recurring journal not found' using errcode = 'P0002';
+    end if;
+  end if;
+  return v_id;
+end $$;
+
+create or replace function public.list_recurring_journals() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return json_build_object('today', private.today(), 'rows', coalesce((select json_agg(x order by x.active desc, x.next_date, x.id) from (
+    select r.id, r.memo, r.every_months, r.next_date, r.end_date, r.active,
+           (select sum((l ->> 'debit')::numeric) from jsonb_array_elements(r.lines) l) as amount,
+           r.last_journal_id, (select number from public.journals where id = r.last_journal_id) as last_journal_number,
+           r.active and r.next_date <= private.today() as due
+    from public.recurring_journals r) x), '[]'));
+end $$;
+
+create or replace function public.get_recurring_journal(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  result json;
+begin
+  select json_build_object('today', private.today(), 'recurring', to_jsonb(r) || jsonb_build_object(
+    'department_name', (select name from public.departments where id = r.department_id),
+    'lines', (select coalesce(jsonb_agg(l || jsonb_build_object('code', a.code, 'account', a.name,
+                'customer_name', (select name from public.customers where id = (l ->> 'customer_id')::bigint)) order by n), '[]')
+              from jsonb_array_elements(r.lines) with ordinality as x(l, n) join public.accounts a on a.id = (l ->> 'account_id')::bigint),
+    'journals', coalesce((select jsonb_agg(jsonb_build_object('id', j.id, 'number', j.number, 'entry_date', j.entry_date, 'memo', j.memo,
+                   'reversed', j.reversed_by_id is not null) order by j.entry_date desc, j.id desc)
+                 from public.journals j where j.recurring_journal_id = r.id), '[]')))
+  into result
+  from public.recurring_journals r where r.id = p_id;
+  if result is null then
+    raise exception 'Recurring journal not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+create or replace function public.delete_recurring_journal(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  delete from public.recurring_journals where id = p_id;
+  if not found then
+    raise exception 'Recurring journal not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Post the recurring journals that are due (one, or all), catching up missed periods (at most 12 per run each).
+create or replace function public.run_recurring_journals(p_id bigint default null) returns json
+language plpgsql security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  r       public.recurring_journals;
+  n       int;
+  period  text;
+  jid     bigint;
+  created jsonb := '[]';
+begin
+  for r in select * from public.recurring_journals
+           where active and next_date <= private.today() and (p_id is null or id = p_id)
+           order by next_date, id for update loop
+    n := 0;
+    while r.active and r.next_date <= private.today() and n < 12 loop
+      period := case when r.every_months = 1 then to_char(r.next_date, 'FMMonth YYYY')
+                     else to_char(r.next_date, 'Mon YYYY') || ' - ' || to_char((r.next_date + make_interval(months => r.every_months))::date - 1, 'Mon YYYY') end;
+      jid := private.post_journal(r.next_date, 'journal', replace(r.memo, '{period}', period), r.reference, null, null,
+        (select jsonb_agg(l || jsonb_build_object('department_id', r.department_id)) from jsonb_array_elements(r.lines) l), me.id);
+      -- Department only on income and expense lines
+      update public.journal_lines l set department_id = null from public.accounts a
+      where l.journal_id = jid and a.id = l.account_id and a.type not in ('income', 'expense');
+      update public.journals set recurring_journal_id = r.id where id = jid;
+      created := created || jsonb_build_object('id', jid, 'number', (select number from public.journals where id = jid), 'memo', r.memo);
+      r.next_date := (r.next_date + make_interval(months => r.every_months))::date;
+      r.active := r.end_date is null or r.next_date <= r.end_date;
+      update public.recurring_journals set next_date = r.next_date, active = r.active, last_journal_id = jid where id = r.id;
+      n := n + 1;
+    end loop;
+  end loop;
+  return json_build_object('created', created);
+end $$;
+
+-- ---------- accruals and prepayments schedules ----------
+
+-- The schedule's months: period (first of month), posting date (month end), amount (the last month takes the rounding).
+create or replace function private.schedule_plan(s public.schedules) returns table (n int, period date, post_on date, amount numeric)
+language sql immutable as $$
+  select g.n, (s.start_month + make_interval(months => g.n - 1))::date,
+         ((s.start_month + make_interval(months => g.n))::date - 1),
+         case when g.n < s.months then round(s.total / s.months, 2) else s.total - round(s.total / s.months, 2) * (s.months - 1) end
+  from generate_series(1, s.months) as g(n)
+$$;
+
+create or replace function public.save_schedule(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "kind":               {"type": "enum", "required": true, "values": ["prepayment", "accrual"]},
+    "name":               {"type": "text", "required": true, "max": 200},
+    "months":             {"type": "int", "required": true},
+    "start_month":        {"type": "date", "required": true},
+    "expense_account_id": {"type": "int", "required": true},
+    "balance_account_id": {"type": "int"},
+    "department_id":      {"type": "int"},
+    "notes":              {"type": "text", "max": 1000},
+    "active":             {"type": "bool"}
+  }');
+  tot   numeric;
+  errs  jsonb := '{}';
+  exp   public.accounts;
+  bal   bigint;
+  old_s public.schedules;
+  v_id  bigint;
+begin
+  begin
+    tot := nullif(btrim(p_data ->> 'total'), '')::numeric;
+  exception when others then tot := null;
+  end;
+  if tot is null or tot <= 0 or scale(tot) > 2 or tot >= 1000000000000 then
+    errs := errs || '{"total": "Enter the total amount, above 0"}';
+  end if;
+  if (d ->> 'months')::int not between 1 and 120 then
+    errs := errs || '{"months": "Between 1 and 120 months"}';
+  end if;
+  select * into exp from public.accounts where id = (d ->> 'expense_account_id')::bigint and active;
+  if exp.id is null or exp.type <> 'expense' then
+    errs := errs || '{"expense_account_id": "Pick an expense account"}';
+  end if;
+  bal := coalesce((d ->> 'balance_account_id')::bigint, case d ->> 'kind' when 'prepayment' then private.acct('prepaid') else private.acct('accruals') end);
+  if not exists (select 1 from public.accounts where id = bal and active and
+                 ((d ->> 'kind' = 'prepayment' and type = 'asset' and subtype = 'current_asset') or
+                  (d ->> 'kind' = 'accrual' and type = 'liability' and subtype = 'current_liability'))) then
+    errs := errs || jsonb_build_object('balance_account_id', case d ->> 'kind' when 'prepayment' then 'Pick a current asset account (e.g. Prepaid expenses)'
+                                                                                 else 'Pick a current liability account (e.g. Accrued expenses)' end);
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  if p_id is null then
+    insert into public.schedules (kind, name, total, months, start_month, expense_account_id, balance_account_id, department_id, notes, created_by)
+    values (d ->> 'kind', d ->> 'name', tot, (d ->> 'months')::int, date_trunc('month', (d ->> 'start_month')::date)::date,
+            exp.id, bal, (d ->> 'department_id')::bigint, d ->> 'notes', me.id)
+    returning id into v_id;
+  else
+    select * into old_s from public.schedules where id = p_id for update;
+    if old_s.id is null then
+      raise exception 'Schedule not found' using errcode = 'P0002';
+    end if;
+    if exists (select 1 from public.schedule_postings where schedule_id = p_id)
+       and (old_s.kind <> d ->> 'kind' or old_s.total <> tot or old_s.months <> (d ->> 'months')::int
+            or old_s.start_month <> date_trunc('month', (d ->> 'start_month')::date)::date
+            or old_s.expense_account_id <> exp.id or old_s.balance_account_id <> bal) then
+      raise exception 'Months have already been posted, so only the name, department, notes and active can change. Undo the postings first to change the amounts.'
+        using errcode = '22023';
+    end if;
+    update public.schedules set kind = d ->> 'kind', name = d ->> 'name', total = tot, months = (d ->> 'months')::int,
+      start_month = date_trunc('month', (d ->> 'start_month')::date)::date, expense_account_id = exp.id, balance_account_id = bal,
+      department_id = (d ->> 'department_id')::bigint, notes = d ->> 'notes', active = (d ->> 'active')::boolean
+    where id = p_id returning id into v_id;
+  end if;
+  return v_id;
+end $$;
+
+create or replace function public.list_schedules() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  t  date := private.today();
+begin
+  return json_build_object('today', t, 'rows', coalesce((select json_agg(x order by x.active desc, x.kind, lower(x.name)) from (
+    select s.id, s.kind, s.name, s.total, s.months, s.start_month, s.active,
+           ea.code || ' · ' || ea.name as expense_account,
+           coalesce((select sum(p.amount) from public.schedule_postings p where p.schedule_id = s.id), 0) as posted,
+           (select count(*) from public.schedule_postings p where p.schedule_id = s.id) as months_posted,
+           case when s.active then (select count(*) from private.schedule_plan(s) pl
+                                    where pl.post_on <= t and not exists (select 1 from public.schedule_postings p where p.schedule_id = s.id and p.period = pl.period))
+                else 0 end as due
+    from public.schedules s join public.accounts ea on ea.id = s.expense_account_id) x), '[]'));
+end $$;
+
+create or replace function public.get_schedule(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  s  public.schedules;
+begin
+  select * into s from public.schedules where id = p_id;
+  if s.id is null then
+    raise exception 'Schedule not found' using errcode = 'P0002';
+  end if;
+  return json_build_object('today', private.today(), 'schedule', to_jsonb(s) || jsonb_build_object(
+    'expense_account', (select code || ' · ' || name from public.accounts where id = s.expense_account_id),
+    'balance_account', (select code || ' · ' || name from public.accounts where id = s.balance_account_id),
+    'department_name', (select name from public.departments where id = s.department_id)),
+    'plan', (select coalesce(json_agg(json_build_object('n', x.n, 'period', x.period, 'post_on', x.post_on, 'amount', x.amount,
+               'posting_id', x.posting_id, 'journal_id', x.journal_id, 'journal_number', x.journal_number, 'balance_after', x.balance_after) order by x.n), '[]')
+             from (select pl.n, pl.period, pl.post_on, pl.amount, p.id as posting_id, p.journal_id, j.number as journal_number,
+                          s.total - sum(pl.amount) over (order by pl.n) as balance_after
+                   from private.schedule_plan(s) pl
+                   left join public.schedule_postings p on p.schedule_id = s.id and p.period = pl.period
+                   left join public.journals j on j.id = p.journal_id) x));
+end $$;
+
+create or replace function public.delete_schedule(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  if exists (select 1 from public.schedule_postings where schedule_id = p_id) then
+    raise exception 'Months have been posted. Undo them first, or stop the schedule instead.' using errcode = '22023';
+  end if;
+  delete from public.schedules where id = p_id;
+  if not found then
+    raise exception 'Schedule not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Post every month that has ended (by p_up_to, default today) and isn't posted yet, for one schedule or all.
+-- Prepayment: Dr expense / Cr prepaid. Accrual: Dr expense / Cr accrued expenses.
+create or replace function public.run_schedules(p_id bigint default null, p_up_to date default null) returns json
+language plpgsql security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  t       date := coalesce(p_up_to, private.today());
+  s       public.schedules;
+  pl      record;
+  jid     bigint;
+  created jsonb := '[]';
+begin
+  if t > private.today() then
+    raise exception 'Months can only be posted once they have ended' using errcode = '22023';
+  end if;
+  for s in select * from public.schedules where active and (p_id is null or id = p_id) order by id for update loop
+    for pl in select * from private.schedule_plan(s) x
+              where x.post_on <= t and not exists (select 1 from public.schedule_postings p where p.schedule_id = s.id and p.period = x.period)
+              order by x.n loop
+      jid := private.post_journal(pl.post_on, s.kind,
+        format('%s: %s (month %s of %s, %s)', case s.kind when 'prepayment' then 'Prepayment' else 'Accrual' end, s.name, pl.n, s.months, to_char(pl.period, 'FMMonth YYYY')),
+        null, 'schedule', s.id,
+        jsonb_build_array(
+          jsonb_build_object('account_id', s.expense_account_id, 'debit', pl.amount, 'credit', 0, 'description', s.name, 'department_id', s.department_id),
+          jsonb_build_object('account_id', s.balance_account_id, 'debit', 0, 'credit', pl.amount, 'description', s.name)),
+        me.id);
+      insert into public.schedule_postings (schedule_id, period, amount, journal_id) values (s.id, pl.period, pl.amount, jid);
+      created := created || jsonb_build_object('schedule', s.name, 'period', pl.period, 'amount', pl.amount, 'journal_id', jid);
+    end loop;
+  end loop;
+  return json_build_object('created', created);
+end $$;
+
+-- Undo one month's posting (reverses its entry).
+create or replace function public.undo_schedule_posting(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  p  public.schedule_postings;
+begin
+  select * into p from public.schedule_postings where id = p_id for update;
+  if p.id is null then
+    raise exception 'Not found' using errcode = 'P0002';
+  end if;
+  if p.journal_id is not null and exists (select 1 from public.journals where id = p.journal_id and reversed_by_id is null) then
+    perform private.reverse_journal(p.journal_id, greatest(private.today(), (select entry_date from public.journals where id = p.journal_id)), null, me.id);
+  end if;
+  delete from public.schedule_postings where id = p_id;
+end $$;
+
 -- Revenue account for the standard types of work (where not chosen yet).
 update public.work_types w set revenue_account_id = a.id
 from public.accounts a
 where w.revenue_account_id is null and a.code = case lower(w.name)
   when 'sea freight' then '4100' when 'air freight' then '4110' when 'land transport' then '4120'
   when 'customs clearance' then '4130' when 'documentation' then '4140' else null end;
+
+-- Departments for the standard types of work (only while no type of work has a department yet).
+update public.work_types w set department_id = d.id from public.departments d
+where w.department_id is null and not exists (select 1 from public.work_types x where x.department_id is not null)
+  and d.name = case lower(w.name)
+    when 'sea freight' then 'Freight forwarding' when 'air freight' then 'Freight forwarding'
+    when 'land transport' then 'Transport' when 'customs clearance' then 'Customs clearance'
+    when 'documentation' then 'Customs clearance' else null end;
 
 -- Post invoices and payments recorded before the finance module existed (runs once; safe to re-run).
 do $$
@@ -6203,6 +6880,21 @@ begin
   end loop;
   for r in select p.id from public.payments p where p.posted_side is null order by p.paid_on, p.id loop
     perform private.post_payment(r.id, null);
+  end loop;
+  -- Profitability tags on income lines of invoices and credit notes posted before phase 4 (and their reversals).
+  for r in select j.id as jid, i.customer_id, t.work_type_id from public.journals j
+           join public.invoices i on i.id = j.source_id left join public.tasks t on t.id = i.task_id
+           where j.source_type = 'invoice'
+             and exists (select 1 from public.journal_lines l join public.accounts a on a.id = l.account_id
+                         where l.journal_id = j.id and a.type = 'income' and l.customer_id is null) loop
+    perform private.tag_journal(r.jid, r.customer_id, r.work_type_id, null);
+  end loop;
+  for r in select j.id as jid, c.customer_id, t.work_type_id from public.journals j
+           join public.credit_notes c on c.id = j.source_id join public.invoices i on i.id = c.invoice_id left join public.tasks t on t.id = i.task_id
+           where j.source_type = 'credit_note'
+             and exists (select 1 from public.journal_lines l join public.accounts a on a.id = l.account_id
+                         where l.journal_id = j.id and a.type = 'income' and l.customer_id is null) loop
+    perform private.tag_journal(r.jid, r.customer_id, r.work_type_id, null);
   end loop;
 end $$;
 
@@ -6350,7 +7042,25 @@ begin
     'public.delete_bank_import(bigint)',
     'public.record_petty_cash(jsonb)',
     'public.void_petty_cash(bigint)',
-    'public.petty_cash(date, date, bigint)'
+    'public.petty_cash(date, date, bigint)',
+    'public.list_departments()',
+    'public.save_department(bigint, text, boolean)',
+    'public.set_work_type_department(bigint, bigint)',
+    'public.profit_tags()',
+    'public.cash_flow(date, date)',
+    'public.trial_balance_parties(date, date)',
+    'public.profitability(date, date, text)',
+    'public.save_recurring_journal(bigint, jsonb)',
+    'public.list_recurring_journals()',
+    'public.get_recurring_journal(bigint)',
+    'public.delete_recurring_journal(bigint)',
+    'public.run_recurring_journals(bigint)',
+    'public.save_schedule(bigint, jsonb)',
+    'public.list_schedules()',
+    'public.get_schedule(bigint)',
+    'public.delete_schedule(bigint)',
+    'public.run_schedules(bigint, date)',
+    'public.undo_schedule_posting(bigint)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);
