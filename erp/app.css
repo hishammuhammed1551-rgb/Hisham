@@ -303,3 +303,16 @@ th.num { text-align: right; }
 .steps { margin: 0; padding-left: 1.2rem; display: grid; gap: 0.6rem; }
 .steps .btn { gap: 0.35rem; }
 @media (max-width: 640px) { .inv-title-block { text-align: left; margin-left: 0; } .inv-meta { justify-content: start; } }
+
+/* payments */
+.inv-partial { background: color-mix(in srgb, var(--color-primary) 16%, transparent); color: var(--color-primary-dark); }
+.cheque-pending { background: color-mix(in srgb, var(--color-warning) 14%, transparent); color: var(--color-warning); }
+.cheque-cleared { background: color-mix(in srgb, var(--color-success) 14%, transparent); color: var(--color-success); }
+.cheque-bounced { background: color-mix(in srgb, var(--color-error) 12%, transparent); color: var(--color-error); }
+.pay-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; margin: 0 0 0.75rem; }
+.pay-summary > div { background: var(--color-surface); border-radius: 8px; padding: 0.6rem 0.8rem; }
+.pay-summary dt { font-size: 0.78rem; color: var(--color-muted); }
+.pay-summary dd { margin: 0; font-family: var(--font-serif); font-size: 1.2rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pay-summary .is-overdue { background: color-mix(in srgb, var(--color-error) 10%, var(--color-bg)); }
+.pay-summary .is-overdue dd, .pay-summary .is-overdue dt { color: var(--color-error); }
+.pay-summary .is-paid dd { color: var(--color-success); }

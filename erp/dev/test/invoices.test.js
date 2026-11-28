@@ -156,11 +156,10 @@ test('a tax invoice needs the company TRN, gets its own number series, and shows
   dash = await ok(manager, 'dashboard');
   assert.deepEqual(dash.unpaid, { count: 1, total: 4172.49 });
 
-  await ok(manager, 'set_invoice_paid', { p_id: taxId, p_paid: true });
+  assert.match((await call(manager, 'set_invoice_paid', { p_id: taxId, p_paid: true })).error.message, /Record payment/,
+    'the old "mark as paid" is replaced by recording payments');
+  await ok(manager, 'record_payment', { p_invoice_id: taxId, p_data: { amount: 4172.49, method: 'bank_transfer', paid_on: dash.today } });
   assert.equal((await ok(manager, 'get_invoice', { p_id: taxId })).invoice.status, 'paid');
-  await ok(manager, 'set_invoice_paid', { p_id: taxId, p_paid: false });
-  assert.equal((await ok(manager, 'get_invoice', { p_id: taxId })).invoice.status, 'sent', 'un-paying goes back to sent');
-  await ok(manager, 'set_invoice_paid', { p_id: taxId, p_paid: true });
 });
 
 test('cancelled numbers are never reused; list filters; customer page shows invoices', async () => {

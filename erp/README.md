@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.5 has Customers (CRM), Tasks, Invoices and Renewals**; expenses and reports are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.6 has Customers (CRM), Tasks, Invoices, Payments and Renewals**; expenses and reports are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -17,6 +17,11 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - Each charge line is 5% VAT, 0% (zero-rated, e.g. international transport), exempt, or no VAT (disbursements such as customs duty paid on the customer's behalf). Totals and VAT are calculated in the database.
   - Invoices are downloaded as PDF (built in the browser) and emailed from your own mailbox: **Email to customer** opens Gmail or your email app with the customer's address, subject and message filled in; attach the PDF, send, then click **I've sent it**.
   - Status: Draft → Sent → Paid, or Cancelled. Sent invoices can't be edited; cancel and re-issue instead. Numbers are never reused and restart each year.
+- **Payments.** Managers record money received against an invoice by **bank transfer, cash or cheque**, in full or in parts; the invoice shows Total / Paid / Balance and turns **Paid** by itself when the balance reaches zero.
+  - Cheques (including post-dated) keep their number, bank and date, and are marked **Cleared** or **Bounced**; a bounced cheque puts the amount back on the balance.
+  - Payments taken against a proforma (advances) move to the tax invoice when it's created.
+  - A tax invoice with a balance after its due date shows as **Overdue** (in red, with days late) on the invoice, the invoice list, the customer's page and the dashboard's **Money owed to us**; **Payment reminder** emails the customer from your own mailbox with the PDF showing the balance due.
+  - The **Payments** page lists everything received, with filters for method and for cheques not yet cleared.
   - Lowcaps' name, address, TRN and bank details come from **Company settings** (admins) and are copied onto each invoice when it's saved. Tax invoices can't be created until the TRN is filled in.
   - Managers and admins create and send invoices; team members can view them.
 - **Renewals.** Recurring services per customer (VAT return every 3 months, trade license every year, residence visa every 2 years…), each with what it's for (e.g. an employee's name or a license number), the next due date, when to start reminding, and who looks after it.
