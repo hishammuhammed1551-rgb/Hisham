@@ -466,6 +466,105 @@ create constraint trigger journal_lines_balanced
   deferrable initially deferred
   for each row execute function private.check_journal_balanced();
 
+-- -------------------------------------------------------------------------------------
+-- Finance phase 2: suppliers, purchase invoices (bills), supplier credit notes, payment vouchers
+-- -------------------------------------------------------------------------------------
+
+alter table public.journals drop constraint if exists journals_kind_check;
+alter table public.journals add constraint journals_kind_check check (kind in ('journal', 'adjustment', 'accrual', 'prepayment', 'opening',
+  'invoice', 'payment', 'reversal', 'bank_receipt', 'bank_payment', 'transfer', 'bill', 'supplier_credit', 'supplier_payment', 'vat_settlement'));
+alter table public.journals drop constraint if exists journals_source_type_check;
+alter table public.journals add constraint journals_source_type_check check (source_type in ('invoice', 'payment', 'bill', 'supplier_payment'));
+
+create table if not exists public.suppliers (
+  id                         bigint generated always as identity primary key,
+  name                       text not null check (char_length(btrim(name)) between 1 and 200),
+  trn                        text check (trn ~ '^\d{15}$'),
+  email                      text check (char_length(email) <= 200),
+  phone                      text check (char_length(phone) <= 30),
+  address                    text check (char_length(address) <= 500),
+  country                    text default 'United Arab Emirates' check (char_length(country) <= 100),
+  payment_terms_days         int not null default 30 check (payment_terms_days between 0 and 365),
+  default_expense_account_id bigint references public.accounts (id) on delete set null,
+  notes                      text check (char_length(notes) <= 2000),
+  active                     boolean not null default true,
+  created_at                 timestamptz not null default now()
+);
+
+alter table public.journal_lines add column if not exists supplier_id bigint references public.suppliers (id) on delete set null;
+
+-- kind: bill (purchase invoice) or credit_note (from the supplier). supplier_ref is the supplier's own document number.
+-- vat_total: VAT charged by the supplier; rcm_vat: VAT self-accounted under the reverse charge (not paid to the supplier).
+create table if not exists public.bills (
+  id               bigint generated always as identity primary key,
+  kind             text not null check (kind in ('bill', 'credit_note')),
+  number           text not null unique,
+  supplier_id      bigint not null references public.suppliers (id) on delete restrict,
+  supplier_ref     text not null check (char_length(btrim(supplier_ref)) between 1 and 60),
+  bill_date        date not null,
+  due_date         date,
+  status           text not null default 'draft' check (status in ('draft', 'posted', 'cancelled')),
+  notes            text check (char_length(notes) <= 1000),
+  subtotal         numeric(14, 2) not null default 0,
+  vat_total        numeric(14, 2) not null default 0,
+  rcm_vat          numeric(14, 2) not null default 0,
+  total            numeric(14, 2) not null default 0,
+  amount_allocated numeric(14, 2) not null default 0,
+  created_by       uuid references public.profiles (id) on delete set null,
+  created_at       timestamptz not null default now(),
+  posted_at        timestamptz,
+  cancelled_at     timestamptz
+);
+-- The same supplier document number can't be entered twice (cancelled ones don't count).
+create unique index if not exists bills_supplier_ref_key on public.bills (supplier_id, kind, lower(btrim(supplier_ref))) where status <> 'cancelled';
+create index if not exists bills_supplier_idx on public.bills (supplier_id);
+
+create table if not exists public.bill_lines (
+  id          bigint generated always as identity primary key,
+  bill_id     bigint not null references public.bills (id) on delete cascade,
+  position    int not null,
+  description text not null check (char_length(btrim(description)) between 1 and 500),
+  account_id  bigint not null references public.accounts (id) on delete restrict,
+  quantity    numeric(12, 3) not null check (quantity > 0),
+  unit_price  numeric(14, 2) not null check (unit_price >= 0),
+  vat_code    text not null check (vat_code in ('standard', 'zero', 'exempt', 'out_of_scope', 'reverse_charge', 'import_goods')),
+  recoverable boolean not null default true,
+  net         numeric(14, 2) not null,
+  vat         numeric(14, 2) not null
+);
+create index if not exists bill_lines_bill_idx on public.bill_lines (bill_id);
+
+-- Payment vouchers. Money not allocated to bills is an advance to the supplier.
+create table if not exists public.supplier_payments (
+  id          bigint generated always as identity primary key,
+  number      text not null unique,
+  supplier_id bigint not null references public.suppliers (id) on delete restrict,
+  paid_on     date not null,
+  amount      numeric(14, 2) not null check (amount > 0),
+  method      text not null check (method in ('bank_transfer', 'cash', 'cheque', 'other')),
+  account_id  bigint not null references public.accounts (id) on delete restrict,
+  reference   text check (char_length(reference) <= 100),
+  notes       text check (char_length(notes) <= 1000),
+  status      text not null default 'posted' check (status in ('posted', 'void')),
+  created_by  uuid references public.profiles (id) on delete set null,
+  created_at  timestamptz not null default now(),
+  voided_at   timestamptz
+);
+create index if not exists supplier_payments_supplier_idx on public.supplier_payments (supplier_id);
+
+-- What settles a bill: a payment voucher or a supplier credit note, in full or in part.
+create table if not exists public.bill_allocations (
+  id             bigint generated always as identity primary key,
+  bill_id        bigint not null references public.bills (id) on delete cascade,
+  payment_id     bigint references public.supplier_payments (id) on delete cascade,
+  credit_note_id bigint references public.bills (id) on delete cascade,
+  amount         numeric(14, 2) not null check (amount > 0),
+  created_by     uuid references public.profiles (id) on delete set null,
+  created_at     timestamptz not null default now(),
+  check ((payment_id is null) <> (credit_note_id is null))
+);
+create index if not exists bill_allocations_bill_idx on public.bill_allocations (bill_id);
+
 -- Running totals on each invoice, kept up to date by private.refresh_invoice_payments().
 alter table public.invoices add column if not exists amount_paid numeric(14, 2) not null default 0;
 alter table public.invoices add column if not exists payment_reminded_at timestamptz;
@@ -565,12 +664,18 @@ alter table public.payslips         enable row level security;
 alter table public.accounts         enable row level security;
 alter table public.journals         enable row level security;
 alter table public.journal_lines    enable row level security;
+alter table public.suppliers         enable row level security;
+alter table public.bills             enable row level security;
+alter table public.bill_lines        enable row level security;
+alter table public.supplier_payments enable row level security;
+alter table public.bill_allocations  enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
               public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
               public.renewal_types, public.renewals, public.renewal_events, public.payments,
               public.employees, public.attendance, public.leave_requests, public.payslips,
-              public.accounts, public.journals, public.journal_lines
+              public.accounts, public.journals, public.journal_lines,
+              public.suppliers, public.bills, public.bill_lines, public.supplier_payments, public.bill_allocations
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -3209,9 +3314,10 @@ begin
       continue;
     end if;
     n := n + 1;
-    insert into public.journal_lines (journal_id, line_no, account_id, description, debit, credit, customer_id)
+    insert into public.journal_lines (journal_id, line_no, account_id, description, debit, credit, customer_id, supplier_id)
     values (v_id, n, (ln ->> 'account_id')::bigint, left(ln ->> 'description', 300),
-            coalesce((ln ->> 'debit')::numeric, 0), coalesce((ln ->> 'credit')::numeric, 0), (ln ->> 'customer_id')::bigint);
+            coalesce((ln ->> 'debit')::numeric, 0), coalesce((ln ->> 'credit')::numeric, 0), (ln ->> 'customer_id')::bigint,
+            (ln ->> 'supplier_id')::bigint);
   end loop;
   return v_id;
 end $$;
@@ -3236,7 +3342,7 @@ begin
   v_id := private.post_journal(p_date, 'reversal', coalesce(p_memo, 'Reversal of ' || j.number || coalesce(': ' || j.memo, '')),
     j.number, j.source_type, j.source_id,
     (select jsonb_agg(jsonb_build_object('account_id', account_id, 'debit', credit, 'credit', debit,
-                                         'description', description, 'customer_id', customer_id) order by line_no)
+                                         'description', description, 'customer_id', customer_id, 'supplier_id', supplier_id) order by line_no)
      from public.journal_lines where journal_id = p_id), p_user);
   update public.journals set reverses_id = p_id where id = v_id;
   update public.journals set reversed_by_id = v_id where id = p_id;
@@ -3708,12 +3814,16 @@ begin
         when 'payment' then coalesce(
           (select jsonb_build_object('label', 'Payment on ' || i.number, 'invoice_id', i.id)
            from public.payments p join public.invoices i on i.id = p.invoice_id where p.id = j.source_id),
-          jsonb_build_object('label', 'Deleted payment')) end,
+          jsonb_build_object('label', 'Deleted payment'))
+        when 'bill' then (select jsonb_build_object('label', b.number || ' (' || b.supplier_ref || ')', 'bill_id', b.id) from public.bills b where b.id = j.source_id)
+        when 'supplier_payment' then (select jsonb_build_object('label', sp.number, 'supplier_payment_id', sp.id) from public.supplier_payments sp where sp.id = j.source_id) end,
       'lines', (select jsonb_agg(jsonb_build_object('account_id', l.account_id, 'code', a.code, 'account', a.name,
                   'description', l.description, 'debit', l.debit, 'credit', l.credit,
-                  'customer_id', l.customer_id, 'customer_name', c.name) order by l.line_no)
+                  'customer_id', l.customer_id, 'customer_name', c.name,
+                  'supplier_id', l.supplier_id, 'supplier_name', sup.name) order by l.line_no)
                 from public.journal_lines l join public.accounts a on a.id = l.account_id
                 left join public.customers c on c.id = l.customer_id
+                left join public.suppliers sup on sup.id = l.supplier_id
                 where l.journal_id = j.id)))
   into result
   from public.journals j left join public.profiles u on u.id = j.created_by
@@ -3749,7 +3859,8 @@ begin
     'customer', (select name from public.customers where id = p_customer),
     'lines', coalesce((select json_agg(x order by x.entry_date, x.journal_id, x.line_id) from (
       select j.id as journal_id, l.id as line_id, j.number, j.entry_date, j.kind, j.memo, j.source_type, j.source_id,
-             l.description, l.debit, l.credit, l.customer_id, c.name as customer_name,
+             l.description, l.debit, l.credit, l.customer_id, c.name as customer_name, l.supplier_id,
+             (select name from public.suppliers where id = l.supplier_id) as supplier_name,
              opening + sum(private.normal_balance(a.type, l.debit, l.credit)) over (order by j.entry_date, j.id, l.id) as balance
       from public.journal_lines l join public.journals j on j.id = l.journal_id
       left join public.customers c on c.id = l.customer_id
@@ -3856,6 +3967,7 @@ begin
     'cash', public.cash_accounts(),
     'receivables', (select coalesce(sum(l.debit - l.credit), 0) from public.journal_lines l where l.account_id = private.acct('ar')),
     'advances', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('customer_advances')),
+    'payables', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('ap')),
     'vat_output_quarter', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l join public.journals j on j.id = l.journal_id
                            where l.account_id = private.acct('vat_output') and j.entry_date between q and t),
     'month', (select json_build_object(
@@ -3886,6 +3998,741 @@ begin
   if not found then
     raise exception 'Type of work not found' using errcode = 'P0002';
   end if;
+end $$;
+
+-- -------------------------------------------------------------------------------------
+-- API: suppliers, bills, payment vouchers, allocations, payables reports, VAT return
+-- -------------------------------------------------------------------------------------
+
+create or replace function private.next_doc_number(p_kind text, p_prefix text, p_date date) returns text
+language plpgsql security definer set search_path = '' as $$
+declare
+  y int := extract(year from p_date)::int;
+  n int;
+begin
+  insert into public.invoice_counters (kind, year, last) values (p_kind, y, 1)
+  on conflict (kind, year) do update set last = public.invoice_counters.last + 1
+  returning last into n;
+  return format('%s-%s-%s', p_prefix, y, lpad(n::text, 4, '0'));
+end $$;
+
+-- Recalculate how much of a bill is settled (or of a credit note is used).
+create or replace function private.refresh_bill(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  update public.bills b set amount_allocated = coalesce((
+    select sum(a.amount) from public.bill_allocations a
+    where (b.kind = 'bill' and a.bill_id = b.id) or (b.kind = 'credit_note' and a.credit_note_id = b.id)), 0)
+  where b.id = p_id;
+end $$;
+
+-- Unallocated part of a payment voucher.
+create or replace function private.payment_unallocated(p_id bigint) returns numeric
+language sql stable security definer set search_path = '' as $$
+  select p.amount - coalesce((select sum(a.amount) from public.bill_allocations a where a.payment_id = p.id), 0)
+  from public.supplier_payments p where p.id = p_id and p.status = 'posted'
+$$;
+
+create or replace function public.supplier_options() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return coalesce((select json_agg(json_build_object('id', id, 'name', name, 'trn', trn, 'payment_terms_days', payment_terms_days,
+      'default_expense_account_id', default_expense_account_id, 'active', active) order by lower(name)) from public.suppliers), '[]');
+end $$;
+
+-- Suppliers with what is owed to them (positive) from the ledger, overdue bills and unused advances/credits.
+create or replace function public.list_suppliers(p_q text default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  t   date := private.today();
+  pat text;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  return coalesce((select json_agg(x order by lower(x.name)) from (
+    select s.id, s.name, s.trn, s.email, s.phone, s.payment_terms_days, s.active,
+           coalesce((select sum(l.credit - l.debit) from public.journal_lines l where l.supplier_id = s.id and l.account_id = private.acct('ap')), 0) as balance,
+           coalesce((select sum(b.total - b.amount_allocated) from public.bills b
+                     where b.supplier_id = s.id and b.kind = 'bill' and b.status = 'posted' and b.total > b.amount_allocated
+                       and coalesce(b.due_date, b.bill_date) < t), 0) as overdue,
+           coalesce((select sum(private.payment_unallocated(p.id)) from public.supplier_payments p where p.supplier_id = s.id and p.status = 'posted'), 0)
+             + coalesce((select sum(b.total - b.amount_allocated) from public.bills b
+                         where b.supplier_id = s.id and b.kind = 'credit_note' and b.status = 'posted'), 0) as unallocated
+    from public.suppliers s
+    where pat is null or s.name ilike pat or s.trn ilike pat or s.email ilike pat) x), '[]');
+end $$;
+
+create or replace function public.save_supplier(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  d    jsonb := private.clean(p_data, '{
+    "name":                       {"type": "text", "required": true, "max": 200},
+    "trn":                        {"type": "text", "format": "trn"},
+    "email":                      {"type": "text", "max": 200, "format": "email"},
+    "phone":                      {"type": "text", "max": 30},
+    "address":                    {"type": "text", "max": 500},
+    "country":                    {"type": "text", "max": 100, "default": "United Arab Emirates"},
+    "payment_terms_days":         {"type": "int"},
+    "default_expense_account_id": {"type": "int"},
+    "notes":                      {"type": "text", "max": 2000},
+    "active":                     {"type": "bool"}
+  }');
+  v_id bigint;
+begin
+  if coalesce((d ->> 'payment_terms_days')::int, 30) > 365 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"payment_terms_days": "Use 0 to 365 days"}';
+  end if;
+  if d ->> 'default_expense_account_id' is not null and not exists (
+       select 1 from public.accounts where id = (d ->> 'default_expense_account_id')::bigint and active and type in ('expense', 'asset')
+         and subtype not in ('bank', 'cash', 'pdc', 'receivable', 'vat_input')) then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"default_expense_account_id": "Pick an expense or asset account"}';
+  end if;
+  if p_id is null then
+    insert into public.suppliers (name, trn, email, phone, address, country, payment_terms_days, default_expense_account_id, notes, active)
+    values (d ->> 'name', d ->> 'trn', d ->> 'email', d ->> 'phone', d ->> 'address', d ->> 'country',
+            coalesce((d ->> 'payment_terms_days')::int, 30), (d ->> 'default_expense_account_id')::bigint, d ->> 'notes',
+            coalesce((p_data ->> 'active')::boolean, true))
+    returning id into v_id;
+    return v_id;
+  end if;
+  update public.suppliers set name = d ->> 'name', trn = d ->> 'trn', email = d ->> 'email', phone = d ->> 'phone', address = d ->> 'address',
+    country = d ->> 'country', payment_terms_days = coalesce((d ->> 'payment_terms_days')::int, 30),
+    default_expense_account_id = (d ->> 'default_expense_account_id')::bigint, notes = d ->> 'notes', active = (d ->> 'active')::boolean
+  where id = p_id;
+  if not found then
+    raise exception 'Supplier not found' using errcode = 'P0002';
+  end if;
+  return p_id;
+end $$;
+
+create or replace function public.get_supplier(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  r  json;
+begin
+  select json_build_object(
+    'today', private.today(),
+    'supplier', to_jsonb(s) || jsonb_build_object(
+      'balance', coalesce((select sum(l.credit - l.debit) from public.journal_lines l where l.supplier_id = s.id and l.account_id = private.acct('ap')), 0),
+      'default_account_name', (select code || ' · ' || name from public.accounts where id = s.default_expense_account_id)),
+    'bills', coalesce((select json_agg(json_build_object('id', b.id, 'kind', b.kind, 'number', b.number, 'supplier_ref', b.supplier_ref,
+        'bill_date', b.bill_date, 'due_date', b.due_date, 'status', b.status, 'total', b.total, 'amount_allocated', b.amount_allocated)
+        order by b.bill_date desc, b.id desc) from public.bills b where b.supplier_id = s.id), '[]'),
+    'payments', coalesce((select json_agg(json_build_object('id', p.id, 'number', p.number, 'paid_on', p.paid_on, 'amount', p.amount,
+        'method', p.method, 'status', p.status, 'unallocated', coalesce(private.payment_unallocated(p.id), 0))
+        order by p.paid_on desc, p.id desc) from public.supplier_payments p where p.supplier_id = s.id), '[]'))
+  into r from public.suppliers s where s.id = p_id;
+  if r is null then
+    raise exception 'Supplier not found' using errcode = 'P0002';
+  end if;
+  return r;
+end $$;
+
+-- Create (p_id null) or edit a draft bill or supplier credit note. Returns its id.
+-- p_data: kind (create only), supplier_id, supplier_ref, bill_date, due_date, notes,
+--         lines: [{description, account_id, quantity, unit_price, vat_code, recoverable}]
+create or replace function public.save_bill(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  d      jsonb := private.clean(p_data, '{
+    "kind":         {"type": "enum", "values": ["bill", "credit_note"], "default": "bill"},
+    "supplier_id":  {"type": "int", "required": true},
+    "supplier_ref": {"type": "text", "required": true, "max": 60},
+    "bill_date":    {"type": "date", "required": true},
+    "due_date":     {"type": "date"},
+    "notes":        {"type": "text", "max": 1000}
+  }');
+  v_old  public.bills;
+  v_kind text;
+  v_id   bigint;
+  ln     jsonb;
+  i      int := 0;
+  qty    numeric;
+  price  numeric;
+  net    numeric;
+  vat    numeric;
+  acc    public.accounts;
+  errs   jsonb := '{}';
+  lerrs  text[] := '{}';
+  clean  jsonb := '[]';
+  sub    numeric := 0;
+  vat_s  numeric := 0;
+  vat_r  numeric := 0;
+  dup    text;
+begin
+  if p_id is not null then
+    select * into v_old from public.bills where id = p_id;
+    if v_old.id is null then
+      raise exception 'Bill not found' using errcode = 'P0002';
+    end if;
+    if v_old.status <> 'draft' then
+      raise exception 'Only drafts can be changed. Cancel this one and enter it again if it is wrong.' using errcode = '22023';
+    end if;
+    v_kind := v_old.kind;
+  else
+    v_kind := d ->> 'kind';
+  end if;
+  if not exists (select 1 from public.suppliers where id = (d ->> 'supplier_id')::bigint) then
+    errs := errs || '{"supplier_id": "Pick a supplier"}';
+  end if;
+  if (d ->> 'due_date')::date < (d ->> 'bill_date')::date then
+    errs := errs || '{"due_date": "Can''t be before the document date"}';
+  end if;
+  select number into dup from public.bills
+  where supplier_id = (d ->> 'supplier_id')::bigint and kind = v_kind and status <> 'cancelled'
+    and lower(btrim(supplier_ref)) = lower(btrim(d ->> 'supplier_ref')) and id is distinct from p_id;
+  if dup is not null then
+    errs := errs || jsonb_build_object('supplier_ref', format('Already entered as %s: the same supplier document can''t be entered twice', dup));
+  end if;
+
+  if jsonb_typeof(p_data -> 'lines') <> 'array' or jsonb_array_length(p_data -> 'lines') = 0 then
+    errs := errs || '{"lines": "Add at least one line"}';
+  else
+    for ln in select value from jsonb_array_elements(p_data -> 'lines') loop
+      i := i + 1;
+      begin
+        qty := nullif(btrim(ln ->> 'quantity'), '')::numeric;
+        price := nullif(btrim(ln ->> 'unit_price'), '')::numeric;
+      exception when others then
+        lerrs := lerrs || format('Line %s: quantity and price must be numbers', i);
+        continue;
+      end;
+      select * into acc from public.accounts where id = nullif(ln ->> 'account_id', '')::bigint;
+      if nullif(btrim(ln ->> 'description'), '') is null then
+        lerrs := lerrs || format('Line %s: add a description', i);
+      elsif acc.id is null or not acc.active or acc.type not in ('expense', 'asset')
+            or acc.subtype in ('bank', 'cash', 'pdc', 'receivable', 'vat_input') then
+        lerrs := lerrs || format('Line %s: pick an expense, cost or asset account', i);
+      elsif qty is null or qty <= 0 or scale(qty) > 3 then
+        lerrs := lerrs || format('Line %s: quantity must be more than 0', i);
+      elsif price is null or price < 0 or scale(price) > 2 then
+        lerrs := lerrs || format('Line %s: price must be 0 or more, with at most 2 decimals', i);
+      elsif coalesce(ln ->> 'vat_code', '') not in ('standard', 'zero', 'exempt', 'out_of_scope', 'reverse_charge', 'import_goods') then
+        lerrs := lerrs || format('Line %s: pick a VAT treatment', i);
+      else
+        net := round(qty * price, 2);
+        vat := case when ln ->> 'vat_code' in ('standard', 'reverse_charge', 'import_goods') then round(net * 0.05, 2) else 0 end;
+        sub := sub + net;
+        if ln ->> 'vat_code' = 'standard' then vat_s := vat_s + vat; else vat_r := vat_r + vat; end if;
+        clean := clean || jsonb_build_object('description', btrim(ln ->> 'description'), 'account_id', acc.id, 'quantity', qty,
+          'unit_price', price, 'vat_code', ln ->> 'vat_code', 'net', net, 'vat', vat,
+          'recoverable', coalesce((ln ->> 'recoverable')::boolean, true));
+      end if;
+    end loop;
+    if array_length(lerrs, 1) > 0 then
+      errs := errs || jsonb_build_object('lines', array_to_string(lerrs, '. '));
+    end if;
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  if p_id is null then
+    insert into public.bills (kind, number, supplier_id, supplier_ref, bill_date, due_date, notes, subtotal, vat_total, rcm_vat, total, created_by)
+    values (v_kind, private.next_doc_number(case v_kind when 'bill' then 'bill' else 'supplier_credit' end,
+                                           case v_kind when 'bill' then 'BILL' else 'SCN' end, (d ->> 'bill_date')::date),
+            (d ->> 'supplier_id')::bigint, btrim(d ->> 'supplier_ref'), (d ->> 'bill_date')::date, (d ->> 'due_date')::date, d ->> 'notes',
+            sub, vat_s, vat_r, sub + vat_s, me.id)
+    returning id into v_id;
+  else
+    v_id := p_id;
+    update public.bills set supplier_id = (d ->> 'supplier_id')::bigint, supplier_ref = btrim(d ->> 'supplier_ref'),
+      bill_date = (d ->> 'bill_date')::date, due_date = (d ->> 'due_date')::date, notes = d ->> 'notes',
+      subtotal = sub, vat_total = vat_s, rcm_vat = vat_r, total = sub + vat_s
+    where id = v_id;
+    delete from public.bill_lines where bill_id = v_id;
+  end if;
+  insert into public.bill_lines (bill_id, position, description, account_id, quantity, unit_price, vat_code, recoverable, net, vat)
+  select v_id, x.ord, x.l ->> 'description', (x.l ->> 'account_id')::bigint, (x.l ->> 'quantity')::numeric, (x.l ->> 'unit_price')::numeric,
+         x.l ->> 'vat_code', (x.l ->> 'recoverable')::boolean, (x.l ->> 'net')::numeric, (x.l ->> 'vat')::numeric
+  from jsonb_array_elements(clean) with ordinality as x(l, ord);
+  return v_id;
+exception when unique_violation then
+  raise exception 'Please fix the highlighted fields' using errcode = '22023',
+    detail = '{"supplier_ref": "This supplier document has already been entered"}';
+end $$;
+
+-- Post a draft bill (or credit note) to the ledger:
+--   Dr each line's account (net, plus VAT that can't be recovered) / Dr VAT input (recoverable VAT)
+--   Cr Accounts payable (the supplier's total); reverse charge VAT is also credited to VAT output.
+-- A credit note posts the same the other way round.
+create or replace function public.post_bill(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  b     public.bills;
+  s     public.suppliers;
+  dr    jsonb;
+  lines jsonb;
+  vin   numeric;
+  vout  numeric;
+  sign  int;
+begin
+  select * into b from public.bills where id = p_id for update;
+  if b.id is null then
+    raise exception 'Bill not found' using errcode = 'P0002';
+  end if;
+  if b.status <> 'draft' then
+    raise exception 'This is already %', b.status using errcode = '22023';
+  end if;
+  select * into s from public.suppliers where id = b.supplier_id;
+  sign := case b.kind when 'bill' then 1 else -1 end;
+
+  select coalesce(jsonb_agg(jsonb_build_object('account_id', x.account_id, 'amount', x.amount)), '[]') into dr from (
+    select l.account_id, sum(l.net + case when not l.recoverable then l.vat else 0 end) as amount
+    from public.bill_lines l where l.bill_id = p_id group by l.account_id) x;
+  select coalesce(sum(vat) filter (where recoverable), 0), coalesce(sum(vat) filter (where vat_code in ('reverse_charge', 'import_goods')), 0)
+  into vin, vout from public.bill_lines where bill_id = p_id;
+
+  lines := (select coalesce(jsonb_agg(jsonb_build_object('account_id', (e ->> 'account_id')::bigint,
+              'debit', case when sign = 1 then (e ->> 'amount')::numeric else 0 end,
+              'credit', case when sign = 1 then 0 else (e ->> 'amount')::numeric end, 'description', b.supplier_ref)), '[]')
+            from jsonb_array_elements(dr) e);
+  if vin > 0 then
+    lines := lines || jsonb_build_object('account_id', private.acct('vat_input'), 'debit', case when sign = 1 then vin else 0 end,
+                                         'credit', case when sign = 1 then 0 else vin end, 'description', 'VAT on ' || b.supplier_ref);
+  end if;
+  if vout > 0 then
+    lines := lines || jsonb_build_object('account_id', private.acct('vat_output'), 'debit', case when sign = 1 then 0 else vout end,
+                                         'credit', case when sign = 1 then vout else 0 end, 'description', 'Reverse charge VAT on ' || b.supplier_ref);
+  end if;
+  lines := lines || jsonb_build_object('account_id', private.acct('ap'), 'debit', case when sign = 1 then 0 else b.total end,
+                                       'credit', case when sign = 1 then b.total else 0 end, 'description', s.name, 'supplier_id', s.id);
+
+  perform private.post_journal(b.bill_date, case b.kind when 'bill' then 'bill' else 'supplier_credit' end,
+    format('%s %s from %s (%s)', case b.kind when 'bill' then 'Bill' else 'Credit note' end, b.number, s.name, b.supplier_ref),
+    b.supplier_ref, 'bill', p_id, lines, me.id);
+  update public.bills set status = 'posted', posted_at = now() where id = p_id;
+end $$;
+
+-- Cancel: drafts simply; posted ones are reversed (only when nothing is allocated against them).
+create or replace function public.cancel_bill(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  b   public.bills;
+  jid bigint;
+begin
+  select * into b from public.bills where id = p_id for update;
+  if b.id is null then
+    raise exception 'Bill not found' using errcode = 'P0002';
+  end if;
+  if b.status = 'cancelled' then
+    return;
+  end if;
+  if exists (select 1 from public.bill_allocations where bill_id = p_id or credit_note_id = p_id) then
+    raise exception 'Payments or credit notes are allocated to this. Remove those allocations first.' using errcode = '22023';
+  end if;
+  for jid in select id from public.journals where source_type = 'bill' and source_id = p_id and reversed_by_id is null and reverses_id is null loop
+    perform private.reverse_journal(jid, greatest(private.today(), b.bill_date), null, me.id);
+  end loop;
+  update public.bills set status = 'cancelled', cancelled_at = now() where id = p_id;
+end $$;
+
+create or replace function public.get_bill(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  r  json;
+begin
+  select json_build_object(
+    'today', private.today(),
+    'bill', to_jsonb(b) || jsonb_build_object(
+      'supplier_name', s.name, 'supplier_trn', s.trn,
+      'lines', coalesce((select jsonb_agg(to_jsonb(l) || jsonb_build_object('account', a.code || ' · ' || a.name) order by l.position)
+                         from public.bill_lines l join public.accounts a on a.id = l.account_id where l.bill_id = b.id), '[]'),
+      'allocations', coalesce((select jsonb_agg(jsonb_build_object('id', al.id, 'amount', al.amount, 'created_at', al.created_at,
+          'bill_id', al.bill_id, 'bill_number', bb.number,
+          'source', case when al.payment_id is not null then (select number from public.supplier_payments where id = al.payment_id)
+                         else (select number from public.bills where id = al.credit_note_id) end,
+          'payment_id', al.payment_id, 'credit_note_id', al.credit_note_id) order by al.id)
+        from public.bill_allocations al join public.bills bb on bb.id = al.bill_id
+        where al.bill_id = b.id or al.credit_note_id = b.id), '[]'),
+      'journal_id', (select id from public.journals where source_type = 'bill' and source_id = b.id and reverses_id is null order by id limit 1)),
+    -- for a bill: the supplier's unused payments and credit notes; for a credit note: the supplier's unpaid bills
+    'open_items', case when b.kind = 'bill' then coalesce((
+        select jsonb_agg(x) from (
+          select 'payment' as type, p.id, p.number, p.paid_on as date, private.payment_unallocated(p.id) as available
+          from public.supplier_payments p where p.supplier_id = b.supplier_id and p.status = 'posted' and private.payment_unallocated(p.id) > 0
+          union all
+          select 'credit_note', c.id, c.number, c.bill_date, c.total - c.amount_allocated
+          from public.bills c where c.supplier_id = b.supplier_id and c.kind = 'credit_note' and c.status = 'posted' and c.total > c.amount_allocated) x), '[]')
+      else coalesce((select jsonb_agg(jsonb_build_object('type', 'bill', 'id', o.id, 'number', o.number, 'date', o.bill_date,
+          'available', o.total - o.amount_allocated))
+        from public.bills o where o.supplier_id = b.supplier_id and o.kind = 'bill' and o.status = 'posted' and o.total > o.amount_allocated), '[]') end)
+  into r
+  from public.bills b join public.suppliers s on s.id = b.supplier_id
+  where b.id = p_id;
+  if r is null then
+    raise exception 'Bill not found' using errcode = 'P0002';
+  end if;
+  return r;
+end $$;
+
+-- status: '' | draft | open (posted, not fully settled) | overdue | paid | cancelled
+create or replace function public.list_bills(p_q text default null, p_kind text default null, p_status text default null,
+                                             p_supplier bigint default null, p_page int default 1) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_manager();
+  t         date := private.today();
+  page_size constant int := 25;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  pat       text;
+  total     bigint;
+  v_rows    json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  with f as (
+    select b.*, s.name as supplier_name from public.bills b join public.suppliers s on s.id = b.supplier_id
+    where (pat is null or b.number ilike pat or b.supplier_ref ilike pat or s.name ilike pat)
+      and (coalesce(p_kind, '') = '' or b.kind = p_kind)
+      and (p_supplier is null or b.supplier_id = p_supplier)
+      and (case coalesce(p_status, '')
+             when '' then true
+             when 'open' then b.status = 'posted' and b.total > b.amount_allocated
+             when 'overdue' then b.status = 'posted' and b.kind = 'bill' and b.total > b.amount_allocated and coalesce(b.due_date, b.bill_date) < t
+             when 'paid' then b.status = 'posted' and b.total <= b.amount_allocated
+             else b.status = p_status end)
+  )
+  select (select count(*) from f), coalesce((select json_agg(x order by x.bill_date desc, x.id desc) from (
+    select f.id, f.kind, f.number, f.supplier_id, f.supplier_name, f.supplier_ref, f.bill_date, f.due_date, f.status, f.total, f.amount_allocated
+    from f order by f.bill_date desc, f.id desc limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, v_rows;
+  return json_build_object('bills', v_rows, 'total', total, 'page', pg, 'pageSize', page_size, 'today', t);
+end $$;
+
+-- Pay a supplier from a bank or cash account (payment voucher), allocating it to bills.
+-- p_data: supplier_id, paid_on, amount, method, account_id, reference, notes, allocations: [{bill_id, amount}]
+-- Whatever is not allocated stays as an advance to the supplier.
+create or replace function public.record_supplier_payment(p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "supplier_id": {"type": "int", "required": true},
+    "paid_on":     {"type": "date", "required": true},
+    "method":      {"type": "enum", "required": true, "values": ["bank_transfer", "cash", "cheque", "other"]},
+    "account_id":  {"type": "int", "required": true},
+    "reference":   {"type": "text", "max": 100},
+    "notes":       {"type": "text", "max": 1000}
+  }');
+  s     public.suppliers;
+  amt   numeric;
+  errs  jsonb := '{}';
+  al    jsonb;
+  b     public.bills;
+  a_amt numeric;
+  alloc numeric := 0;
+  lerrs text[] := '{}';
+  v_id  bigint;
+  num   text;
+begin
+  select * into s from public.suppliers where id = (d ->> 'supplier_id')::bigint;
+  if s.id is null then errs := errs || '{"supplier_id": "Pick a supplier"}'; end if;
+  if not exists (select 1 from public.accounts where id = (d ->> 'account_id')::bigint and subtype in ('bank', 'cash') and active) then
+    errs := errs || '{"account_id": "Pick a bank or cash account"}';
+  end if;
+  begin
+    amt := nullif(btrim(p_data ->> 'amount'), '')::numeric;
+  exception when others then amt := null;
+  end;
+  if amt is null or amt <= 0 or scale(amt) > 2 then
+    errs := errs || '{"amount": "Enter an amount above 0, with at most 2 decimals"}';
+  end if;
+  if (d ->> 'paid_on')::date > private.today() then
+    errs := errs || '{"paid_on": "Can''t be in the future"}';
+  end if;
+  for al in select value from jsonb_array_elements(coalesce(p_data -> 'allocations', '[]')) loop
+    begin
+      a_amt := coalesce(nullif(btrim(al ->> 'amount'), '')::numeric, 0);
+    exception when others then a_amt := -1;
+    end;
+    continue when a_amt = 0;
+    select * into b from public.bills where id = (al ->> 'bill_id')::bigint;
+    if b.id is null or b.kind <> 'bill' or b.status <> 'posted' or b.supplier_id is distinct from s.id then
+      lerrs := lerrs || 'An allocation is to a bill that isn''t open for this supplier';
+    elsif a_amt < 0 or scale(a_amt) > 2 or a_amt > b.total - b.amount_allocated then
+      lerrs := lerrs || format('%s: allocate between 0 and its balance of AED %s', b.number, to_char(b.total - b.amount_allocated, 'FM999,999,999,990.00'));
+    else
+      alloc := alloc + a_amt;
+    end if;
+  end loop;
+  if amt is not null and alloc > amt then
+    lerrs := lerrs || format('Allocations (AED %s) add up to more than the payment', to_char(alloc, 'FM999,999,999,990.00'));
+  end if;
+  if array_length(lerrs, 1) > 0 then errs := errs || jsonb_build_object('allocations', array_to_string(lerrs, '. ')); end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  num := private.next_doc_number('supplier_payment', 'PV', (d ->> 'paid_on')::date);
+  insert into public.supplier_payments (number, supplier_id, paid_on, amount, method, account_id, reference, notes, created_by)
+  values (num, s.id, (d ->> 'paid_on')::date, amt, d ->> 'method', (d ->> 'account_id')::bigint, d ->> 'reference', d ->> 'notes', me.id)
+  returning id into v_id;
+  perform private.post_journal((d ->> 'paid_on')::date, 'supplier_payment', format('Payment %s to %s', num, s.name),
+    coalesce(d ->> 'reference', num), 'supplier_payment', v_id,
+    jsonb_build_array(
+      jsonb_build_object('account_id', private.acct('ap'), 'debit', amt, 'credit', 0, 'description', s.name, 'supplier_id', s.id),
+      jsonb_build_object('account_id', (d ->> 'account_id')::bigint, 'debit', 0, 'credit', amt, 'description', s.name)),
+    me.id);
+  for al in select value from jsonb_array_elements(coalesce(p_data -> 'allocations', '[]')) loop
+    a_amt := coalesce(nullif(btrim(al ->> 'amount'), '')::numeric, 0);
+    continue when a_amt = 0;
+    insert into public.bill_allocations (bill_id, payment_id, amount, created_by) values ((al ->> 'bill_id')::bigint, v_id, a_amt, me.id);
+    perform private.refresh_bill((al ->> 'bill_id')::bigint);
+  end loop;
+  return v_id;
+end $$;
+
+-- Void a payment voucher entered by mistake: reverses it and frees its allocations.
+create or replace function public.void_supplier_payment(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  p   public.supplier_payments;
+  bid bigint;
+  jid bigint;
+begin
+  select * into p from public.supplier_payments where id = p_id for update;
+  if p.id is null then
+    raise exception 'Payment voucher not found' using errcode = 'P0002';
+  end if;
+  if p.status = 'void' then
+    return;
+  end if;
+  for jid in select id from public.journals where source_type = 'supplier_payment' and source_id = p_id and reversed_by_id is null and reverses_id is null loop
+    perform private.reverse_journal(jid, greatest(private.today(), p.paid_on), null, me.id);
+  end loop;
+  for bid in delete from public.bill_allocations where payment_id = p_id returning bill_id loop
+    perform private.refresh_bill(bid);
+  end loop;
+  update public.supplier_payments set status = 'void', voided_at = now() where id = p_id;
+end $$;
+
+-- Apply an unused payment or credit note to a bill (no ledger effect: both are already in payables).
+create or replace function public.allocate_to_bill(p_bill_id bigint, p_source_type text, p_source_id bigint, p_amount numeric) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  b     public.bills;
+  avail numeric;
+  src_supplier bigint;
+begin
+  select * into b from public.bills where id = p_bill_id for update;
+  if b.id is null or b.kind <> 'bill' or b.status <> 'posted' then
+    raise exception 'Pick a posted bill' using errcode = '22023';
+  end if;
+  if p_source_type = 'payment' then
+    select supplier_id, private.payment_unallocated(id) into src_supplier, avail from public.supplier_payments where id = p_source_id and status = 'posted';
+  elsif p_source_type = 'credit_note' then
+    select supplier_id, total - amount_allocated into src_supplier, avail from public.bills
+    where id = p_source_id and kind = 'credit_note' and status = 'posted';
+  end if;
+  if src_supplier is null or src_supplier <> b.supplier_id then
+    raise exception 'That payment or credit note isn''t available for this supplier' using errcode = '22023';
+  end if;
+  if p_amount is null or p_amount <= 0 or p_amount > avail or p_amount > b.total - b.amount_allocated then
+    raise exception 'Allocate more than 0, up to AED % (what''s left on both)', to_char(least(avail, b.total - b.amount_allocated), 'FM999,999,999,990.00')
+      using errcode = '22023';
+  end if;
+  insert into public.bill_allocations (bill_id, payment_id, credit_note_id, amount, created_by)
+  values (p_bill_id, case when p_source_type = 'payment' then p_source_id end, case when p_source_type = 'credit_note' then p_source_id end,
+          round(p_amount, 2), me.id);
+  perform private.refresh_bill(p_bill_id);
+  if p_source_type = 'credit_note' then perform private.refresh_bill(p_source_id); end if;
+end $$;
+
+create or replace function public.remove_allocation(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  al public.bill_allocations;
+begin
+  delete from public.bill_allocations where id = p_id returning * into al;
+  if al.id is null then
+    raise exception 'Allocation not found' using errcode = 'P0002';
+  end if;
+  perform private.refresh_bill(al.bill_id);
+  if al.credit_note_id is not null then perform private.refresh_bill(al.credit_note_id); end if;
+end $$;
+
+create or replace function public.get_supplier_payment(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  r  json;
+begin
+  select json_build_object('payment', to_jsonb(p) || jsonb_build_object(
+      'supplier_name', s.name, 'supplier_trn', s.trn, 'account', a.code || ' · ' || a.name,
+      'unallocated', coalesce(private.payment_unallocated(p.id), 0), 'created_by_name', u.name,
+      'allocations', coalesce((select jsonb_agg(jsonb_build_object('id', al.id, 'bill_id', b.id, 'number', b.number, 'supplier_ref', b.supplier_ref,
+          'amount', al.amount) order by al.id) from public.bill_allocations al join public.bills b on b.id = al.bill_id where al.payment_id = p.id), '[]'),
+      'journal_id', (select id from public.journals where source_type = 'supplier_payment' and source_id = p.id and reverses_id is null order by id limit 1)),
+    'company', (select json_build_object('legal_name', legal_name, 'address', address, 'trn', trn) from public.company_settings where id = 1))
+  into r
+  from public.supplier_payments p join public.suppliers s on s.id = p.supplier_id join public.accounts a on a.id = p.account_id
+  left join public.profiles u on u.id = p.created_by
+  where p.id = p_id;
+  if r is null then
+    raise exception 'Payment voucher not found' using errcode = 'P0002';
+  end if;
+  return r;
+end $$;
+
+-- Supplier statement of account from the payables ledger: opening, each document, running balance (owed = positive).
+create or replace function public.supplier_statement(p_supplier bigint, p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  f       date := coalesce(p_from, private.fy_start(private.today()));
+  t       date := coalesce(p_to, private.today());
+  opening numeric;
+begin
+  select coalesce(sum(l.credit - l.debit), 0) into opening
+  from public.journal_lines l join public.journals j on j.id = l.journal_id
+  where l.supplier_id = p_supplier and l.account_id = private.acct('ap') and j.entry_date < f;
+  return json_build_object('from', f, 'to', t, 'opening', opening,
+    'supplier', (select to_jsonb(s) from public.suppliers s where s.id = p_supplier),
+    'company', (select json_build_object('legal_name', legal_name, 'address', address, 'trn', trn) from public.company_settings where id = 1),
+    'lines', coalesce((select json_agg(x order by x.entry_date, x.journal_id) from (
+      select j.id as journal_id, j.entry_date, j.number, j.kind, j.memo, j.reference, l.debit, l.credit,
+             opening + sum(l.credit - l.debit) over (order by j.entry_date, j.id, l.id) as balance
+      from public.journal_lines l join public.journals j on j.id = l.journal_id
+      where l.supplier_id = p_supplier and l.account_id = private.acct('ap') and j.entry_date between f and t) x), '[]'),
+    'closing', opening + coalesce((select sum(l.credit - l.debit) from public.journal_lines l join public.journals j on j.id = l.journal_id
+      where l.supplier_id = p_supplier and l.account_id = private.acct('ap') and j.entry_date between f and t), 0));
+end $$;
+
+-- Payables ageing at a date: open bill balances by days past due, per supplier, less unused advances and credit notes.
+create or replace function public.payables_ageing(p_as_of date default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  t  date := coalesce(p_as_of, private.today());
+begin
+  return json_build_object('as_of', t, 'rows', coalesce((select json_agg(x order by lower(x.name)) from (
+    select s.id, s.name,
+           coalesce(sum(o.bal) filter (where o.days <= 0), 0) as current,
+           coalesce(sum(o.bal) filter (where o.days between 1 and 30), 0) as d30,
+           coalesce(sum(o.bal) filter (where o.days between 31 and 60), 0) as d60,
+           coalesce(sum(o.bal) filter (where o.days between 61 and 90), 0) as d90,
+           coalesce(sum(o.bal) filter (where o.days > 90), 0) as d90plus,
+           coalesce((select sum(private.payment_unallocated(p.id)) from public.supplier_payments p
+                     where p.supplier_id = s.id and p.status = 'posted' and p.paid_on <= t), 0)
+             + coalesce((select sum(c.total - c.amount_allocated) from public.bills c
+                         where c.supplier_id = s.id and c.kind = 'credit_note' and c.status = 'posted' and c.bill_date <= t), 0) as unallocated
+    from public.suppliers s
+    left join lateral (
+      select b.total - b.amount_allocated as bal, t - coalesce(b.due_date, b.bill_date) as days
+      from public.bills b where b.supplier_id = s.id and b.kind = 'bill' and b.status = 'posted' and b.bill_date <= t and b.total > b.amount_allocated) o on true
+    group by s.id
+    having coalesce(sum(o.bal), 0) > 0
+        or coalesce((select sum(private.payment_unallocated(p.id)) from public.supplier_payments p where p.supplier_id = s.id and p.status = 'posted'), 0) > 0) x), '[]'));
+end $$;
+
+-- VAT return (FTA VAT 201) for a period, worked out from tax invoices and posted bills, with the VAT ledger
+-- (every VAT-relevant line) and the movement on the VAT accounts in the ledger as a cross-check.
+-- Emirate split of box 1 is not tracked: all standard-rated sales are reported under the company's emirate.
+create or replace function public.vat_return(p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  f  date := p_from;
+  t  date := p_to;
+  r  record;
+begin
+  if f is null or t is null or t < f then
+    raise exception 'Pick the period (from and to dates)' using errcode = '22023';
+  end if;
+  return (
+    with sales as (
+      select 'sale' as side, i.issue_date as date, i.number as document, i.id as doc_id, i.customer_name as party, i.customer_trn as party_trn,
+             l.description, l.vat_code, true as recoverable, l.net, l.vat
+      from public.invoices i join public.invoice_lines l on l.invoice_id = i.id
+      where i.kind = 'tax' and i.status in ('sent', 'paid') and i.issue_date between f and t
+    ), purchases as (
+      select 'purchase' as side, b.bill_date, b.number || ' (' || b.supplier_ref || ')', b.id, s.name, s.trn, l.description, l.vat_code, l.recoverable,
+             case b.kind when 'bill' then l.net else -l.net end, case b.kind when 'bill' then l.vat else -l.vat end
+      from public.bills b join public.bill_lines l on l.bill_id = b.id join public.suppliers s on s.id = b.supplier_id
+      where b.status = 'posted' and b.bill_date between f and t
+    ), all_lines as (
+      select *, case
+        when side = 'sale' and vat_code = 'standard' then '1'
+        when side = 'sale' and vat_code = 'zero' then '4'
+        when side = 'sale' and vat_code = 'exempt' then '5'
+        when side = 'purchase' and vat_code = 'reverse_charge' then '3 / 10'
+        when side = 'purchase' and vat_code = 'import_goods' then '6 / 10'
+        when side = 'purchase' and vat_code = 'standard' and recoverable then '9'
+        else '' end as box
+      from (select * from sales union all select * from purchases) u
+    )
+    select json_build_object(
+      'from', f, 'to', t,
+      'emirate', 'Sharjah',
+      'box1',  json_build_object('amount', coalesce(sum(net) filter (where side = 'sale' and vat_code = 'standard'), 0),
+                                 'vat', coalesce(sum(vat) filter (where side = 'sale' and vat_code = 'standard'), 0)),
+      'box3',  json_build_object('amount', coalesce(sum(net) filter (where side = 'purchase' and vat_code = 'reverse_charge'), 0),
+                                 'vat', coalesce(sum(vat) filter (where side = 'purchase' and vat_code = 'reverse_charge'), 0)),
+      'box4',  json_build_object('amount', coalesce(sum(net) filter (where side = 'sale' and vat_code = 'zero'), 0)),
+      'box5',  json_build_object('amount', coalesce(sum(net) filter (where side = 'sale' and vat_code = 'exempt'), 0)),
+      'box6',  json_build_object('amount', coalesce(sum(net) filter (where side = 'purchase' and vat_code = 'import_goods'), 0),
+                                 'vat', coalesce(sum(vat) filter (where side = 'purchase' and vat_code = 'import_goods'), 0)),
+      'box9',  json_build_object('amount', coalesce(sum(net) filter (where side = 'purchase' and vat_code = 'standard' and recoverable), 0),
+                                 'vat', coalesce(sum(vat) filter (where side = 'purchase' and vat_code = 'standard' and recoverable), 0)),
+      'box10', json_build_object('amount', coalesce(sum(net) filter (where side = 'purchase' and vat_code in ('reverse_charge', 'import_goods') and recoverable), 0),
+                                 'vat', coalesce(sum(vat) filter (where side = 'purchase' and vat_code in ('reverse_charge', 'import_goods') and recoverable), 0)),
+      'ledger', coalesce(json_agg(json_build_object('side', side, 'date', date, 'document', document, 'doc_id', doc_id, 'party', party,
+                  'party_trn', party_trn, 'description', description, 'vat_code', vat_code, 'recoverable', recoverable, 'net', net, 'vat', vat, 'box', box)
+                  order by date, document) filter (where vat_code <> 'out_of_scope'), '[]'),
+      'gl', (select json_build_object(
+                'vat_output', coalesce(sum(l.credit - l.debit) filter (where l.account_id = private.acct('vat_output')), 0),
+                'vat_input', coalesce(sum(l.debit - l.credit) filter (where l.account_id = private.acct('vat_input')), 0))
+             from public.journal_lines l join public.journals j on j.id = l.journal_id
+             where j.entry_date between f and t and j.kind <> 'vat_settlement'),
+      'settled', (select json_build_object('id', j.id, 'number', j.number) from public.journals j
+                  where j.kind = 'vat_settlement' and j.reference = format('VAT %s to %s', f, t) and j.reversed_by_id is null limit 1))
+    from all_lines);
+end $$;
+
+-- Move the period's VAT output and input into "VAT payable to FTA" (Dr output / Cr input / Cr payable, or the other way if refundable).
+create or replace function public.post_vat_settlement(p_from date, p_to date) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  outv numeric;
+  inv  numeric;
+  ref  text := format('VAT %s to %s', p_from, p_to);
+begin
+  if p_from is null or p_to is null or p_to < p_from then
+    raise exception 'Pick the period' using errcode = '22023';
+  end if;
+  if exists (select 1 from public.journals where kind = 'vat_settlement' and reference = ref and reversed_by_id is null) then
+    raise exception 'The VAT for this period has already been recorded' using errcode = '22023';
+  end if;
+  select coalesce(sum(l.credit - l.debit) filter (where l.account_id = private.acct('vat_output')), 0),
+         coalesce(sum(l.debit - l.credit) filter (where l.account_id = private.acct('vat_input')), 0)
+  into outv, inv
+  from public.journal_lines l join public.journals j on j.id = l.journal_id
+  where j.entry_date between p_from and p_to and j.kind <> 'vat_settlement';
+  if outv = 0 and inv = 0 then
+    raise exception 'There is no VAT to record for this period' using errcode = '22023';
+  end if;
+  return private.post_journal(p_to, 'vat_settlement', format('VAT return %s to %s', to_char(p_from, 'DD Mon YYYY'), to_char(p_to, 'DD Mon YYYY')),
+    ref, null, null, jsonb_build_array(
+      jsonb_build_object('account_id', private.acct('vat_output'), 'debit', greatest(outv, 0), 'credit', greatest(-outv, 0)),
+      jsonb_build_object('account_id', private.acct('vat_input'), 'debit', greatest(-inv, 0), 'credit', greatest(inv, 0)),
+      jsonb_build_object('account_id', private.acct('vat_payable'), 'debit', greatest(inv - outv, 0), 'credit', greatest(outv - inv, 0))),
+    me.id);
 end $$;
 
 -- Revenue account for the standard types of work (where not chosen yet).
@@ -4005,7 +4852,25 @@ begin
     'public.profit_loss(date, date)',
     'public.balance_sheet(date)',
     'public.finance_overview()',
-    'public.set_work_type_account(bigint, bigint)'
+    'public.set_work_type_account(bigint, bigint)',
+    'public.supplier_options()',
+    'public.list_suppliers(text)',
+    'public.save_supplier(bigint, jsonb)',
+    'public.get_supplier(bigint)',
+    'public.save_bill(bigint, jsonb)',
+    'public.post_bill(bigint)',
+    'public.cancel_bill(bigint)',
+    'public.get_bill(bigint)',
+    'public.list_bills(text, text, text, bigint, int)',
+    'public.record_supplier_payment(jsonb)',
+    'public.void_supplier_payment(bigint)',
+    'public.allocate_to_bill(bigint, text, bigint, numeric)',
+    'public.remove_allocation(bigint)',
+    'public.get_supplier_payment(bigint)',
+    'public.supplier_statement(bigint, date, date)',
+    'public.payables_ageing(date)',
+    'public.vat_return(date, date)',
+    'public.post_vat_settlement(date, date)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);
