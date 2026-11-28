@@ -760,3 +760,94 @@ test('finance: postings from invoices, opening balances, journals, reversal, ban
   if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-overview.png`, fullPage: true });
   assert.deepEqual(errors, []);
 });
+
+test('payables and VAT: supplier, bill with reverse charge, duplicate check, payment voucher, ageing, VAT return', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await signIn(admin, 'admin@lowcaps.test');
+
+  await admin.goto(base + '#/finance/suppliers');
+  await admin.click('button:text("+ Add supplier")');
+  await admin.fill('dialog [name=name]', 'Gulf Freight Lines LLC');
+  await admin.fill('dialog [name=trn]', '100222333400003');
+  await admin.fill('dialog [name=payment_terms_days]', '15');
+  await admin.selectOption('dialog [name=default_expense_account_id]', { label: '6200 · Office rent' });
+  await admin.click('dialog button:text("Save")');
+  await admin.waitForSelector('h1:text("Gulf Freight Lines LLC")');
+
+  // A bill: one standard line, one reverse-charge line from abroad
+  await admin.click('a:text("+ Bill")');
+  await admin.waitForSelector('h1:text("New bill")');
+  await admin.fill('[name=supplier_ref]', 'GF-1001');
+  await admin.locator('.l-desc').nth(0).fill('Warehouse rent, November');
+  assert.equal(await admin.locator('.b-acct').nth(0).evaluate(el => el.selectedOptions[0].textContent), '6200 · Office rent');
+  await admin.locator('.l-price').nth(0).fill('4000');
+  await admin.click('button:text("+ Add line")');
+  await admin.locator('.l-desc').nth(1).fill('Software subscription (overseas)');
+  await admin.locator('.l-price').nth(1).fill('1000');
+  await admin.locator('.b-vat').nth(1).selectOption('reverse_charge');
+  await admin.waitForSelector('.inv-form-totals dd.grand:text("AED 5,200.00")');
+  assert.ok(await admin.isVisible('.inv-form-totals dd:text("AED 50.00")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ap-bill-form.png`, fullPage: true });
+  await admin.click('button:text("Save as draft")');
+  await admin.waitForSelector('text=Draft: not in the books yet');
+  await admin.click('button:text("Post")');
+  await admin.waitForSelector('text=Posted to the books');
+  await admin.waitForSelector('.badge:text("To pay")');
+
+  // The same supplier invoice number can't be entered twice
+  await admin.goto(base + '#/finance/bills/new');
+  await admin.selectOption('[name=supplier_id]', { label: 'Gulf Freight Lines LLC' });
+  await admin.fill('[name=supplier_ref]', 'gf-1001');
+  await admin.locator('.l-desc').nth(0).fill('Again');
+  await admin.locator('.l-price').nth(0).fill('10');
+  await admin.click('button:text("Save as draft")');
+  await admin.waitForSelector('text=can\'t be entered twice');
+
+  // Pay part of it; the rest stays owed
+  await admin.goto(base + '#/finance/bills?status=open');
+  await admin.click('a.row-link:has-text("BILL-")');
+  await admin.click('.page-head a:text-is("Pay"), main a.btn:text-is("Pay")');
+  await admin.waitForSelector('h1:text("Pay a supplier")');
+  await admin.waitForSelector('.alloc');
+  await admin.fill('[name=amount]', '3000');
+  await admin.fill('.alloc', '3000');
+  await admin.waitForSelector('text=AED 0.00 left as an advance');
+  await admin.click('button:text("Save payment")');
+  await admin.waitForSelector('h1:has-text("Payment voucher PV-")');
+  const [pdf] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text("PDF")')]);
+  assert.equal(fs.readFileSync(await pdf.path()).subarray(0, 5).toString(), '%PDF-');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ap-voucher.png`, fullPage: true });
+  await admin.click('a.row-link:has-text("GF-1001")');
+  await admin.waitForSelector('.badge:text("Partly paid")');
+  assert.ok(await admin.isVisible('dd.grand:text("AED 2,200.00")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ap-bill.png`, fullPage: true });
+
+  // Supplier list, statement, ageing
+  await admin.goto(base + '#/finance/suppliers');
+  await admin.waitForSelector('td.num:text("AED 2,200.00")');
+  await admin.click('a.row-link:text("Gulf Freight Lines LLC")');
+  await admin.click('a:text("Statement")');
+  await admin.waitForSelector('h1:text("Statement of account")');
+  assert.ok(await admin.isVisible('tr.total-row:has-text("Closing balance") >> text=2,200.00'));
+  await admin.goto(base + '#/finance/reports?report=ap');
+  await admin.waitForSelector('h2:text("Payables ageing")');
+  assert.ok(await admin.isVisible('tr.total-row >> text=2,200.00'));
+
+  // VAT return for the current quarter, then record it
+  await admin.goto(base + '#/finance/vat');
+  await admin.waitForSelector('h2:text("VAT 201 summary")');
+  await admin.waitForSelector('text=Matches the ledger ✓');
+  assert.ok(await admin.isVisible('tr:has(td:text-is("10")) >> text=50.00'));
+  assert.ok(await admin.isVisible('a:text("GF-1001")') || await admin.isVisible('a:has-text("BILL-")'));
+  const [csv] = await Promise.all([admin.waitForEvent('download'), admin.locator('.card-head button:text("Excel (CSV)")').click()]);
+  assert.match(fs.readFileSync(await csv.path(), 'utf8'), /Date,Document,Party,TRN/);
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/vat-return.png`, fullPage: true });
+  admin.once('dialog', d => d.accept());
+  await admin.click('button:text("Record this VAT return in the books")');
+  await admin.waitForSelector('text=Recorded in the books');
+
+  await admin.goto(base + '#/finance');
+  await admin.waitForSelector('.stat:has-text("Payables")');
+  assert.deepEqual(errors, []);
+});

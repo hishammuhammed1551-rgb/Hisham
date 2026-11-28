@@ -354,3 +354,11 @@ th.num { text-align: right; }
 .page-head .btn-row input[type="date"] { width: auto; }
 .stat .value.value-money { font-size: 1.35rem; white-space: nowrap; }
 .pay-summary dd { font-size: 1.05rem; white-space: nowrap; }
+
+/* payables */
+.text-bad { color: var(--color-error); font-weight: 600; }
+.dd-text { font-size: 0.95rem; font-weight: 500; overflow-wrap: anywhere; }
+td.center, th.center { text-align: center; }
+.bill-edit td:nth-child(2) select { min-width: 11rem; }
+.bill-edit td:nth-child(5) select { min-width: 9rem; }
+.apply-amt { width: 8rem; }

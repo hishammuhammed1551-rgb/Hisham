@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.8 has Customers (CRM), Tasks, Invoices, Payments, Renewals, HR and Finance (phase 1: general ledger)**; expenses and reports are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.9 has Customers (CRM), Tasks, Invoices, Payments, Renewals, HR and Finance (phase 1: general ledger; phase 2: payables and VAT)**; expenses and reports are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -39,7 +39,13 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - **Bank & cash:** balances per bank account, cash box and cheques in hand; money in, money out (e.g. expenses, or customs duty paid for a customer to 1300), transfers between accounts.
   - **Reports:** trial balance (opening, movements, closing), profit and loss, balance sheet (checks assets = liabilities + equity), account ledger with running balance and drill-down to each entry and its invoice; Excel (CSV) and PDF export.
   - **Closing the books:** admins set a date up to which nothing can be posted.
-  - Coming in later phases: payables and input VAT with reverse charge and the VAT return summary; credit notes, recurring invoices, statements and ageing; bank statement import and reconciliation; cash flow and profitability reports; recurring journals.
+- **Finance (phase 2): payables and VAT.**
+  - **Suppliers:** name, TRN, contact, payment terms and the usual expense account; each supplier's page shows what is owed, bills, payments and a **statement of account** (Excel/PDF).
+  - **Bills (purchase invoices) and supplier credit notes:** saved as drafts, then **posted** (Dr expense or asset / Dr VAT input / Cr payables). Each line has an account and a VAT treatment: 5%, zero-rated, exempt, out of scope, or **reverse charge** for imported services or goods (the 5% is self-accounted: VAT output and, if recoverable, VAT input). Untick **Recov.** for VAT that can't be reclaimed; it is added to the cost. The same supplier invoice number can't be entered twice. Cancelling a posted bill reverses its entry.
+  - **Payment vouchers:** pay one or several bills in full or in part from a bank or cash account; anything not allocated stays as an **advance** to the supplier and can be applied to a later bill, as can a credit note. Vouchers download as PDF with signature lines; voiding one reverses its entry.
+  - **Payables ageing** (Reports): not yet due, 1–30, 31–60, 61–90 and over 90 days past due, per supplier.
+  - **VAT return:** for any period (quarter buttons), the FTA VAT 201 boxes 1–14 from sales invoices and bills, checked against the VAT accounts in the ledger, with the **VAT ledger** (every transaction, party TRN and box) to export as supporting documents. **Record this VAT return in the books** moves VAT output and input into "VAT payable to FTA".
+  - Coming in later phases: customer credit notes, recurring invoices, customer statements and receivables ageing; bank statement import and reconciliation; petty cash; cash flow and profitability reports; recurring journals.
 - **HR.**
   - **Employee records:** job (employee no., designation, department, joining date), contact, personal and emergency details, documents (Emirates ID, passport, visa with expiry warnings), bank and monthly salary package, leave entitlement. Managers and admins see and edit everyone's full record; everyone else sees their own in full and only name, designation, department, email and phone of colleagues.
   - **Attendance:** **Sign in** on arrival and **Sign out** when leaving. The location is recorded; away from the office (or with location off) a **remark is required** saying why. Managers see the whole team for any day (on time, late, on leave, not signed in, where they signed in from, remarks) and can correct mistakes.

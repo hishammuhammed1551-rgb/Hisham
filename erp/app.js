@@ -288,7 +288,10 @@ function layout(active, ...content) {
         isManager() && h('div', { class: 'nav-heading' }, 'Finance'),
         isManager() && link('#/finance', 'chart', 'Overview', 'finance'),
         isManager() && link('#/finance/journals', 'note', 'Journal entries', 'finance-journals'),
+        isManager() && link('#/finance/suppliers', 'users', 'Suppliers', 'finance-suppliers'),
+        isManager() && link('#/finance/bills', 'invoice', 'Bills', 'finance-bills'),
         isManager() && link('#/finance/bank', 'cash', 'Bank & cash', 'finance-bank'),
+        isManager() && link('#/finance/vat', 'tag', 'VAT return', 'finance-vat'),
         isManager() && link('#/finance/reports', 'chart', 'Reports', 'finance-reports'),
         isManager() && link('#/finance/accounts', 'tag', 'Chart of accounts', 'finance-accounts'),
         h('div', { class: 'nav-heading' }, 'HR'),
@@ -3033,12 +3036,14 @@ async function viewFinance() {
   return layout('finance',
     pageHead('Finance', o.books_locked_until ? `Books closed up to ${fmtDate(o.books_locked_until)}` : 'Accounts, ledgers and reports', [
       h('a', { class: 'btn btn-secondary', href: '#/finance/journals/new' }, '+ Journal entry'),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/bills/new' }, '+ Bill'),
       h('a', { class: 'btn btn-primary', href: '#/finance/reports' }, 'Reports'),
     ]),
     h('div', { class: 'grid stats' },
       tile('Bank & cash', cashTotal, '#/finance/bank', pdc ? `+ ${money(pdc)} in cheques not cleared` : null),
       tile('Receivables', o.receivables, `#/finance/reports?report=tb`, 'Owed by customers'),
       tile('Customer advances', o.advances, '#/finance/bank', 'Received, not yet invoiced'),
+      tile('Payables', o.payables, '#/finance/reports?report=ap', 'Owed to suppliers'),
       tile('VAT output this quarter', o.vat_output_quarter, '#/finance/reports?report=tb', `Since ${fmtDate(o.quarter_start)}`)),
     h('div', { class: 'grid two-col' }, result(`This month (since ${fmtDate(o.month_start)})`, o.month), result(`This year (since ${fmtDate(o.fy_start)})`, o.year)),
     h('section', { class: 'card' },
@@ -3410,12 +3415,12 @@ async function viewReports(params) {
     const n = new URLSearchParams({ report, from, to, ...changes });
     location.hash = '#/finance/reports?' + n;
   };
-  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['tb', 'Trial balance']].map(([k, label]) =>
+  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['tb', 'Trial balance'], ['ap', 'Payables ageing']].map(([k, label]) =>
     h('button', { type: 'button', 'aria-pressed': String(report === k), onclick: () => go({ report: k }) }, label)));
   const dates = h('div', { class: 'filters report-dates' },
-    report !== 'bs' && input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go({ from: e.target.value }) }),
-    input('to', to, { type: 'date', 'aria-label': report === 'bs' ? 'As at' : 'To', onchange: e => go({ to: e.target.value }) }),
-    report !== 'bs' && periodPresets(from, to, (f, t2) => go({ from: f, to: t2 })));
+    !['bs', 'ap'].includes(report) && input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go({ from: e.target.value }) }),
+    input('to', to, { type: 'date', 'aria-label': ['bs', 'ap'].includes(report) ? 'As at' : 'To', onchange: e => go({ to: e.target.value }) }),
+    !['bs', 'ap'].includes(report) && periodPresets(from, to, (f, t2) => go({ from: f, to: t2 })));
   const ledgerLink = (r, text) => h('a', { class: 'row-link', href: `#/finance/ledger/${r.id}?from=${report === 'bs' ? `${to.slice(0, 4)}-01-01` : from}&to=${to}` }, text);
 
   let body;
@@ -3425,7 +3430,9 @@ async function viewReports(params) {
   let title = '';
   let subtitle = '';
 
-  if (report === 'tb') {
+  if (report === 'ap') {
+    ({ title, subtitle, header, exportRows, numCols, body } = await payablesAgeing(to));
+  } else if (report === 'tb') {
     const tb = await rpc('trial_balance', { p_from: from, p_to: to });
     title = 'Trial balance';
     subtitle = `${fmtDate(tb.from)} – ${fmtDate(tb.to)}`;
@@ -3513,9 +3520,535 @@ async function viewReports(params) {
       h('p', { class: ok ? 'muted' : 'form-error' }, ok ? 'Assets equal liabilities plus equity ✓' : `Difference of ${money(Math.abs(assets - liabilities - equity))}`)];
   }
   return layout('finance-reports',
-    pageHead('Reports', null, exportButtons(`${title.replace(/ /g, '-')}-${report === 'bs' ? to : from + '-to-' + to}`, title, subtitle, header, exportRows, numCols)),
+    pageHead('Reports', null, exportButtons(`${title.replace(/ /g, '-')}-${['bs', 'ap'].includes(report) ? to : from + '-to-' + to}`, title, subtitle, header, exportRows, numCols)),
     tabs, dates,
     h('section', { class: 'card' }, h('h2', {}, title), h('p', { class: 'muted' }, subtitle), body));
+}
+
+// ---------- payables ----------
+
+const PURCHASE_VAT = {
+  standard: '5% VAT', zero: '0% (zero-rated)', exempt: 'Exempt', out_of_scope: 'No VAT (out of scope)',
+  reverse_charge: 'Reverse charge: imported services', import_goods: 'Reverse charge: imported goods',
+};
+const costAccount = a => ['expense', 'asset'].includes(a.type) && !['bank', 'cash', 'pdc', 'receivable', 'vat_input'].includes(a.subtype);
+
+function billBadge(b, today) {
+  if (b.status === 'draft') return h('span', { class: 'badge badge-plain' }, 'Draft');
+  if (b.status === 'cancelled') return h('span', { class: 'badge inv-cancelled' }, 'Cancelled');
+  const bal = round2(b.total - b.amount_allocated);
+  if (b.kind === 'credit_note') return bal > 0 ? h('span', { class: 'badge inv-partial' }, `${money(bal)} unused`) : h('span', { class: 'badge inv-paid' }, 'Used');
+  if (bal <= 0) return h('span', { class: 'badge inv-paid' }, 'Paid');
+  const due = b.due_date || b.bill_date;
+  if (today && due < today) return h('span', { class: 'badge badge-overdue' }, `Overdue · ${daysBetween(due, today)} days`);
+  return Number(b.amount_allocated) > 0 ? h('span', { class: 'badge inv-partial' }, 'Partly paid') : h('span', { class: 'badge inv-sent' }, 'To pay');
+}
+
+function supplierDialog(s, accounts, refresh) {
+  const dlg = openDialog(s.id ? `Edit ${s.name}` : 'Add supplier', handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Name', input('name', s.name, { required: true, maxlength: 200 }), { full: true }),
+      field('TRN', input('trn', s.trn, { inputmode: 'numeric', placeholder: '15 digits, if VAT registered' })),
+      field('Payment terms (days)', input('payment_terms_days', s.payment_terms_days ?? 30, { type: 'number', min: 0, max: 365 })),
+      field('Email', input('email', s.email, { type: 'email', maxlength: 200 })),
+      field('Phone', input('phone', s.phone, { type: 'tel', maxlength: 30 })),
+      field('Address', textarea('address', s.address, { rows: 2, maxlength: 500 }), { full: true }),
+      field('Country', input('country', s.country ?? 'United Arab Emirates', { maxlength: 100 })),
+      field('Usual expense account', accountSelect('default_expense_account_id', s.default_expense_account_id, accounts, {}, costAccount),
+        { hint: 'Filled in on new bills from this supplier.' }),
+      field('Notes', textarea('notes', s.notes, { rows: 2, maxlength: 2000 }), { full: true })),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: s.active !== false }), 'Active'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    const id = await rpc('save_supplier', { p_id: s.id || null, p_data: data });
+    dlg.close();
+    toast('Supplier saved');
+    if (s.id) refresh(); else location.hash = `#/finance/suppliers/${id}`;
+  }));
+}
+
+async function viewSuppliers(params) {
+  const [list, accounts] = await Promise.all([rpc('list_suppliers', { p_q: params.q || null }), rpc('list_accounts', { p_include_inactive: false })]);
+  const refresh = () => render();
+  let timer;
+  return layout('finance-suppliers',
+    pageHead('Suppliers', `${list.length} supplier${list.length === 1 ? '' : 's'} · owed ${money(list.reduce((t, s) => t + Number(s.balance), 0))}`, [
+      h('a', { class: 'btn btn-secondary', href: '#/finance/reports?report=ap' }, 'Payables ageing'),
+      h('button', { class: 'btn btn-primary', onclick: () => supplierDialog({}, accounts, refresh) }, '+ Add supplier'),
+    ]),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' }, input('q', params.q, { type: 'search', placeholder: 'Search name, TRN or email…', 'aria-label': 'Search suppliers',
+        oninput: e => { clearTimeout(timer); timer = setTimeout(() => { location.hash = '#/finance/suppliers' + (e.target.value.trim() ? '?q=' + encodeURIComponent(e.target.value.trim()) : ''); }, 350); } })),
+      list.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Supplier'), h('th', { class: 'hide-sm' }, 'TRN'), h('th', { class: 'num' }, 'We owe'),
+              h('th', { class: 'num' }, 'Overdue'), h('th', { class: 'num hide-sm' }, 'Advances & credits'))),
+            h('tbody', {}, list.map(s => h('tr', { class: s.active ? '' : 'row-off' },
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/suppliers/${s.id}` }, s.name), s.email && h('div', { class: 'meta muted' }, s.email)),
+              h('td', { class: 'hide-sm' }, s.trn || h('span', { class: 'muted' }, '—')),
+              h('td', { class: 'num' }, money(s.balance)),
+              h('td', { class: 'num' }, Number(s.overdue) ? h('span', { class: 'badge badge-overdue' }, money(s.overdue)) : h('span', { class: 'muted' }, '—')),
+              h('td', { class: 'num hide-sm' }, Number(s.unallocated) ? money(s.unallocated) : h('span', { class: 'muted' }, '—')))))))
+        : h('p', { class: 'empty' }, params.q ? 'No suppliers match.' : 'No suppliers yet. Add the companies you buy from or pay (landlord, carriers, port, utilities…).')));
+}
+
+async function viewSupplier(id) {
+  const [{ supplier: s, bills, payments, today }, accounts] = await Promise.all([rpc('get_supplier', { p_id: id }), rpc('list_accounts', { p_include_inactive: false })]);
+  const refresh = () => render();
+  return layout('finance-suppliers',
+    pageHead(s.name, [s.trn && `TRN ${s.trn}`, `${s.payment_terms_days} days terms`].filter(Boolean).join(' · '), [
+      h('a', { class: 'btn btn-primary', href: `#/finance/bills/new?supplier=${id}` }, '+ Bill'),
+      h('a', { class: 'btn btn-secondary', href: `#/finance/supplier-payments/new?supplier=${id}` }, 'Pay'),
+      h('a', { class: 'btn btn-secondary', href: `#/finance/bills/new?supplier=${id}&kind=credit_note` }, '+ Credit note'),
+      h('a', { class: 'btn btn-secondary', href: `#/finance/suppliers/${id}/statement` }, 'Statement'),
+      h('button', { class: 'btn btn-secondary', onclick: () => supplierDialog(s, accounts, refresh) }, 'Edit'),
+    ], [h('a', { href: '#/finance/suppliers' }, '← Suppliers')]),
+    h('dl', { class: 'pay-summary' },
+      h('div', {}, h('dt', {}, 'We owe'), h('dd', {}, money(s.balance))),
+      h('div', {}, h('dt', {}, 'Usual account'), h('dd', { class: 'dd-text' }, s.default_account_name || '—')),
+      h('div', {}, h('dt', {}, 'Contact'), h('dd', { class: 'dd-text' }, [s.email, s.phone].filter(Boolean).join(' · ') || '—'))),
+    h('div', { class: 'grid two-col' },
+      h('section', { class: 'card' }, h('h2', {}, 'Bills & credit notes'),
+        bills.length ? h('ul', { class: 'list' }, bills.map(b => h('li', {},
+          h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/bills/${b.id}` }, `${b.number} · ${b.supplier_ref}`),
+            h('div', { class: 'meta' }, `${b.kind === 'bill' ? 'Bill' : 'Credit note'} · ${fmtDate(b.bill_date)}${b.due_date ? ' · due ' + fmtDate(b.due_date) : ''}`)),
+          h('div', { class: 'badge-stack' }, h('strong', {}, money(b.total)), billBadge(b, today)))))
+          : h('p', { class: 'empty' }, 'None yet.')),
+      h('section', { class: 'card' }, h('h2', {}, 'Payments'),
+        payments.length ? h('ul', { class: 'list' }, payments.map(p => h('li', { class: p.status === 'void' ? 'done' : '' },
+          h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/supplier-payments/${p.id}` }, p.number),
+            h('div', { class: 'meta' }, `${fmtDate(p.paid_on)} · ${PAY_METHOD[p.method]}${Number(p.unallocated) > 0 ? ' · ' + money(p.unallocated) + ' advance not allocated' : ''}`)),
+          h('div', { class: 'badge-stack' }, h('strong', {}, money(p.amount)), p.status === 'void' && h('span', { class: 'badge inv-cancelled' }, 'Void')))))
+          : h('p', { class: 'empty' }, 'None yet.'))));
+}
+
+async function viewBills(params) {
+  const q = new URLSearchParams(params);
+  const data = await rpc('list_bills', { p_q: q.get('q') || null, p_kind: q.get('kind') || null, p_status: q.get('status') || null,
+    p_supplier: Number(q.get('supplier')) || null, p_page: Number(q.get('page')) || 1 });
+  const setParam = (k, v) => { const n = new URLSearchParams(params); if (v) n.set(k, v); else n.delete(k); if (k !== 'page') n.delete('page'); location.hash = '#/finance/bills' + (n.toString() ? '?' + n : ''); };
+  let timer;
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  return layout('finance-bills',
+    pageHead('Bills', 'Purchase invoices and credit notes from suppliers.', [
+      h('a', { class: 'btn btn-secondary', href: '#/finance/supplier-payments/new' }, 'Pay a supplier'),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/bills/new?kind=credit_note' }, '+ Credit note'),
+      h('a', { class: 'btn btn-primary', href: '#/finance/bills/new' }, '+ Bill'),
+    ]),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' },
+        input('q', q.get('q'), { type: 'search', placeholder: 'Search number, supplier or their invoice no.…', 'aria-label': 'Search',
+          oninput: e => { clearTimeout(timer); timer = setTimeout(() => setParam('q', e.target.value.trim()), 350); } }),
+        select('status', q.get('status'), [['', 'Any status'], ['open', 'To pay'], ['overdue', 'Overdue'], ['draft', 'Draft'], ['paid', 'Paid'], ['cancelled', 'Cancelled']],
+          { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value) }),
+        select('kind', q.get('kind'), [['', 'Bills and credit notes'], ['bill', 'Bills'], ['credit_note', 'Credit notes']],
+          { 'aria-label': 'Type', onchange: e => setParam('kind', e.target.value) })),
+      data.bills.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Number'), h('th', {}, 'Supplier'), h('th', { class: 'hide-sm' }, 'Their no.'), h('th', { class: 'hide-sm' }, 'Date'),
+              h('th', { class: 'num' }, 'Total'), h('th', { class: 'num hide-sm' }, 'Balance'), h('th', {}, 'Status'))),
+            h('tbody', {}, data.bills.map(b => h('tr', {},
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/bills/${b.id}` }, b.number), b.kind === 'credit_note' && h('div', { class: 'meta muted' }, 'Credit note')),
+              h('td', {}, h('a', { href: `#/finance/suppliers/${b.supplier_id}` }, b.supplier_name)),
+              h('td', { class: 'hide-sm' }, b.supplier_ref), h('td', { class: 'hide-sm' }, fmtDate(b.bill_date)),
+              h('td', { class: 'num' }, money(b.total)),
+              h('td', { class: 'num hide-sm' }, b.status === 'posted' ? money(b.total - b.amount_allocated) : '—'),
+              h('td', {}, billBadge(b, data.today)))))))
+        : h('p', { class: 'empty' }, [...q.keys()].length ? 'Nothing matches.' : 'No bills yet. Enter supplier invoices here to track what you owe and claim input VAT.'),
+      data.total > data.pageSize && h('div', { class: 'pager' }, h('span', { class: 'muted' }, `Page ${data.page} of ${pages}`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
+function billForm(b, kind, suppliers, accounts, onSubmit, cancelHref) {
+  const tbody = h('tbody', {});
+  const totals = h('dl', { class: 'inv-form-totals' });
+  const supplierSel = select('supplier_id', b.supplier_id ? String(b.supplier_id) : '', [['', 'Pick a supplier…'],
+    ...suppliers.filter(s => s.active || s.id === b.supplier_id).map(s => [String(s.id), s.name])], { required: true });
+  const billDate = input('bill_date', b.bill_date || localToday(), { type: 'date', required: true });
+  const dueDate = input('due_date', b.due_date || '', { type: 'date' });
+  const supplier = () => suppliers.find(s => String(s.id) === supplierSel.value);
+  const setDue = () => { const s = supplier(); if (s && kind === 'bill' && !b.id) dueDate.value = addDays(billDate.value, s.payment_terms_days); };
+  supplierSel.addEventListener('change', () => {
+    setDue();
+    const s = supplier();
+    if (s && s.default_expense_account_id) for (const row of tbody.rows) { const sel = row.querySelector('.b-acct'); if (!sel.value) sel.value = String(s.default_expense_account_id); }
+  });
+  billDate.addEventListener('change', setDue);
+
+  const recalc = () => {
+    let net = 0; let vat = 0; let rcm = 0;
+    for (const row of tbody.rows) {
+      const n = round2(Number(row.querySelector('.l-qty').value) * Number(row.querySelector('.l-price').value));
+      const code = row.querySelector('.b-vat').value;
+      const v = ['standard', 'reverse_charge', 'import_goods'].includes(code) ? round2(n * 0.05) : 0;
+      row.querySelector('.l-amount').textContent = Number.isFinite(n) ? amount(n) : '—';
+      net += Number.isFinite(n) ? n : 0;
+      if (code === 'standard') vat += v; else rcm += v;
+    }
+    totals.replaceChildren(h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(net)), h('dt', {}, 'VAT charged'), h('dd', {}, money(vat)),
+      h('dt', { class: 'grand' }, kind === 'bill' ? 'Total to pay' : 'Total credit'), h('dd', { class: 'grand' }, money(round2(net + vat))),
+      ...(rcm > 0 ? [h('dt', {}, 'Reverse charge VAT (self-accounted)'), h('dd', {}, money(rcm))] : []));
+  };
+  const addLine = (l = {}) => {
+    const s = supplier();
+    const row = h('tr', {},
+      h('td', {}, h('input', { class: 'l-desc', value: l.description ?? '', required: true, maxlength: 500, 'aria-label': 'Description' })),
+      h('td', {}, accountSelect('', l.account_id || (s && s.default_expense_account_id), accounts, { class: 'b-acct', required: true, 'aria-label': 'Account' }, costAccount)),
+      h('td', {}, h('input', { class: 'l-qty', type: 'number', min: '0.001', step: '0.001', value: l.quantity ?? 1, required: true, 'aria-label': 'Quantity', oninput: recalc })),
+      h('td', {}, h('input', { class: 'l-price', type: 'number', min: '0', step: '0.01', value: l.unit_price ?? '', required: true, 'aria-label': 'Unit price', placeholder: '0.00', oninput: recalc })),
+      h('td', {}, select('', l.vat_code || 'standard', Object.entries(PURCHASE_VAT), { class: 'b-vat', 'aria-label': 'VAT', onchange: recalc })),
+      h('td', { class: 'center' }, h('input', { class: 'b-rec', type: 'checkbox', checked: l.recoverable !== false, 'aria-label': 'VAT recoverable', title: 'VAT recoverable' })),
+      h('td', { class: 'num l-amount' }),
+      h('td', {}, h('button', { class: 'btn btn-danger btn-sm', type: 'button', 'aria-label': 'Remove line', onclick: () => { if (tbody.rows.length > 1) { row.remove(); recalc(); } } }, '×')));
+    tbody.append(row);
+    recalc();
+  };
+  (b.lines && b.lines.length ? b.lines : [{}]).forEach(addLine);
+  if (!b.id && !b.due_date) setDue();
+
+  return handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Supplier', supplierSel),
+      field(kind === 'bill' ? 'Their invoice number' : 'Their credit note number', input('supplier_ref', b.supplier_ref, { required: true, maxlength: 60 }),
+        { hint: 'Checked so the same document can\'t be entered twice.' }),
+      field(kind === 'bill' ? 'Invoice date' : 'Credit note date', billDate),
+      kind === 'bill' ? field('Due date', dueDate) : h('div')),
+    h('div', { class: 'field', 'data-field': 'lines' },
+      h('label', {}, 'Lines (AED, excluding VAT)'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'inv-edit bill-edit' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Description'), h('th', {}, 'Account'), h('th', {}, 'Qty'), h('th', {}, 'Unit price'), h('th', {}, 'VAT'),
+          h('th', { title: 'VAT recoverable' }, 'Recov.'), h('th', { class: 'num' }, 'Amount'), h('th', {}, ''))),
+        tbody)),
+      h('div', { class: 'inv-edit-foot' }, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => addLine() }, '+ Add line'), totals),
+      h('div', { class: 'hint' }, 'Untick "Recov." when the VAT can\'t be reclaimed (e.g. entertainment, some motor costs): it is added to the cost instead. ',
+        'Reverse charge: for services or goods bought from abroad; you account for the 5% VAT yourself and, if recoverable, reclaim it in the same return.')),
+    field('Notes (optional)', textarea('notes', b.notes, { rows: 2, maxlength: 1000 })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, b.id ? 'Save changes' : 'Save as draft'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  data => {
+    data.kind = kind;
+    data.lines = [...tbody.rows].map(r => ({
+      description: r.querySelector('.l-desc').value, account_id: r.querySelector('.b-acct').value, quantity: r.querySelector('.l-qty').value,
+      unit_price: r.querySelector('.l-price').value, vat_code: r.querySelector('.b-vat').value, recoverable: r.querySelector('.b-rec').checked,
+    }));
+    return onSubmit(data);
+  });
+}
+
+async function viewBillNew(params) {
+  const kind = params.kind === 'credit_note' ? 'credit_note' : 'bill';
+  const [suppliers, accounts] = await Promise.all([rpc('supplier_options'), rpc('list_accounts', { p_include_inactive: false })]);
+  const back = params.supplier ? `#/finance/suppliers/${params.supplier}` : '#/finance/bills';
+  return layout('finance-bills',
+    pageHead(kind === 'bill' ? 'New bill' : 'New supplier credit note', 'Saved as a draft first; post it to put it in the books.', null, h('a', { href: back }, '← Back')),
+    suppliers.length === 0 && h('p', { class: 'notice' }, 'Add a supplier first: ', h('a', { href: '#/finance/suppliers' }, 'Suppliers')),
+    h('section', { class: 'card' }, billForm({ supplier_id: Number(params.supplier) || null }, kind, suppliers, accounts, async data => {
+      const id = await rpc('save_bill', { p_id: null, p_data: data });
+      toast('Draft saved. Check it, then Post.');
+      location.hash = `#/finance/bills/${id}`;
+    }, back)));
+}
+
+async function viewBillEdit(id) {
+  const [{ bill: b }, suppliers, accounts] = await Promise.all([rpc('get_bill', { p_id: id }), rpc('supplier_options'), rpc('list_accounts', { p_include_inactive: false })]);
+  return layout('finance-bills', pageHead(`Edit ${b.number}`, b.supplier_name, null, h('a', { href: `#/finance/bills/${id}` }, '← Back')),
+    h('section', { class: 'card' }, billForm(b, b.kind, suppliers, accounts, async data => {
+      await rpc('save_bill', { p_id: id, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/bills/${id}`;
+    }, `#/finance/bills/${id}`)));
+}
+
+async function viewBill(id) {
+  const { bill: b, today, open_items: open } = await rpc('get_bill', { p_id: id });
+  const refresh = () => render();
+  const act = (fn, args, msg) => async () => { try { await rpc(fn, args); toast(msg); refresh(); } catch (err) { toast(err.message, true); } };
+  const bal = round2(b.total - b.amount_allocated);
+  const applyRow = o => {
+    const max = Math.min(Number(o.available), bal);
+    const amt = h('input', { type: 'number', min: '0.01', step: '0.01', max: max.toFixed(2), value: max.toFixed(2), class: 'apply-amt', 'aria-label': 'Amount to apply' });
+    return h('li', {},
+      h('div', { class: 'grow' }, h('strong', {}, o.number), h('div', { class: 'meta' }, `${o.type === 'payment' ? 'Payment (advance)' : o.type === 'credit_note' ? 'Credit note' : 'Bill'} · ${fmtDate(o.date)} · ${money(o.available)} available`)),
+      h('div', { class: 'btn-row' }, amt, h('button', {
+        class: 'btn btn-secondary btn-sm',
+        onclick: async () => {
+          try {
+            if (b.kind === 'bill') await rpc('allocate_to_bill', { p_bill_id: b.id, p_source_type: o.type, p_source_id: o.id, p_amount: Number(amt.value) });
+            else await rpc('allocate_to_bill', { p_bill_id: o.id, p_source_type: 'credit_note', p_source_id: b.id, p_amount: Number(amt.value) });
+            toast('Applied'); refresh();
+          } catch (err) { toast(err.message, true); }
+        },
+      }, 'Apply')));
+  };
+  return layout('finance-bills',
+    pageHead(`${b.number} · ${b.supplier_ref}`, `${b.kind === 'bill' ? 'Bill' : 'Credit note'} from ${b.supplier_name}`, [
+      b.status === 'draft' && h('button', { class: 'btn btn-primary', onclick: act('post_bill', { p_id: b.id }, 'Posted to the books') }, 'Post'),
+      b.status === 'draft' && h('a', { class: 'btn btn-secondary', href: `#/finance/bills/${b.id}/edit` }, 'Edit'),
+      b.status === 'posted' && b.kind === 'bill' && bal > 0 && h('a', { class: 'btn btn-primary', href: `#/finance/supplier-payments/new?supplier=${b.supplier_id}&bill=${b.id}` }, 'Pay'),
+      b.journal_id && h('a', { class: 'btn btn-secondary', href: `#/finance/journals/${b.journal_id}` }, 'Ledger entry'),
+      b.status !== 'cancelled' && h('button', { class: 'btn btn-danger', onclick: () => { if (confirmAction(`Cancel ${b.number}?${b.status === 'posted' ? ' Its ledger entry will be reversed.' : ''}`)) act('cancel_bill', { p_id: b.id }, 'Cancelled')(); } }, 'Cancel'),
+    ], [h('a', { href: `#/finance/suppliers/${b.supplier_id}` }, `← ${b.supplier_name}`), ' ', billBadge(b, today)]),
+    b.status === 'draft' && h('p', { class: 'notice' }, 'Draft: not in the books yet. Check it, then click Post.'),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [['Supplier', h('a', { href: `#/finance/suppliers/${b.supplier_id}` }, b.supplier_name)], ['Supplier TRN', b.supplier_trn],
+        ['Their number', b.supplier_ref], ['Date', fmtDate(b.bill_date)], ['Due', b.due_date && fmtDate(b.due_date)], ['Notes', b.notes]]
+        .filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Description'), h('th', { class: 'hide-sm' }, 'Account'), h('th', {}, 'VAT'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'VAT'))),
+        h('tbody', {}, b.lines.map(l => h('tr', {},
+          h('td', {}, l.description, Number(l.quantity) !== 1 && h('div', { class: 'meta muted' }, `${qtyText(l.quantity)} × ${amount(l.unit_price)}`)),
+          h('td', { class: 'hide-sm' }, l.account),
+          h('td', {}, PURCHASE_VAT[l.vat_code], ['standard', 'reverse_charge', 'import_goods'].includes(l.vat_code) && !l.recoverable && h('div', { class: 'meta muted' }, 'Not recoverable')),
+          h('td', { class: 'num' }, amount(l.net)), h('td', { class: 'num' }, amt0(l.vat))))))),
+      h('dl', { class: 'inv-totals' },
+        h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(b.subtotal)), h('dt', {}, 'VAT charged'), h('dd', {}, money(b.vat_total)),
+        h('dt', { class: 'grand' }, 'Total'), h('dd', { class: 'grand' }, money(b.total)),
+        Number(b.rcm_vat) > 0 && [h('dt', {}, 'Reverse charge VAT (self-accounted)'), h('dd', {}, money(b.rcm_vat))],
+        b.status === 'posted' && [h('dt', {}, b.kind === 'bill' ? 'Paid / credited' : 'Used'), h('dd', {}, money(b.amount_allocated)),
+          h('dt', { class: 'grand' }, b.kind === 'bill' ? 'Balance' : 'Unused'), h('dd', { class: 'grand' }, money(bal))])),
+    b.status === 'posted' && h('section', { class: 'card' },
+      h('h2', {}, b.kind === 'bill' ? 'Payments and credits' : 'Applied to'),
+      b.allocations.length ? h('ul', { class: 'list' }, b.allocations.map(a => h('li', {},
+        h('div', { class: 'grow' }, h('strong', {}, money(a.amount)), ' · ', b.kind === 'bill'
+          ? (a.payment_id ? h('a', { href: `#/finance/supplier-payments/${a.payment_id}` }, a.source) : h('a', { href: `#/finance/bills/${a.credit_note_id}` }, a.source))
+          : h('a', { href: `#/finance/bills/${a.bill_id}` }, a.bill_number),
+          h('div', { class: 'meta' }, fmtDate(a.created_at))),
+        h('button', { class: 'btn btn-danger btn-sm', onclick: () => { if (confirmAction('Remove this allocation?')) act('remove_allocation', { p_id: a.id }, 'Allocation removed')(); } }, 'Remove'))))
+        : h('p', { class: 'empty' }, 'Nothing yet.'),
+      bal > 0 && open.length > 0 && [h('h3', { class: 'notes-heading' }, b.kind === 'bill' ? 'Apply an advance or credit note' : 'Apply to a bill'), h('ul', { class: 'list' }, open.map(applyRow))]));
+}
+
+async function viewSupplierPaymentNew(params) {
+  const [suppliers, banks] = await Promise.all([rpc('supplier_options'), rpc('cash_accounts')]);
+  const supplierSel = select('supplier_id', params.supplier || '', [['', 'Pick a supplier…'], ...suppliers.filter(s => s.active).map(s => [String(s.id), s.name])], { required: true });
+  const amountIn = input('amount', '', { type: 'number', min: '0.01', step: '0.01', required: true });
+  const allocBody = h('tbody', {});
+  const summary = h('p', { class: 'muted' });
+  let openBills = [];
+  const recalc = () => {
+    const total = [...allocBody.querySelectorAll('.alloc')].reduce((t, el) => t + (Number(el.value) || 0), 0);
+    const left = round2((Number(amountIn.value) || 0) - total);
+    summary.textContent = `Allocated ${money(total)} · ${left >= 0 ? `${money(left)} left as an advance to the supplier` : `over by ${money(-left)}`}`;
+    summary.className = left < 0 ? 'form-error' : 'muted';
+  };
+  const fillOldest = () => {
+    let left = Number(amountIn.value) || 0;
+    for (const el of allocBody.querySelectorAll('.alloc')) { const v = Math.min(Number(el.max), left); el.value = v > 0 ? v.toFixed(2) : ''; left = round2(left - (v > 0 ? v : 0)); }
+    recalc();
+  };
+  const loadBills = async () => {
+    allocBody.replaceChildren();
+    if (!supplierSel.value) { recalc(); return; }
+    openBills = (await rpc('list_bills', { p_status: 'open', p_kind: 'bill', p_supplier: Number(supplierSel.value), p_page: 1 })).bills.slice().reverse();
+    for (const b of openBills) {
+      const bal = round2(b.total - b.amount_allocated);
+      allocBody.append(h('tr', {}, h('td', {}, `${b.number} · ${b.supplier_ref}`), h('td', {}, fmtDate(b.bill_date)), h('td', {}, b.due_date ? fmtDate(b.due_date) : '—'),
+        h('td', { class: 'num' }, money(bal)),
+        h('td', {}, h('input', { class: 'alloc', 'data-bill': String(b.id), type: 'number', min: '0', step: '0.01', max: bal.toFixed(2),
+          value: params.bill && String(b.id) === String(params.bill) ? bal.toFixed(2) : '', 'aria-label': `Pay towards ${b.number}`, oninput: recalc }))));
+      if (params.bill && String(b.id) === String(params.bill) && !amountIn.value) amountIn.value = bal.toFixed(2);
+    }
+    if (!openBills.length) allocBody.append(h('tr', {}, h('td', { colspan: 5, class: 'muted' }, 'No unpaid bills: the whole amount will be an advance.')));
+    recalc();
+  };
+  supplierSel.addEventListener('change', loadBills);
+  amountIn.addEventListener('input', recalc);
+  const usable = banks.filter(a => a.active && a.subtype !== 'pdc');
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Supplier', supplierSel), field('Amount (AED)', amountIn),
+      field('Paid from', select('account_id', usable[0] ? String(usable[0].id) : '', usable.map(a => [String(a.id), `${a.code} · ${a.name}`]), { required: true })),
+      field('Paid by', select('method', 'bank_transfer', Object.entries(PAY_METHOD))),
+      field('Date', input('paid_on', localToday(), { type: 'date', max: localToday(), required: true })),
+      field('Reference (optional)', input('reference', '', { maxlength: 100, placeholder: 'Transfer ref. or cheque no.' })),
+      field('Note (optional)', input('notes', '', { maxlength: 1000 }), { full: true })),
+    h('div', { class: 'field', 'data-field': 'allocations' },
+      h('label', {}, 'Pay towards'),
+      h('div', { class: 'table-wrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Bill'), h('th', {}, 'Date'), h('th', {}, 'Due'), h('th', { class: 'num' }, 'Balance'), h('th', {}, 'Pay now'))), allocBody)),
+      h('div', { class: 'inv-edit-foot' }, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: fillOldest }, 'Fill oldest first'), summary)),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save payment'),
+      h('a', { class: 'btn btn-secondary', href: params.supplier ? `#/finance/suppliers/${params.supplier}` : '#/finance/bills' }, 'Cancel'))),
+  async data => {
+    data.allocations = [...allocBody.querySelectorAll('.alloc')].map(el => ({ bill_id: el.dataset.bill, amount: el.value }));
+    const id = await rpc('record_supplier_payment', { p_data: data });
+    toast('Payment saved');
+    location.hash = `#/finance/supplier-payments/${id}`;
+  });
+  setTimeout(loadBills);
+  return layout('finance-bills', pageHead('Pay a supplier', 'Creates a payment voucher. Anything not allocated to bills stays as an advance.'),
+    h('section', { class: 'card' }, form));
+}
+
+function buildVoucherPdf(d) {
+  const p = d.payment;
+  const rows = [['Voucher no.', p.number], ['Date', fmtDate(p.paid_on)], ['Paid to', p.supplier_name], ['Supplier TRN', p.supplier_trn || '—'],
+    ['Amount', money(p.amount)], ['Paid by', `${PAY_METHOD[p.method]} from ${p.account}`], ['Reference', p.reference || '—'],
+    ...p.allocations.map(a => [`Towards ${a.number} (${a.supplier_ref})`, money(a.amount)]),
+    Number(p.unallocated) > 0 && ['Advance (not yet allocated)', money(p.unallocated)], ['Notes', p.notes || '—']].filter(Boolean);
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(74, 122, 92);
+  doc.text(pdfText(d.company.legal_name || 'Lowcaps'), 15, 20);
+  doc.setFontSize(16); doc.setTextColor(28, 42, 34); doc.text('PAYMENT VOUCHER', 195, 20, { align: 'right' });
+  window.autoTable(doc, { startY: 30, margin: { left: 15, right: 15 }, body: rows.map(([k, v]) => [pdfText(k), pdfText(v)]),
+    styles: { font: 'helvetica', fontSize: 10, cellPadding: 2.5, lineColor: [219, 229, 222], lineWidth: 0.1 }, columnStyles: { 0: { fontStyle: 'bold', cellWidth: 60 } } });
+  const y = doc.lastAutoTable.finalY + 25;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+  ['Prepared by', 'Approved by', 'Received by'].forEach((t, i) => { doc.line(15 + i * 62, y, 70 + i * 62, y); doc.text(t, 15 + i * 62, y + 5); });
+  return doc;
+}
+
+async function viewSupplierPayment(id) {
+  const d = await rpc('get_supplier_payment', { p_id: id });
+  const p = d.payment;
+  const refresh = () => render();
+  return layout('finance-bills',
+    pageHead(`Payment voucher ${p.number}`, `${fmtDate(p.paid_on)} · ${p.supplier_name}`, [
+      h('button', { class: 'btn btn-secondary', onclick: () => { try { buildVoucherPdf(d).save(`${p.number}.pdf`); } catch (err) { toast(err.message, true); } } }, icon('download'), 'PDF'),
+      p.journal_id && h('a', { class: 'btn btn-secondary', href: `#/finance/journals/${p.journal_id}` }, 'Ledger entry'),
+      p.status === 'posted' && h('button', { class: 'btn btn-danger', onclick: async () => {
+        if (!confirmAction(`Void ${p.number}? Its ledger entry is reversed and its allocations removed.`)) return;
+        try { await rpc('void_supplier_payment', { p_id: p.id }); toast('Voided'); refresh(); } catch (err) { toast(err.message, true); }
+      } }, 'Void'),
+    ], [h('a', { href: `#/finance/suppliers/${p.supplier_id}` }, `← ${p.supplier_name}`), ' ', p.status === 'void' && h('span', { class: 'badge inv-cancelled' }, 'Void')]),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [['Amount', h('strong', {}, money(p.amount))], ['Paid by', `${PAY_METHOD[p.method]} from ${p.account}`], ['Reference', p.reference],
+        ['Recorded by', p.created_by_name], ['Notes', p.notes]].filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('h3', { class: 'notes-heading' }, 'Allocated to'),
+      p.allocations.length ? h('ul', { class: 'list' }, p.allocations.map(a => h('li', {},
+        h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/bills/${a.bill_id}` }, `${a.number} · ${a.supplier_ref}`)), h('strong', {}, money(a.amount)))))
+        : h('p', { class: 'empty' }, 'Not allocated to any bill.'),
+      Number(p.unallocated) > 0 && h('p', { class: 'notice' }, `${money(p.unallocated)} is an advance to the supplier. Apply it from an unpaid bill's page.`)));
+}
+
+async function viewSupplierStatement(id, params) {
+  const fy = `${localToday().slice(0, 4)}-01-01`;
+  const st = await rpc('supplier_statement', { p_supplier: id, p_from: params.from || fy, p_to: params.to || localToday() });
+  const go = (k, v) => { const n = new URLSearchParams(params); n.set(k, v); location.hash = `#/finance/suppliers/${id}/statement?` + n; };
+  const header = ['Date', 'Entry', 'Details', 'Billed / credited', 'Paid / debited', 'Balance owed'];
+  const rows = [[fmtDate(st.from), '', { text: 'Opening balance' }, '', '', { text: amount(st.opening) }],
+    ...st.lines.map(l => [fmtDate(l.entry_date), l.number, l.memo || JOURNAL_KIND[l.kind], amt0(l.credit), amt0(l.debit), amount(l.balance)]),
+    [fmtDate(st.to), '', { text: 'Closing balance' }, '', '', { text: amount(st.closing) }]];
+  const subtitle = `${st.supplier.name}${st.supplier.trn ? ' · TRN ' + st.supplier.trn : ''} · ${fmtDate(st.from)} – ${fmtDate(st.to)}`;
+  return layout('finance-suppliers',
+    pageHead('Statement of account', subtitle, [
+      input('from', st.from, { type: 'date', 'aria-label': 'From', onchange: e => go('from', e.target.value) }),
+      input('to', st.to, { type: 'date', 'aria-label': 'To', onchange: e => go('to', e.target.value) }),
+      ...exportButtons(`Statement-${st.supplier.name.replace(/[^A-Za-z0-9]+/g, '-')}-${st.to}`, 'Supplier statement of account', subtitle, header, rows, [3, 4, 5]),
+    ], [h('a', { href: `#/finance/suppliers/${id}` }, `← ${st.supplier.name}`)]),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+      h('thead', {}, h('tr', {}, header.map((t, i) => h('th', { class: i >= 3 ? 'num' : '' }, t)))),
+      h('tbody', {}, rows.map((r, i) => h('tr', { class: i === 0 || i === rows.length - 1 ? 'total-row' : '' },
+        r.map((c, j) => h('td', { class: j >= 3 ? 'num' : '' }, j === 1 && c && i > 0 && i < rows.length - 1
+          ? h('a', { href: `#/finance/journals/${st.lines[i - 1].journal_id}` }, c) : (c && typeof c === 'object' ? c.text : c))))))))));
+}
+
+// ---------- VAT ----------
+
+async function viewVat(params) {
+  const t = localToday();
+  const q0 = String(Math.floor((Number(t.slice(5, 7)) - 1) / 3) * 3 + 1).padStart(2, '0');
+  const from = params.from || `${t.slice(0, 4)}-${q0}-01`;
+  const to = params.to || t;
+  const v = await rpc('vat_return', { p_from: from, p_to: to });
+  const go = (f, t2) => { location.hash = `#/finance/vat?from=${f}&to=${t2}`; };
+  const quarters = [];
+  for (let i = 0; i < 5; i++) {
+    const d = new Date(Number(t.slice(0, 4)), Number(q0) - 1 - i * 3, 1);
+    const f = d.toLocaleDateString('en-CA');
+    const e = new Date(d.getFullYear(), d.getMonth() + 3, 0).toLocaleDateString('en-CA');
+    quarters.push([`Q${Math.floor(d.getMonth() / 3) + 1} ${d.getFullYear()}`, f, e]);
+  }
+  const due = Number(v.box1.vat) + Number(v.box3.vat) + Number(v.box6.vat);
+  const rec = Number(v.box9.vat) + Number(v.box10.vat);
+  const net = round2(due - rec);
+  const boxRows = [
+    ['1', `Standard rated supplies (${v.emirate})`, v.box1.amount, v.box1.vat],
+    ['3', 'Supplies subject to the reverse charge', v.box3.amount, v.box3.vat],
+    ['4', 'Zero rated supplies', v.box4.amount, null],
+    ['5', 'Exempt supplies', v.box5.amount, null],
+    ['6', 'Goods imported into the UAE', v.box6.amount, v.box6.vat],
+    ['8', 'Totals (outputs)', Number(v.box1.amount) + Number(v.box3.amount) + Number(v.box4.amount) + Number(v.box5.amount) + Number(v.box6.amount), due],
+    ['9', 'Standard rated expenses', v.box9.amount, v.box9.vat],
+    ['10', 'Supplies subject to the reverse charge (recoverable)', v.box10.amount, v.box10.vat],
+    ['11', 'Totals (inputs)', Number(v.box9.amount) + Number(v.box10.amount), rec],
+    ['12', 'Total value of due tax for the period', null, due],
+    ['13', 'Total value of recoverable tax for the period', null, rec],
+    ['14', net >= 0 ? 'Payable tax for the period' : 'Refundable tax for the period', null, Math.abs(net)],
+  ];
+  const glOk = round2(v.gl.vat_output) === round2(due) && round2(v.gl.vat_input) === round2(rec);
+  const ledgerHeader = ['Date', 'Document', 'Party', 'TRN', 'Type', 'Box', 'Net', 'VAT'];
+  const ledgerRows = v.ledger.map(l => [fmtDate(l.date), l.document, l.party, l.party_trn || '', `${l.side === 'sale' ? 'Sale' : 'Purchase'}: ${(l.side === 'sale' ? VAT_CODES : PURCHASE_VAT)[l.vat_code] || l.vat_code}${l.side === 'purchase' && !l.recoverable ? ' (not recoverable)' : ''}`, l.box, amount(l.net), amount(l.vat)]);
+  const subtitle = `${fmtDate(v.from)} – ${fmtDate(v.to)}`;
+  return layout('finance-vat',
+    pageHead('VAT return', `${subtitle} · FTA VAT 201`, [
+      ...exportButtons(`VAT-return-${v.from}-to-${v.to}`, 'VAT return (VAT 201)', subtitle, ['Box', 'Description', 'Amount (AED)', 'VAT (AED)'],
+        boxRows.map(r => [r[0], r[1], r[2] == null ? '' : amount(r[2]), r[3] == null ? '' : amount(r[3])]), [2, 3]),
+    ]),
+    h('div', { class: 'filters report-dates' },
+      input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go(e.target.value, to) }),
+      input('to', to, { type: 'date', 'aria-label': 'To', onchange: e => go(from, e.target.value) }),
+      h('div', { class: 'btn-row' }, quarters.map(([label, f, e]) => h('button', { class: `btn btn-sm ${f === from && e === to ? 'btn-primary' : 'btn-secondary'}`, type: 'button', onclick: () => go(f, e) }, label)))),
+    h('div', { class: 'grid two-col' },
+      h('section', { class: 'card' }, h('h2', {}, 'VAT 201 summary'),
+        h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+          h('thead', {}, h('tr', {}, h('th', {}, 'Box'), h('th', {}, 'Description'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'VAT'))),
+          h('tbody', {}, boxRows.map(r => h('tr', { class: ['8', '11', '14'].includes(r[0]) ? 'total-row' : '' },
+            h('td', {}, r[0]), h('td', {}, r[1]), h('td', { class: 'num' }, r[2] == null ? '' : amount(r[2])), h('td', { class: 'num' }, r[3] == null ? '' : amount(r[3])))))))),
+      h('section', { class: 'card' }, h('h2', {}, 'Check and record'),
+        h('dl', { class: 'pay-summary' },
+          h('div', { class: net > 0 ? 'is-overdue' : 'is-paid' }, h('dt', {}, net >= 0 ? 'To pay to FTA' : 'Refundable from FTA'), h('dd', {}, money(Math.abs(net))))),
+        h('p', { class: glOk ? 'muted' : 'form-error' }, glOk
+          ? `Matches the ledger ✓ (VAT output ${money(v.gl.vat_output)}, VAT input ${money(v.gl.vat_input)})`
+          : `The ledger shows VAT output ${money(v.gl.vat_output)} and VAT input ${money(v.gl.vat_input)} for this period, which differs from the return. Check for manual journals on the VAT accounts.`),
+        h('p', { class: 'muted' }, 'Box 1 is reported under one emirate. Boxes 2 (tourist refunds) and 7 (import adjustments) are not used. Enter these figures in the FTA portal (EmaraTax) and keep the VAT ledger below as supporting documents.'),
+        v.settled
+          ? h('p', { class: 'notice' }, 'Recorded in the books: ', h('a', { href: `#/finance/journals/${v.settled.id}` }, v.settled.number),
+            state.user.role === 'admin' ? [' · ', h('a', { href: '#/finance/accounts' }, 'close the books up to ' + fmtDate(v.to))] : '')
+          : h('button', { class: 'btn btn-primary', onclick: async () => {
+            if (!confirmAction(`Record the VAT for ${subtitle}? This moves VAT output and input into "VAT payable to FTA".`)) return;
+            try { await rpc('post_vat_settlement', { p_from: from, p_to: to }); toast('VAT recorded'); render(); } catch (err) { toast(err.message, true); }
+          } }, 'Record this VAT return in the books'))),
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', {}, `VAT ledger (${v.ledger.length} lines)`),
+        h('div', { class: 'btn-row' }, exportButtons(`VAT-ledger-${v.from}-to-${v.to}`, 'VAT ledger', subtitle, ledgerHeader, ledgerRows, [6, 7]))),
+      v.ledger.length
+        ? h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+            h('thead', {}, h('tr', {}, ledgerHeader.map((x, i) => h('th', { class: i >= 6 ? 'num' : '' }, x)))),
+            h('tbody', {}, v.ledger.map((l, i) => h('tr', {},
+              h('td', {}, ledgerRows[i][0]),
+              h('td', {}, h('a', { href: l.side === 'sale' ? `#/invoices/${l.doc_id}` : `#/finance/bills/${l.doc_id}` }, l.document)),
+              h('td', {}, l.party), h('td', {}, l.party_trn || h('span', { class: 'muted' }, '—')), h('td', {}, ledgerRows[i][4]),
+              h('td', {}, l.box), h('td', { class: 'num' }, amount(l.net)), h('td', { class: 'num' }, amount(l.vat)))))))
+        : h('p', { class: 'empty' }, 'No VAT transactions in this period.')));
+}
+
+async function payablesAgeing(to) {
+  const a = await rpc('payables_ageing', { p_as_of: to });
+  const header = ['Supplier', 'Not yet due', '1–30 days', '31–60 days', '61–90 days', 'Over 90 days', 'Total due', 'Advances & credits'];
+  const tot = Array(7).fill(0);
+  const rows = a.rows.map(r => {
+    const vals = [r.current, r.d30, r.d60, r.d90, r.d90plus].map(Number);
+    const total = vals.reduce((x, y) => x + y, 0);
+    [...vals, total, Number(r.unallocated)].forEach((v, i) => { tot[i] += v; });
+    return { r, cells: [...vals, total, Number(r.unallocated)] };
+  });
+  const exportRows = [...rows.map(({ r, cells }) => [r.name, ...cells.map(amt0)]), [{ text: 'Total' }, ...tot.map(x => ({ text: amount(x) }))]];
+  return {
+    title: 'Payables ageing', subtitle: `As at ${fmtDate(a.as_of)}, by days past the due date`, header, exportRows, numCols: [1, 2, 3, 4, 5, 6, 7],
+    body: rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+      h('thead', {}, h('tr', {}, header.map((x, i) => h('th', { class: i ? 'num' : '' }, x)))),
+      h('tbody', {}, rows.map(({ r, cells }) => h('tr', {}, h('td', {}, h('a', { class: 'row-link', href: `#/finance/suppliers/${r.id}` }, r.name)),
+        cells.map((c, i) => h('td', { class: 'num' }, i >= 2 && i <= 4 && c ? h('span', { class: 'text-bad' }, amount(c)) : amt0(c))))),
+        h('tr', { class: 'total-row' }, h('td', {}, 'Total'), tot.map(x => h('td', { class: 'num' }, amount(x)))))))
+      : h('p', { class: 'empty' }, 'Nothing owed to suppliers.'),
+  };
 }
 
 // ---------- users (admin) ----------
@@ -3680,6 +4213,16 @@ async function render() {
       else if ((m = path.match(/^\/finance\/ledger\/(\d+)$/))) view = await viewLedger(Number(m[1]), params);
       else if (path === '/finance/bank') view = await viewBank();
       else if (path === '/finance/reports') view = await viewReports(params);
+      else if (path === '/finance/suppliers') view = await viewSuppliers(params);
+      else if ((m = path.match(/^\/finance\/suppliers\/(\d+)$/))) view = await viewSupplier(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/suppliers\/(\d+)\/statement$/))) view = await viewSupplierStatement(Number(m[1]), params);
+      else if (path === '/finance/bills') view = await viewBills(params);
+      else if (path === '/finance/bills/new') view = await viewBillNew(params);
+      else if ((m = path.match(/^\/finance\/bills\/(\d+)$/))) view = await viewBill(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/bills\/(\d+)\/edit$/))) view = await viewBillEdit(Number(m[1]));
+      else if (path === '/finance/supplier-payments/new') view = await viewSupplierPaymentNew(params);
+      else if ((m = path.match(/^\/finance\/supplier-payments\/(\d+)$/))) view = await viewSupplierPayment(Number(m[1]));
+      else if (path === '/finance/vat') view = await viewVat(params);
       else if (path === '/renewals') view = await viewRenewals(params);
       else if (path === '/renewals/new') view = await viewRenewalNew(params);
       else if ((m = path.match(/^\/renewals\/(\d+)$/))) view = await viewRenewal(Number(m[1]));
