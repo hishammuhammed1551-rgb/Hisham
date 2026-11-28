@@ -36,8 +36,8 @@ after(async () => {
   await db.stop();
 });
 
-async function newPage(errors, viewport = { width: 1300, height: 860 }) {
-  const ctx = await browser.newContext({ viewport, acceptDownloads: true });
+async function newPage(errors, viewport = { width: 1300, height: 860 }, contextOptions = {}) {
+  const ctx = await browser.newContext({ viewport, acceptDownloads: true, ...contextOptions });
   const page = await ctx.newPage();
   page.on('pageerror', e => errors.push(e.message));
   page.on('console', m => {
@@ -149,8 +149,8 @@ test('full flow: sign up, approve staff, customers, contacts, activity, export',
   await admin.click('button:text("Change password")');
   await admin.waitForSelector('text=Current password is wrong');
 
-  // Sign out, then back in
-  await admin.click('text=Sign out');
+  // Log out, then back in
+  await admin.click('text=Log out');
   await admin.waitForSelector('h1:text("Sign in")');
   await admin.fill('[name=email]', 'admin@lowcaps.test');
   await admin.fill('[name=password]', 'nope-nope-nope');
@@ -527,5 +527,144 @@ test('payments: an overdue balance shows on the dashboard and customer, with a p
   await admin.goto(base + '#/invoices?status=overdue');
   await admin.waitForSelector(`tbody a.row-link:text("${number}")`);
   assert.equal(await admin.locator('tbody tr').count(), 1);
+  assert.deepEqual(errors, []);
+});
+
+test('HR: employee role, sign in with remark when away, leave approval, payslips, private details', { skip: !playwright }, async () => {
+  const errors = [];
+  const OFFICE = { latitude: 25.3463, longitude: 56.3418 };
+  const AWAY = { latitude: 25.3463, longitude: 56.3517 };   // about 1 km east
+  const admin = await newPage(errors);
+  await signIn(admin, 'admin@lowcaps.test');
+
+  // Admin: office location for attendance
+  await admin.goto(base + '#/settings');
+  await admin.waitForSelector('h2:text("HR: office, working hours and leave")');
+  await admin.fill('[name=office_lat]', String(OFFICE.latitude));
+  await admin.fill('[name=office_lng]', String(OFFICE.longitude));
+  await admin.click('button:text("Save HR settings")');
+  await admin.waitForSelector('text=HR settings saved');
+
+  // A new person signs up and is given the Employee (HR only) role
+  const emp = await newPage(errors, { width: 390, height: 844 }, { geolocation: AWAY, permissions: ['geolocation'] });
+  await signUp(emp, 'Ravi Driver', 'ravi@lowcaps.test');
+  await emp.waitForSelector('text=Waiting for access');
+  await admin.goto(base + '#/users');
+  await admin.click('tr:has-text("Ravi Driver") button:text("Give access")');
+  await admin.waitForSelector('text=Ravi Driver now has access');
+  await admin.click('tr:has-text("Ravi Driver") button:text("Edit")');
+  await admin.selectOption('dialog [name=role]', 'employee');
+  await admin.click('dialog button[type=submit]');
+  await admin.waitForSelector('td:text("Employee (HR only)")');
+
+  // Manager fills in the HR record
+  await admin.goto(base + '#/hr/people');
+  await admin.click('a.row-link:text("Ravi Driver")');
+  await admin.click('a:text("Edit record")');
+  await admin.fill('[name=employee_no]', 'LC-007');
+  await admin.fill('[name=designation]', 'Driver');
+  await admin.fill('[name=department]', 'Transport');
+  await admin.fill('[name=joining_date]', '2024-03-01');
+  await admin.fill('[name=passport_no]', 'Z1234567');
+  await admin.fill('[name=basic_salary]', '3000');
+  await admin.fill('[name=housing_allowance]', '1000');
+  await admin.click('button:text("Save")');
+  await admin.waitForSelector('text=Employee record saved');
+  assert.ok(await admin.isVisible('strong:text("AED 4,000.00 / month")'));
+
+  // The employee only sees HR; signing in 1 km away needs a remark
+  await emp.click('text=Check again');
+  await emp.waitForSelector('h2:text("Today,")');
+  assert.equal(await emp.locator('.sidebar a[href="#/customers"]').count(), 0, 'no Customers link for employees');
+  await emp.goto(base + '#/customers');
+  await emp.waitForSelector('h2:text("Today,")');
+  assert.match(emp.url(), /#\/hr$/, 'redirected back to HR');
+  await emp.click('button:text("Sign in")');
+  await emp.waitForSelector('dialog >> text=from the office');
+  assert.match(await emp.textContent('dialog'), /about 995 m from the office/);
+  await emp.fill('dialog [name=remark]', 'Delivery at Sharjah port first');
+  await emp.click('dialog button:text("Sign in")');
+  await emp.waitForSelector('.attendance-status:text("Signed in at")');
+  assert.ok(await emp.isVisible('text=Remark: Delivery at Sharjah port first'));
+  if (SHOTS) await emp.screenshot({ path: `${SHOTS}/hr-employee.png`, fullPage: true });
+  // Back at the office: sign out without a remark
+  await emp.context().setGeolocation(OFFICE);
+  await emp.click('button:text("Sign out")');
+  await emp.waitForSelector('.attendance-status:text("signed out")');
+  assert.equal(await emp.locator('dialog').count(), 0);
+
+  // Leave request: Thursday to Monday = 3 working days
+  const thu = await emp.evaluate(() => {
+    const d = new Date(); d.setMonth(d.getMonth() + 1, 1);
+    while (d.getDay() !== 4) d.setDate(d.getDate() + 1);
+    const mon = new Date(d); mon.setDate(mon.getDate() + 4);
+    return [d.toLocaleDateString('en-CA'), mon.toLocaleDateString('en-CA')];
+  });
+  await emp.goto(base + '#/hr/leave');
+  await emp.fill('[name=start_date]', thu[0]);
+  await emp.fill('[name=end_date]', thu[1]);
+  await emp.dispatchEvent('[name=end_date]', 'change');
+  await emp.waitForSelector('text=3 working days (weekends not counted). You have 30 annual leave days left.');
+  await emp.fill('[name=reason]', 'Family visit');
+  await emp.click('button:text("Send request")');
+  await emp.waitForSelector('text=Leave requested');
+  await emp.waitForSelector('.badge:text("Waiting for approval")');
+
+  // Colleagues' details are basic only; own record is full
+  await emp.goto(base + '#/hr/people');
+  await emp.click('a.row-link:text("Hisham M")');
+  await emp.waitForSelector('h2:text("Contact")');
+  assert.equal(await emp.locator('h2:text("Salary and bank")').count(), 0, 'no salary for colleagues');
+  await emp.goto(base + '#/hr/people/me');
+  await emp.waitForSelector('h2:text("Salary and bank")');
+  assert.ok(await emp.isVisible('dd:text("Z1234567")'));
+
+  // Manager approves; team attendance shows where Ravi signed in from
+  await admin.goto(base + '#/');
+  await admin.waitForSelector('a:text("1 leave request is waiting for approval")');
+  await admin.click('a:text("1 leave request is waiting for approval")');
+  await admin.click('li:has-text("Ravi Driver") button:text("Approve")');
+  await admin.click('dialog button:text("Approve")');
+  await admin.waitForSelector('text=Leave approved');
+  if (SHOTS) {
+    await admin.selectOption('[name=status]', '');
+    await admin.waitForSelector('.badge:text("Approved")');
+    await admin.screenshot({ path: `${SHOTS}/hr-leave.png`, fullPage: true });
+  }
+  await admin.goto(base + '#/hr/attendance');
+  await admin.waitForSelector('h1:text("Team attendance")');
+  const row = admin.locator('tr:has-text("Ravi Driver")');
+  assert.ok(await row.locator('text=995 m away').isVisible());
+  assert.ok(await row.locator('text=Remark: Delivery at Sharjah port first').isVisible());
+  assert.ok(await row.locator('.badge:text("At office")').isVisible(), 'signed out at the office');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/hr-attendance.png`, fullPage: true });
+
+  // Payslips: create from salary packages, publish, employee downloads the PDF
+  await admin.goto(base + '#/hr/payslips');
+  await admin.click('button:text("Create payslips for this month")');
+  await admin.waitForSelector('text=1 draft payslip created from salary packages');
+  await admin.click('tr:has-text("Ravi Driver") button:text("Edit")');
+  await admin.fill('dialog [name=overtime]', '250');
+  await admin.fill('dialog [name=deductions]', '100');
+  await admin.fill('dialog [name=deduction_note]', 'Traffic fine');
+  await admin.click('dialog button:text("Save")');
+  await admin.waitForSelector('td:text("AED 4,150.00")');
+  admin.once('dialog', d => d.accept());
+  await admin.click('button:text("Publish all drafts")');
+  await admin.waitForSelector('.badge:text("Published")');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/hr-payslips.png` });
+
+  await emp.goto(base + '#/hr/payslips');
+  await emp.click('.list a.row-link');
+  await emp.waitForSelector('.inv-title:text("PAYSLIP")');
+  assert.ok(await emp.isVisible('dd.grand:text("AED 4,150.00")'));
+  const [pdf] = await Promise.all([emp.waitForEvent('download'), emp.click('button:text("Download PDF")')]);
+  assert.match(pdf.suggestedFilename(), /^Payslip-\d{4}-\d{2}-Ravi-Driver\.pdf$/);
+  const bytes = fs.readFileSync(await pdf.path());
+  assert.equal(bytes.subarray(0, 5).toString(), '%PDF-');
+  if (SHOTS) await emp.screenshot({ path: `${SHOTS}/hr-payslip.png`, fullPage: true });
+
+  const overflow = await emp.evaluate(() => document.documentElement.scrollWidth > innerWidth);
+  assert.equal(overflow, false, 'no sideways scrolling on a phone');
   assert.deepEqual(errors, []);
 });

@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.6 has Customers (CRM), Tasks, Invoices, Payments and Renewals**; expenses and reports are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.7 has Customers (CRM), Tasks, Invoices, Payments, Renewals and HR**; expenses and reports are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -12,6 +12,7 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - **Team member:** sees everything, adds and edits leads and customers, logs activity, comments on any task, and moves the status of tasks assigned to them.
   - **Manager:** everything a team member can do, plus creating, assigning, editing and deleting tasks, managing the **Types of work** list, and deleting customers.
   - **Administrator:** everything, plus managing users.
+  - **Employee (HR only):** only the HR section: their own attendance, leave, payslips and record, and colleagues' basic contact details.
 - **Tasks.** A manager creates a task (title, customer, type of work, description, due date, priority) and assigns it to someone. It moves through New → In progress → Waiting → Done (or Cancelled), with a history of comments, status changes and re-assignments. Tasks show on a Tasks page (filter by status, person, type of work), on each customer's page, and as **My tasks** on the dashboard.
 - **Invoices.** When a manager creates a task for a customer, the ERP goes straight on to a **proforma invoice** (`PRO-2026-0001`). When the task is marked complete, its page and the dashboard prompt for the final **tax invoice** (`INV-2026-0001`), pre-filled from the proforma's charges.
   - Each charge line is 5% VAT, 0% (zero-rated, e.g. international transport), exempt, or no VAT (disbursements such as customs duty paid on the customer's behalf). Totals and VAT are calculated in the database.
@@ -30,6 +31,12 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - **Mark as renewed** moves the due date on by the repeat period (or to a date you choose) and keeps a history.
   - Managers can **Create task** from a renewal to hand the work to a team member; from there the usual task → proforma → tax invoice flow applies.
   - Renewal types and their default period and reminder are edited by managers under **Types**. Anyone with access can add renewals; managers can delete them (others can **Stop** one instead).
+- **HR.**
+  - **Employee records:** job (employee no., designation, department, joining date), contact, personal and emergency details, documents (Emirates ID, passport, visa with expiry warnings), bank and monthly salary package, leave entitlement. Managers and admins see and edit everyone's full record; everyone else sees their own in full and only name, designation, department, email and phone of colleagues.
+  - **Attendance:** **Sign in** on arrival and **Sign out** when leaving. The location is recorded; away from the office (or with location off) a **remark is required** saying why. Managers see the whole team for any day (on time, late, on leave, not signed in, where they signed in from, remarks) and can correct mistakes.
+  - **Leave:** annual and medical leave requests (counted in working days, skipping the weekend days set in Company settings) go to a manager for approval. Everyone sees their entitlement, taken, waiting and remaining days. Managers can't approve their own leave.
+  - **Payslips:** managers create the month's payslips for everyone from their salary packages in one click, adjust overtime, bonus and deductions, and publish; employees see and download only their own published payslips (PDF).
+  - Office location, "counts as at office" radius, work start time (for late), weekend days and default leave days are set by admins under **Company settings**.
 - **Customers.** Company or individual, status (lead / active / inactive), UAE TRN (checked as 15 digits), contact details, address, how they found Lowcaps, which services they want (shipping, clearing, customs), notes, and the staff member who owns the account.
 - **Contacts.** Several people per customer, one marked as the main contact.
 - **Activity log.** Notes, calls, meetings and emails on each customer, plus follow-ups with a due date that can be marked done.

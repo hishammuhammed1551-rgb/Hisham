@@ -42,6 +42,7 @@ const ICONS = {
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   download: '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
   cash: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 12h.01M18 12h.01"/>',
+  badge: '<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="11" r="2.5"/><path d="M5.5 17c.7-1.8 2-2.7 3.5-2.7s2.8.9 3.5 2.7M15 10h4M15 14h3"/>',
   renew: '<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
   note: '<path d="M5 3h10l4 4v14H5z"/><path d="M9 11h6M9 15h6"/>',
@@ -66,8 +67,9 @@ const SERVICES = ['Shipping', 'Clearing', 'Customs'];
 
 const statusBadge = s => h('span', { class: `badge badge-${s}` }, STATUS_LABEL[s] || s);
 
-const ROLE_LABEL = { admin: 'Administrator', manager: 'Manager', staff: 'Team member' };
-const ROLE_OPTIONS = [['staff', 'Team member'], ['manager', 'Manager'], ['admin', 'Administrator']];
+const ROLE_LABEL = { admin: 'Administrator', manager: 'Manager', staff: 'Team member', employee: 'Employee (HR only)' };
+const ROLE_OPTIONS = [['employee', 'Employee (HR only)'], ['staff', 'Team member'], ['manager', 'Manager'], ['admin', 'Administrator']];
+const isEmployee = () => state.user?.role === 'employee';
 const TASK_STATUS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', done: 'Done', cancelled: 'Cancelled' };
 const PRIORITY = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
 const INVOICE_KIND = { proforma: 'Proforma invoice', tax: 'Tax invoice' };
@@ -270,13 +272,25 @@ function layout(active, ...content) {
     h('aside', { class: 'sidebar', onclick: e => { if (e.target.closest('a')) shell.classList.remove('menu-open'); } },
       h('a', { class: 'brand', href: '#/' }, h('span', { class: 'logo-mark' }, 'L'),
         h('span', {}, 'Lowcaps', h('small', {}, 'ERP'))),
-      h('nav', { class: 'nav', 'aria-label': 'Main' },
+      isEmployee() ? h('nav', { class: 'nav', 'aria-label': 'Main' },
+        link('#/hr', 'home', 'My HR', 'hr'),
+        link('#/hr/attendance?mine=1', 'follow_up', 'Attendance', 'hr-attendance'),
+        link('#/hr/leave', 'meeting', 'Leave', 'hr-leave'),
+        link('#/hr/payslips', 'invoice', 'Payslips', 'hr-payslips'),
+        link('#/hr/people', 'users', 'Team', 'hr-people'))
+      : h('nav', { class: 'nav', 'aria-label': 'Main' },
         link('#/', 'home', 'Dashboard', 'dashboard'),
         link('#/customers', 'users', 'Customers', 'customers'),
         link('#/tasks', 'task', 'Tasks', 'tasks'),
         link('#/renewals', 'renew', 'Renewals', 'renewals'),
         link('#/invoices', 'invoice', 'Invoices', 'invoices'),
         link('#/payments', 'cash', 'Payments', 'payments'),
+        h('div', { class: 'nav-heading' }, 'HR'),
+        link('#/hr', 'badge', 'My HR', 'hr'),
+        link('#/hr/attendance', 'follow_up', 'Attendance', 'hr-attendance'),
+        link('#/hr/leave', 'meeting', 'Leave', 'hr-leave'),
+        link('#/hr/payslips', 'invoice', 'Payslips', 'hr-payslips'),
+        link('#/hr/people', 'users', 'Team', 'hr-people'),
         h('div', { class: 'nav-heading' }, 'Next modules'),
         soon('chart', 'Expenses & reports'),
         isManager() && h('div', { class: 'nav-heading' }, 'Manage'),
@@ -288,7 +302,7 @@ function layout(active, ...content) {
         h('span', { class: 'muted' }, ROLE_LABEL[state.user.role] || state.user.role),
         h('div', { class: 'row' },
           h('a', { href: '#/account' }, 'Account'),
-          h('button', { onclick: logout }, 'Sign out')))),
+          h('button', { onclick: logout }, 'Log out')))),
     h('main', { class: 'main', id: 'main' }, ...content));
   return shell;
 }
@@ -401,7 +415,7 @@ function viewPending() {
     `Hi ${state.user.name}, your account (${state.user.email}) is set up, but an administrator still needs to give it access to the ERP.`,
     h('div', { class: 'btn-row' },
       h('button', { class: 'btn btn-primary', onclick: () => { state.user = null; render(); } }, 'Check again'),
-      h('button', { class: 'btn btn-secondary', onclick: logout }, 'Sign out')));
+      h('button', { class: 'btn btn-secondary', onclick: logout }, 'Log out')));
 }
 
 function viewNotConfigured() {
@@ -416,7 +430,14 @@ function viewNotConfigured() {
 // ---------- dashboard ----------
 
 async function viewDashboard() {
-  const d = await rpc('dashboard');
+  const [d, hr] = await Promise.all([rpc('dashboard'), rpc('my_hr')]);
+  const weekend = hr.settings.weekend_days.includes(new Date(hr.today + 'T00:00:00').getDay());
+  const hrNotices = [
+    !hr.attendance && !hr.on_leave && !weekend && h('p', { class: 'notice' }, 'You haven\'t signed in today. ',
+      h('a', { href: '#/hr' }, 'Sign in now')),
+    hr.pendingApprovals > 0 && h('p', { class: 'notice' },
+      h('a', { href: '#/hr/leave' }, `${hr.pendingApprovals} leave request${hr.pendingApprovals > 1 ? 's are' : ' is'} waiting for approval`)),
+  ];
   const stat = (label, value, href) =>
     h('a', { class: 'card stat', href }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value));
 
@@ -435,6 +456,7 @@ async function viewDashboard() {
       isManager() && h('a', { class: 'btn btn-secondary', href: '#/tasks/new' }, '+ New task'),
       h('a', { class: 'btn btn-primary', href: '#/customers/new' }, '+ New customer'),
     ]),
+    hrNotices,
     h('div', { class: 'grid stats' },
       stat('Active customers', d.counts.active, '#/customers?status=active'),
       stat('Open leads', d.counts.lead, '#/customers?status=lead'),
@@ -1697,7 +1719,8 @@ async function viewCompanySettings() {
   });
   return layout('settings',
     pageHead('Company settings', 'Printed on every new invoice. Invoices already created keep the details they were made with.'),
-    h('section', { class: 'card' }, form));
+    h('section', { class: 'card' }, form),
+    hrSettingsCard(await rpc('get_hr_settings')));
 }
 
 // ---------- renewals ----------
@@ -2174,6 +2197,723 @@ async function viewPayments(params) {
           h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
 }
 
+// ---------- HR ----------
+
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const LEAVE_KIND = { annual: 'Annual leave', medical: 'Medical leave' };
+const LEAVE_STATUS = { pending: 'Waiting for approval', approved: 'Approved', rejected: 'Rejected', cancelled: 'Cancelled' };
+const leaveBadge = st => h('span', { class: `badge leave-${st}` }, LEAVE_STATUS[st] || st);
+const fmtTime = ts => (ts ? new Date(ts).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Dubai' }) : '');
+const monthLabel = ymd => new Date(ymd.slice(0, 7) + '-01T00:00:00').toLocaleDateString('en-GB', { month: 'long', year: 'numeric' });
+const num = n => Number(n).toLocaleString('en-US', { maximumFractionDigits: 1 });
+
+function hoursBetween(a, b) {
+  if (!a || !b) return '';
+  const mins = Math.round((Date.parse(b) - Date.parse(a)) / 60000);
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`;
+}
+
+function distanceM(lat1, lng1, lat2, lng2) {
+  const rad = d => (d * Math.PI) / 180;
+  const a = Math.sin(rad(lat2 - lat1) / 2) ** 2 + Math.cos(rad(lat1)) * Math.cos(rad(lat2)) * Math.sin(rad(lng2 - lng1) / 2) ** 2;
+  return 2 * 6371000 * Math.asin(Math.sqrt(a));
+}
+
+function getLocation() {
+  return new Promise(resolve => {
+    if (!navigator.geolocation) { resolve(null); return; }
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy }),
+      () => resolve(null),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 });
+  });
+}
+
+/** "At office" / "1.2 km away" / "No location", with the remark if any. */
+function placeText(atOffice, distance, remark) {
+  const where = atOffice === true ? h('span', { class: 'badge badge-active' }, 'At office')
+    : atOffice === false ? h('span', { class: 'badge badge-lead' }, distance == null ? 'No location' : `${distance >= 1000 ? (distance / 1000).toFixed(1) + ' km' : distance + ' m'} away`)
+      : null;
+  return [where, remark && h('div', { class: 'meta prewrap' }, `Remark: ${remark}`)];
+}
+
+/** Sign in / out: get the location; away from the office (or none) ask for a remark first. */
+async function signAttendance(action, settings, button, refresh) {
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = 'Getting your location…';
+  const loc = await getLocation();
+  button.disabled = false;
+  button.textContent = label;
+  let away = false;
+  let distance = null;
+  if (settings.office_set) {
+    if (!loc) away = true;
+    else {
+      distance = Math.round(distanceM(settings.office_lat, settings.office_lng, loc.lat, loc.lng));
+      away = distance > settings.office_radius_m;
+    }
+  }
+  const send = async remark => {
+    await rpc('attendance_sign', { p_action: action, p_lat: loc ? loc.lat : null, p_lng: loc ? loc.lng : null,
+      p_accuracy: loc ? loc.accuracy : null, p_remark: remark || null });
+    toast(action === 'in' ? `Signed in at ${fmtTime(new Date().toISOString())}` : `Signed out at ${fmtTime(new Date().toISOString())}`);
+    refresh();
+  };
+  const askRemark = message => {
+    const dlg = openDialog(action === 'in' ? 'Signing in away from the office' : 'Signing out away from the office', handleForm(h('form', { class: 'form' },
+      h('p', {}, message),
+      field('Remark', textarea('remark', '', { rows: 3, required: true, maxlength: 300,
+        placeholder: 'e.g. Client visit at Sharjah port, or working from the customs office' })),
+      h('div', { class: 'btn-row' },
+        h('button', { class: 'btn btn-primary', type: 'submit' }, action === 'in' ? 'Sign in' : 'Sign out'),
+        h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+    async data => {
+      await send(data.remark);
+      dlg.close();
+    }));
+  };
+  if (away) {
+    askRemark(loc
+      ? `You're about ${distance >= 1000 ? (distance / 1000).toFixed(1) + ' km' : distance + ' m'} from the office. You can still ${action === 'in' ? 'sign in' : 'sign out'}; please say why.`
+      : 'Your location isn\'t available (it may be switched off or blocked for this site). You can still continue; please say where you are.');
+    return;
+  }
+  try {
+    await send(null);
+  } catch (err) {
+    if (err.details && err.details.remark) askRemark(err.details.remark);
+    else toast(err.message, true);
+  }
+}
+
+function attendanceCard(hr, refresh) {
+  const a = hr.attendance;
+  const weekend = hr.settings.weekend_days.includes(new Date(hr.today + 'T00:00:00').getDay());
+  let status;
+  let button = null;
+  if (a && a.sign_out) status = `Signed in ${fmtTime(a.sign_in)} · signed out ${fmtTime(a.sign_out)} · ${hoursBetween(a.sign_in, a.sign_out)}`;
+  else if (a && a.sign_in) status = `Signed in at ${fmtTime(a.sign_in)}`;
+  else if (hr.on_leave) status = `You're on ${LEAVE_KIND[hr.on_leave].toLowerCase()} today.`;
+  else status = weekend ? 'It\'s the weekend. You can still sign in if you\'re working.' : 'You haven\'t signed in yet today.';
+  if (!a || !a.sign_in) {
+    button = h('button', { class: 'btn btn-primary btn-big', onclick: e => signAttendance('in', hr.settings, e.currentTarget, refresh) }, 'Sign in');
+  } else if (!a.sign_out) {
+    button = h('button', { class: 'btn btn-primary btn-big', onclick: e => signAttendance('out', hr.settings, e.currentTarget, refresh) }, 'Sign out');
+  }
+  return h('section', { class: 'card attendance-card' },
+    h('div', { class: 'card-head' }, h('h2', {}, `Today, ${fmtDate(hr.today)}`),
+      h('a', { class: 'btn btn-secondary btn-sm', href: '#/hr/attendance?mine=1' }, 'My attendance')),
+    h('p', { class: 'attendance-status' }, status),
+    a && a.sign_in && h('div', { class: 'meta' }, 'In: ', placeText(a.in_at_office, a.in_distance_m, a.in_remark)),
+    a && a.sign_out && h('div', { class: 'meta' }, 'Out: ', placeText(a.out_at_office, a.out_distance_m, a.out_remark)),
+    button,
+    !hr.settings.office_set && h('p', { class: 'muted' }, 'The office location isn\'t set yet, so sign-ins are not checked against it.'));
+}
+
+function leaveTiles(annual, medical) {
+  const tile = (title, b) => h('div', { class: 'card stat' },
+    h('div', { class: 'label' }, title),
+    h('div', { class: 'value' }, num(b.remaining), h('span', { class: 'value-of' }, ` of ${num(b.entitled)} left`)),
+    h('div', { class: 'meta' }, `${num(b.taken)} taken · ${num(b.pending)} waiting for approval`));
+  return h('div', { class: 'grid two-col' }, tile('Annual leave', annual), tile('Medical leave', medical));
+}
+
+async function viewMyHr() {
+  const hr = await rpc('my_hr');
+  const refresh = () => render();
+  return layout('hr',
+    pageHead(`Hello, ${state.user.name.split(' ')[0]}`, hr.designation || ROLE_LABEL[state.user.role],
+      h('a', { class: 'btn btn-secondary', href: '#/hr/people/me' }, 'My details')),
+    isManager() && hr.pendingApprovals > 0 && h('p', { class: 'notice' },
+      h('a', { href: '#/hr/leave' }, `${hr.pendingApprovals} leave request${hr.pendingApprovals > 1 ? 's are' : ' is'} waiting for approval`)),
+    attendanceCard(hr, refresh),
+    h('div', { class: 'card-head section-head' }, h('h2', {}, `Leave in ${hr.today.slice(0, 4)}`),
+      h('a', { class: 'btn btn-primary btn-sm', href: '#/hr/leave' }, 'Request leave')),
+    leaveTiles(hr.annual, hr.medical),
+    h('div', { class: 'grid two-col' },
+      h('section', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', {}, 'My payslips'), h('a', { class: 'btn btn-secondary btn-sm', href: '#/hr/payslips' }, 'See all')),
+        hr.payslips.length
+          ? h('ul', { class: 'list' }, hr.payslips.map(p => h('li', {},
+              h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/hr/payslips/${p.id}` }, monthLabel(p.period))),
+              h('strong', {}, money(p.net)))))
+          : h('p', { class: 'empty' }, 'No payslips yet.')),
+      isManager() && h('section', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', {}, 'Documents expiring soon')),
+        hr.expiringDocuments.length
+          ? h('ul', { class: 'list' }, hr.expiringDocuments.map(x => h('li', {},
+              h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/hr/people/${x.id}` }, x.name), h('div', { class: 'meta' }, x.label)),
+              h('span', { class: `badge ${x.expiry < hr.today ? 'badge-overdue' : 'badge-lead'}` },
+                `${x.expiry < hr.today ? 'Expired' : 'Expires'} ${fmtDate(x.expiry)}`))))
+          : h('p', { class: 'empty' }, 'No visas, Emirates IDs or passports expiring in the next 60 days.'))));
+}
+
+// Attendance: managers see the team for a day; everyone sees their own month.
+async function viewAttendance(params) {
+  if (isManager() && !params.mine && !params.person) return viewTeamAttendance(params);
+  const month = params.month ? `${params.month}-01` : null;
+  const data = await rpc('my_attendance', { p_month: month, p_profile: params.person || null });
+  const byDate = Object.fromEntries(data.days.map(d => [d.work_date, d]));
+  const leaveOn = ymd => data.leaves.find(l => l.start_date <= ymd && l.end_date >= ymd);
+  const days = [];
+  const first = new Date(data.month + 'T00:00:00');
+  for (let d = new Date(first); d.getMonth() === first.getMonth(); d.setDate(d.getDate() + 1)) {
+    const ymd = d.toLocaleDateString('en-CA');
+    if (ymd > data.today) break;
+    days.push({ ymd, dow: d.getDay() });
+  }
+  days.reverse();
+  const present = data.days.filter(d => d.sign_in).length;
+  const late = data.days.filter(d => d.sign_in && fmtTime(d.sign_in) > data.work_start).length;
+  const qs = new URLSearchParams(params);
+  return layout('hr-attendance',
+    pageHead(params.person ? `Attendance: ${data.name}` : 'My attendance', `${monthLabel(data.month)} · ${present} days present · ${late} late (after ${data.work_start})`,
+      input('month', data.month.slice(0, 7), { type: 'month', 'aria-label': 'Month', max: data.today.slice(0, 7),
+        onchange: e => { qs.set('month', e.target.value); if (!qs.get('person')) qs.set('mine', '1'); location.hash = '#/hr/attendance?' + qs; } }),
+      isManager() && h('a', { href: '#/hr/attendance' }, '← Team attendance')),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Day'), h('th', {}, 'Status'), h('th', {}, 'Signed in'), h('th', {}, 'Signed out'), h('th', { class: 'hide-sm' }, 'Hours'))),
+      h('tbody', {}, days.map(({ ymd, dow }) => {
+        const a = byDate[ymd];
+        const leave = leaveOn(ymd);
+        const weekend = data.weekend_days.includes(dow);
+        const status = a && a.sign_in
+          ? (fmtTime(a.sign_in) > data.work_start ? h('span', { class: 'badge badge-lead' }, 'Late') : h('span', { class: 'badge badge-active' }, 'Present'))
+          : leave ? h('span', { class: 'badge leave-approved' }, LEAVE_KIND[leave.kind])
+            : weekend ? h('span', { class: 'muted' }, 'Weekend')
+              : ymd === data.today ? h('span', { class: 'muted' }, 'Not signed in yet') : h('span', { class: 'badge badge-overdue' }, 'Absent');
+        return h('tr', {},
+          h('td', {}, `${DAY_NAMES[dow].slice(0, 3)} ${fmtDate(ymd)}`),
+          h('td', {}, status, a && a.edit_note && h('div', { class: 'meta muted' }, a.edit_note)),
+          h('td', {}, a && a.sign_in ? [fmtTime(a.sign_in), ' ', placeText(a.in_at_office, a.in_distance_m, a.in_remark)] : ''),
+          h('td', {}, a && a.sign_out ? [fmtTime(a.sign_out), ' ', placeText(a.out_at_office, a.out_distance_m, a.out_remark)] : ''),
+          h('td', { class: 'hide-sm' }, a ? hoursBetween(a.sign_in, a.sign_out) : ''));
+      }))))));
+}
+
+function attendanceEditDialog(p, date, refresh) {
+  const dlg = openDialog(`Correct attendance: ${p.name}, ${fmtDate(date)}`, handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Signed in', input('in', fmtTime(p.sign_in), { type: 'time' })),
+      field('Signed out', input('out', fmtTime(p.sign_out), { type: 'time' }))),
+    field('Reason for the change', input('note', p.edit_note || '', { maxlength: 300, placeholder: 'e.g. Forgot to sign out' }),
+      { hint: 'Leave both times empty to remove the day\'s record.' }),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('save_attendance', { p_profile: p.id, p_date: date, p_in: data.in, p_out: data.out, p_note: data.note });
+    dlg.close();
+    toast('Attendance corrected');
+    refresh();
+  }));
+}
+
+async function viewTeamAttendance(params) {
+  const data = await rpc('team_attendance', { p_date: params.date || null });
+  const refresh = () => render();
+  const counts = { present: 0, late: 0, leave: 0, absent: 0 };
+  const rows = data.people.map(p => {
+    let status;
+    if (p.sign_in) {
+      if (p.late) { counts.late++; status = h('span', { class: 'badge badge-lead' }, 'Late'); } else { counts.present++; status = h('span', { class: 'badge badge-active' }, 'Present'); }
+    } else if (p.on_leave) { counts.leave++; status = h('span', { class: 'badge leave-approved' }, LEAVE_KIND[p.on_leave]); }
+    else if (data.weekend) status = h('span', { class: 'muted' }, 'Weekend');
+    else { counts.absent++; status = h('span', { class: 'badge badge-overdue' }, data.date === data.today ? 'Not signed in' : 'Absent'); }
+    return h('tr', {},
+      h('td', {}, h('a', { class: 'row-link', href: `#/hr/attendance?person=${p.id}` }, p.name), p.designation && h('div', { class: 'meta muted' }, p.designation)),
+      h('td', {}, status, p.edit_note && h('div', { class: 'meta muted' }, p.edit_note)),
+      h('td', {}, p.sign_in ? [fmtTime(p.sign_in), ' ', placeText(p.in_at_office, p.in_distance_m, p.in_remark)] : ''),
+      h('td', {}, p.sign_out ? [fmtTime(p.sign_out), ' ', placeText(p.out_at_office, p.out_distance_m, p.out_remark)] : ''),
+      h('td', { class: 'hide-sm' }, hoursBetween(p.sign_in, p.sign_out)),
+      h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => attendanceEditDialog(p, data.date, refresh) }, 'Correct')));
+  });
+  return layout('hr-attendance',
+    pageHead('Team attendance', `${DAY_NAMES[new Date(data.date + 'T00:00:00').getDay()]} ${fmtDate(data.date)} · ${counts.present} on time · ${counts.late} late · ${counts.leave} on leave · ${counts.absent} ${data.date === data.today ? 'not signed in' : 'absent'}`, [
+      input('date', data.date, { type: 'date', max: data.today, 'aria-label': 'Day', onchange: e => { location.hash = '#/hr/attendance?date=' + e.target.value; } }),
+      h('a', { class: 'btn btn-secondary', href: '#/hr/attendance?mine=1' }, 'My attendance'),
+    ]),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Employee'), h('th', {}, 'Status'), h('th', {}, 'Signed in'), h('th', {}, 'Signed out'), h('th', { class: 'hide-sm' }, 'Hours'), h('th', {}, ''))),
+      h('tbody', {}, rows)))));
+}
+
+// ---------- leave ----------
+
+function countLeaveDays(start, end, weekend) {
+  if (!start || !end || end < start) return 0;
+  let n = 0;
+  for (let d = new Date(start + 'T00:00:00'); d.toLocaleDateString('en-CA') <= end; d.setDate(d.getDate() + 1)) {
+    if (!weekend.includes(d.getDay())) n++;
+  }
+  return n;
+}
+
+function decideDialog(r, approve, refresh) {
+  const dlg = openDialog(`${approve ? 'Approve' : 'Reject'} ${r.name}'s ${LEAVE_KIND[r.kind].toLowerCase()}`, handleForm(h('form', { class: 'form' },
+    h('p', {}, `${fmtDate(r.start_date)} – ${fmtDate(r.end_date)} · ${num(r.days)} day${Number(r.days) === 1 ? '' : 's'}${r.reason ? ' · ' + r.reason : ''}`),
+    h('p', { class: 'muted' }, `${num(r.remaining)} of ${r.entitled} days left including this request.`),
+    field(approve ? 'Note (optional)' : 'Reason (shown to the employee)', textarea('note', '', { rows: 2, maxlength: 500, required: !approve })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: approve ? 'btn btn-primary' : 'btn btn-danger', type: 'submit' }, approve ? 'Approve' : 'Reject'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('decide_leave', { p_id: r.id, p_approve: approve, p_note: data.note || null });
+    dlg.close();
+    toast(approve ? 'Leave approved' : 'Leave rejected');
+    refresh();
+  }));
+}
+
+function leaveRequestList(requests, { showName, canCancel, refresh }) {
+  return requests.length
+    ? h('ul', { class: 'list' }, requests.map(r => h('li', {},
+        h('div', { class: 'grow' },
+          h('div', { class: 'body' }, showName && [h('strong', {}, r.name), ' · '], `${LEAVE_KIND[r.kind]}: ${fmtDate(r.start_date)}${r.end_date !== r.start_date ? ' – ' + fmtDate(r.end_date) : ''} · ${num(r.days)} day${Number(r.days) === 1 ? '' : 's'}`),
+          r.reason && h('div', { class: 'meta prewrap' }, r.reason),
+          (r.decided_by_name || r.decision_note) && h('div', { class: 'meta' },
+            [r.decided_by_name && `${LEAVE_STATUS[r.status]} by ${r.decided_by_name}`, r.decision_note && `"${r.decision_note}"`].filter(Boolean).join(' · '))),
+        h('div', { class: 'badge-stack' }, leaveBadge(r.status),
+          canCancel(r) && h('button', {
+            class: 'btn btn-secondary btn-sm',
+            onclick: async () => {
+              if (!confirmAction('Cancel this leave request?')) return;
+              try { await rpc('cancel_leave', { p_id: r.id }); toast('Leave cancelled'); refresh(); } catch (err) { toast(err.message, true); }
+            },
+          }, r.status === 'pending' && !showName ? 'Withdraw' : 'Cancel')))))
+    : h('p', { class: 'empty' }, 'None.');
+}
+
+async function viewLeave(params) {
+  const mgr = isManager();
+  const [sum, all] = await Promise.all([
+    rpc('leave_summary', {}),
+    mgr ? rpc('list_leave_requests', { p_status: params.status ?? 'pending', p_year: null }) : null,
+  ]);
+  const refresh = () => render();
+  const kind = select('kind', 'annual', Object.entries(LEAVE_KIND));
+  const start = input('start_date', '', { type: 'date', required: true });
+  const end = input('end_date', '', { type: 'date', required: true });
+  const preview = h('p', { class: 'muted' }, 'Pick the dates to see how many leave days it uses.');
+  const update = () => {
+    if (start.value && !end.value) end.value = start.value;
+    const n = countLeaveDays(start.value, end.value, sum.weekend_days);
+    const b = sum[kind.value];
+    preview.textContent = start.value && end.value
+      ? `${n} working day${n === 1 ? '' : 's'} (weekends not counted). You have ${num(b.remaining)} ${kind.value} leave days left.`
+      : 'Pick the dates to see how many leave days it uses.';
+    preview.className = n > b.remaining ? 'form-error' : 'muted';
+  };
+  [kind, start, end].forEach(el => el.addEventListener('change', update));
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Type', kind), h('div'),
+      field('First day', start), field('Last day', end)),
+    preview,
+    field('Reason (optional)', textarea('reason', '', { rows: 2, maxlength: 1000, placeholder: 'e.g. Family visit; for medical leave, mention the certificate' })),
+    h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Send request'))),
+  async data => {
+    await rpc('request_leave', { p_data: data });
+    toast('Leave requested. A manager will review it.');
+    refresh();
+  });
+
+  return layout('hr-leave',
+    pageHead('Leave', `${sum.year} · annual and medical leave need a manager's approval`),
+    leaveTiles(sum.annual, sum.medical),
+    mgr && h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', {}, 'Team requests'),
+        select('status', params.status ?? 'pending', [['pending', 'Waiting for approval'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['cancelled', 'Cancelled'], ['', 'All']],
+          { 'aria-label': 'Show', onchange: e => { location.hash = '#/hr/leave?status=' + e.target.value; } })),
+      all.length
+        ? h('ul', { class: 'list' }, all.map(r => h('li', {},
+            h('div', { class: 'grow' },
+              h('div', { class: 'body' }, h('a', { class: 'row-link', href: `#/hr/people/${r.profile_id}` }, r.name),
+                ` · ${LEAVE_KIND[r.kind]}: ${fmtDate(r.start_date)}${r.end_date !== r.start_date ? ' – ' + fmtDate(r.end_date) : ''} · ${num(r.days)} day${Number(r.days) === 1 ? '' : 's'}`),
+              h('div', { class: 'meta' }, [r.designation, `${num(r.remaining)} of ${r.entitled} days left`, r.reason].filter(Boolean).join(' · ')),
+              r.decided_by_name && h('div', { class: 'meta' }, `${LEAVE_STATUS[r.status]} by ${r.decided_by_name}${r.decision_note ? ': "' + r.decision_note + '"' : ''}`)),
+            h('div', { class: 'badge-stack' }, leaveBadge(r.status),
+              h('div', { class: 'btn-row' },
+                r.status === 'pending' && (r.profile_id !== state.user.id || state.user.role === 'admin') && [
+                  h('button', { class: 'btn btn-primary btn-sm', onclick: () => decideDialog(r, true, refresh) }, 'Approve'),
+                  h('button', { class: 'btn btn-danger btn-sm', onclick: () => decideDialog(r, false, refresh) }, 'Reject')],
+                r.status === 'approved' && h('button', {
+                  class: 'btn btn-secondary btn-sm',
+                  onclick: async () => {
+                    if (!confirmAction(`Cancel ${r.name}'s approved leave? The days go back to their balance.`)) return;
+                    try { await rpc('cancel_leave', { p_id: r.id }); toast('Leave cancelled'); refresh(); } catch (err) { toast(err.message, true); }
+                  },
+                }, 'Cancel'))))))
+        : h('p', { class: 'empty' }, (params.status ?? 'pending') === 'pending' ? 'No requests waiting for approval.' : 'None.')),
+    h('div', { class: 'grid two-col' },
+      h('section', { class: 'card' }, h('h2', {}, 'Request leave'), form),
+      h('section', { class: 'card' }, h('h2', {}, 'My requests'),
+        leaveRequestList(sum.requests, { showName: false, canCancel: r => r.status === 'pending', refresh }))));
+}
+
+// ---------- payslips ----------
+
+const PAY_PARTS = [['basic_salary', 'Basic salary'], ['housing_allowance', 'Housing allowance'], ['transport_allowance', 'Transport allowance'],
+  ['other_allowance', 'Other allowance'], ['overtime', 'Overtime'], ['bonus', 'Bonus']];
+
+function payslipDialog(ps, people, period, refresh) {
+  const isNew = !ps.id;
+  const dlg = openDialog(isNew ? `New payslip for ${monthLabel(period)}` : `Payslip: ${ps.name}, ${monthLabel(ps.period)}`, handleForm(h('form', { class: 'form' },
+    isNew && field('Employee', select('profile_id', '', [['', 'Pick…'], ...people.map(p => [p.id, p.name])], { required: true })),
+    isNew && h('input', { type: 'hidden', name: 'period', value: period }),
+    h('div', { class: 'form-grid' },
+      PAY_PARTS.map(([k, label]) => field(`${label} (AED)`, input(k, ps[k] ?? '', { type: 'number', min: 0, step: '0.01' }))),
+      field('Deductions (AED)', input('deductions', ps.deductions ?? '', { type: 'number', min: 0, step: '0.01' })),
+      field('Deduction reason', input('deduction_note', ps.deduction_note, { maxlength: 300, placeholder: 'e.g. Salary advance, traffic fine' }))),
+    field('Note on the payslip (optional)', textarea('notes', ps.notes, { rows: 2, maxlength: 1000 })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('save_payslip', { p_id: ps.id || null, p_data: data });
+    dlg.close();
+    toast('Payslip saved');
+    refresh();
+  }));
+}
+
+async function viewPayslips(params) {
+  const period = params.month ? `${params.month}-01` : null;
+  const data = await rpc('list_payslips', { p_period: period, p_profile: null });
+  const refresh = () => render();
+  if (data.mine) {
+    return layout('hr-payslips', pageHead('My payslips', 'Your salary slips, published by a manager each month.'),
+      h('section', { class: 'card' }, data.payslips.length
+        ? h('ul', { class: 'list' }, data.payslips.map(p => h('li', {},
+            h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/hr/payslips/${p.id}` }, monthLabel(p.period))),
+            h('strong', {}, money(p.net)))))
+        : h('p', { class: 'empty' }, 'No payslips yet.')));
+  }
+  const act = (fn, args, message) => async () => {
+    try { await rpc(fn, args); toast(message); refresh(); } catch (err) { toast(err.message, true); }
+  };
+  const drafts = data.payslips.filter(p => p.status === 'draft');
+  return layout('hr-payslips',
+    pageHead('Payslips', `${monthLabel(data.period)} · ${data.payslips.length} payslip${data.payslips.length === 1 ? '' : 's'} · net total ${money(data.payslips.reduce((t, p) => t + Number(p.net), 0))}`, [
+      input('month', data.period.slice(0, 7), { type: 'month', 'aria-label': 'Month', onchange: e => { location.hash = '#/hr/payslips?month=' + e.target.value; } }),
+      h('button', {
+        class: 'btn btn-primary',
+        onclick: async () => {
+          try {
+            const n = await rpc('generate_payslips', { p_period: data.period });
+            toast(n ? `${n} draft payslip${n === 1 ? '' : 's'} created from salary packages` : 'Everyone with a salary set already has a payslip this month');
+            refresh();
+          } catch (err) { toast(err.message, true); }
+        },
+      }, 'Create payslips for this month'),
+      drafts.length > 0 && h('button', {
+        class: 'btn btn-secondary',
+        onclick: async () => {
+          if (!confirmAction(`Publish ${drafts.length} draft payslip${drafts.length === 1 ? '' : 's'}? Employees will be able to see them.`)) return;
+          try {
+            for (const p of drafts) await rpc('set_payslip_published', { p_id: p.id, p_published: true });
+            toast('Payslips published');
+            refresh();
+          } catch (err) { toast(err.message, true); }
+        },
+      }, `Publish all drafts (${drafts.length})`),
+    ]),
+    h('section', { class: 'card' },
+      data.payslips.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Employee'), h('th', { class: 'num hide-sm' }, 'Earnings'), h('th', { class: 'num hide-sm' }, 'Deductions'),
+              h('th', { class: 'num' }, 'Net pay'), h('th', {}, 'Status'), h('th', {}, ''))),
+            h('tbody', {}, data.payslips.map(p => h('tr', {},
+              h('td', {}, h('a', { class: 'row-link', href: `#/hr/payslips/${p.id}` }, p.name), p.designation && h('div', { class: 'meta muted' }, p.designation)),
+              h('td', { class: 'num hide-sm' }, money(p.gross)),
+              h('td', { class: 'num hide-sm' }, money(p.deductions)),
+              h('td', { class: 'num' }, money(p.net)),
+              h('td', {}, p.status === 'published' ? h('span', { class: 'badge badge-active' }, 'Published') : h('span', { class: 'badge badge-plain' }, 'Draft')),
+              h('td', {}, h('div', { class: 'btn-row' },
+                p.status === 'draft' && h('button', {
+                  class: 'btn btn-secondary btn-sm',
+                  onclick: async () => {
+                    try { payslipDialog({ ...(await rpc('get_payslip', { p_id: p.id })).payslip, name: p.name }, [], data.period, refresh); } catch (err) { toast(err.message, true); }
+                  },
+                }, 'Edit'),
+                h('button', { class: 'btn btn-secondary btn-sm', onclick: act('set_payslip_published', { p_id: p.id, p_published: p.status !== 'published' },
+                  p.status === 'published' ? 'Unpublished' : 'Published') }, p.status === 'published' ? 'Unpublish' : 'Publish'),
+                p.status === 'draft' && h('button', {
+                  class: 'btn btn-danger btn-sm', 'aria-label': `Delete ${p.name}'s payslip`,
+                  onclick: () => { if (confirmAction(`Delete ${p.name}'s draft payslip?`)) act('delete_payslip', { p_id: p.id }, 'Payslip deleted')(); },
+                }, 'Delete'))))))))
+        : h('p', { class: 'empty' }, 'No payslips for this month yet. "Create payslips for this month" makes drafts from each employee\'s salary package.'),
+      data.missing.length > 0 && h('div', { class: 'missing-payslips' },
+        h('p', { class: 'muted' }, `No payslip yet: ${data.missing.map(m => m.name + (Number(m.basic_salary) ? '' : ' (no salary set)')).join(', ')}`),
+        h('button', { class: 'btn btn-secondary btn-sm', onclick: () => payslipDialog({}, data.missing, data.period, refresh) }, '+ Add a payslip'))));
+}
+
+function payslipDocument(d) {
+  const p = d.payslip;
+  const e = d.employee;
+  const c = d.company;
+  return h('article', { class: 'inv-doc payslip-doc' },
+    h('header', { class: 'inv-head' },
+      h('div', {}, h('div', { class: 'inv-supplier' }, c.legal_name || 'Lowcaps'), String(c.address || '').split('\n').map(l => h('div', { class: 'muted' }, l))),
+      h('div', { class: 'inv-title-block' }, h('div', { class: 'inv-title' }, 'PAYSLIP'), h('div', {}, monthLabel(p.period)))),
+    h('dl', { class: 'facts' }, [['Employee', e.name], ['Employee no.', e.employee_no], ['Designation', e.designation], ['Department', e.department],
+      ['Joining date', e.joining_date && fmtDate(e.joining_date)], ['Paid to', [e.bank_name, e.iban].filter(Boolean).join(' · ')]]
+      .filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+    h('table', { class: 'inv-lines' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Earnings'), h('th', { class: 'num' }, 'AED'))),
+      h('tbody', {}, PAY_PARTS.filter(([k]) => Number(p[k]) > 0).map(([k, label]) => h('tr', {}, h('td', {}, label), h('td', { class: 'num' }, amount(p[k])))),
+        h('tr', {}, h('td', {}, h('strong', {}, 'Total earnings')), h('td', { class: 'num' }, h('strong', {}, amount(p.gross)))),
+        Number(p.deductions) > 0 && h('tr', {}, h('td', {}, `Deductions${p.deduction_note ? ' (' + p.deduction_note + ')' : ''}`), h('td', { class: 'num' }, `- ${amount(p.deductions)}`)))),
+    h('dl', { class: 'inv-totals' }, h('dt', { class: 'grand' }, 'Net pay'), h('dd', { class: 'grand' }, money(p.net))),
+    p.notes && h('p', { class: 'prewrap' }, p.notes),
+    h('p', { class: 'muted' }, 'This payslip is generated by Lowcaps ERP.'));
+}
+
+function buildPayslipPdf(d) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const p = d.payslip;
+  const e = d.employee;
+  const c = d.company;
+  const GREEN = [74, 122, 92];
+  const DARK = [28, 42, 34];
+  const GREY = [90, 107, 96];
+  const W = 210;
+  const M = 15;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(...GREEN);
+  doc.text(pdfText(c.legal_name || 'Lowcaps'), M, M + 5);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...GREY);
+  const addr = String(c.address || '').split('\n').filter(Boolean).map(pdfText);
+  addr.forEach((l, i) => doc.text(l, M, M + 11 + i * 4.3));
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(...DARK);
+  doc.text('PAYSLIP', W - M, M + 5, { align: 'right' });
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(10);
+  doc.text(pdfText(monthLabel(p.period)), W - M, M + 11, { align: 'right' });
+  let y = Math.max(M + 11 + addr.length * 4.3, M + 14) + 6;
+  doc.setDrawColor(219, 229, 222); doc.line(M, y, W - M, y);
+  y += 7;
+  const info = [['Employee', e.name], ['Employee no.', e.employee_no], ['Designation', e.designation], ['Department', e.department],
+    ['Joining date', e.joining_date && fmtDate(e.joining_date)], ['Paid to', [e.bank_name, e.iban].filter(Boolean).join(' - ')]].filter(([, v]) => v);
+  doc.setFontSize(9.5);
+  info.forEach(([k, v], i) => {
+    doc.setFont('helvetica', 'bold'); doc.setTextColor(...GREY); doc.text(k, M, y + i * 5.5);
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(...DARK); doc.text(pdfText(v), M + 35, y + i * 5.5);
+  });
+  y += info.length * 5.5 + 4;
+  const body = PAY_PARTS.filter(([k]) => Number(p[k]) > 0).map(([k, label]) => [label, amount(p[k])]);
+  body.push([{ content: 'Total earnings', styles: { fontStyle: 'bold' } }, { content: amount(p.gross), styles: { fontStyle: 'bold' } }]);
+  if (Number(p.deductions) > 0) body.push([pdfText(`Deductions${p.deduction_note ? ' (' + p.deduction_note + ')' : ''}`), `- ${amount(p.deductions)}`]);
+  window.autoTable(doc, {
+    startY: y, margin: { left: M, right: M }, head: [['Earnings and deductions', 'AED']], body,
+    styles: { font: 'helvetica', fontSize: 9.5, cellPadding: 2.2, textColor: DARK, lineColor: [219, 229, 222], lineWidth: 0.1 },
+    headStyles: { fillColor: GREEN, textColor: 255, fontStyle: 'bold' },
+    columnStyles: { 1: { halign: 'right', cellWidth: 40 } },
+    didParseCell: cell => { if (cell.section === 'head' && cell.column.index === 1) cell.cell.styles.halign = 'right'; },
+  });
+  y = doc.lastAutoTable.finalY + 9;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(12); doc.setTextColor(...DARK);
+  doc.text('Net pay', W - M - 45, y, { align: 'right' });
+  doc.text(money(p.net), W - M, y, { align: 'right' });
+  y += 10;
+  if (p.notes) {
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+    doc.splitTextToSize(pdfText(p.notes), W - 2 * M).forEach(l => { doc.text(l, M, y); y += 4.3; });
+  }
+  doc.setFontSize(8); doc.setTextColor(...GREY);
+  doc.text(`Payslip ${pdfText(e.name)} ${monthLabel(p.period)} - confidential`, W - M, 290, { align: 'right' });
+  return doc;
+}
+
+async function viewPayslip(id) {
+  const d = await rpc('get_payslip', { p_id: id });
+  const fileName = `Payslip-${d.payslip.period.slice(0, 7)}-${d.employee.name.replace(/[^A-Za-z0-9]+/g, '-')}.pdf`;
+  return layout('hr-payslips',
+    pageHead(`Payslip: ${monthLabel(d.payslip.period)}`, d.employee.name, [
+      h('button', {
+        class: 'btn btn-primary',
+        onclick: () => { try { buildPayslipPdf(d).save(fileName); } catch (err) { toast('Could not create the PDF: ' + err.message, true); } },
+      }, icon('download'), 'Download PDF'),
+    ], [h('a', { href: '#/hr/payslips' }, '← Payslips'), ' ',
+      d.payslip.status === 'published' ? h('span', { class: 'badge badge-active' }, 'Published') : h('span', { class: 'badge badge-plain' }, 'Draft')]),
+    h('section', { class: 'card' }, payslipDocument(d)));
+}
+
+// ---------- people ----------
+
+async function viewPeople() {
+  const people = await rpc('hr_directory');
+  const mgr = isManager();
+  return layout('hr-people',
+    pageHead('Team', mgr ? 'Everyone\'s records. Click a name for the full record.' : 'Colleagues\' contact details. Click your own name for your full record.'),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Designation'), h('th', { class: 'hide-sm' }, 'Department'),
+        h('th', {}, 'Email'), h('th', { class: 'hide-sm' }, 'Phone'), mgr && h('th', { class: 'hide-sm' }, 'Joined'))),
+      h('tbody', {}, people.map(p => h('tr', {},
+        h('td', {}, h('a', { class: 'row-link', href: `#/hr/people/${p.id}` }, p.name),
+          p.id === state.user.id && h('span', { class: 'muted' }, ' (you)'),
+          p.status === 'left' && [' ', h('span', { class: 'badge badge-inactive' }, 'Left')],
+          mgr && p.employee_no && h('div', { class: 'meta muted' }, p.employee_no)),
+        h('td', {}, p.designation || h('span', { class: 'muted' }, '—')),
+        h('td', { class: 'hide-sm' }, p.department || h('span', { class: 'muted' }, '—')),
+        h('td', {}, h('a', { href: `mailto:${p.email}` }, p.email)),
+        h('td', { class: 'hide-sm' }, p.work_phone || h('span', { class: 'muted' }, '—')),
+        mgr && h('td', { class: 'hide-sm' }, p.joining_date ? fmtDate(p.joining_date) : h('span', { class: 'muted' }, '—')))))))));
+}
+
+function expiryBadge(date, today) {
+  if (!date) return null;
+  const days = daysBetween(today, date);
+  if (days < 0) return h('span', { class: 'badge badge-overdue' }, `Expired ${fmtDate(date)}`);
+  if (days <= 60) return h('span', { class: 'badge badge-lead' }, `Expires ${fmtDate(date)}`);
+  return fmtDate(date);
+}
+
+async function viewPerson(idParam) {
+  const id = idParam === 'me' ? state.user.id : idParam;
+  const e = await rpc('get_employee', { p_id: id });
+  const self = id === state.user.id;
+  const section = (title, rows) => {
+    const shown = rows.filter(([, v]) => v !== null && v !== undefined && v !== '');
+    return h('section', { class: 'card' }, h('h2', {}, title),
+      shown.length ? h('dl', { class: 'facts' }, shown.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])) : h('p', { class: 'empty' }, 'Not filled in yet.'));
+  };
+  if (!e.full) {
+    return layout('hr-people', pageHead(e.name, e.designation, null, h('a', { href: '#/hr/people' }, '← Team')),
+      section('Contact', [['Designation', e.designation], ['Department', e.department], ['Email', h('a', { href: `mailto:${e.email}` }, e.email)], ['Phone', e.work_phone]]));
+  }
+  const [leave, payslips] = await Promise.all([
+    rpc('leave_summary', { p_profile: id }),
+    isManager() && !self ? rpc('list_payslips', { p_profile: id }) : null,
+  ]);
+  const total = ['basic_salary', 'housing_allowance', 'transport_allowance', 'other_allowance'].reduce((t, k) => t + Number(e[k] || 0), 0);
+  return layout('hr-people',
+    pageHead(e.name, [e.designation, e.department].filter(Boolean).join(' · ') || ROLE_LABEL[e.role], [
+      isManager() && h('a', { class: 'btn btn-primary', href: `#/hr/people/${id}/edit` }, 'Edit record'),
+      isManager() && !self && h('a', { class: 'btn btn-secondary', href: `#/hr/attendance?person=${id}` }, 'Attendance'),
+    ], [h('a', { href: '#/hr/people' }, '← Team'), ' ', e.status === 'left' ? h('span', { class: 'badge badge-inactive' }, 'Left') : null]),
+    !isManager() && self && h('p', { class: 'muted' }, 'Only you and managers can see these details. If something is wrong, ask a manager to update it.'),
+    h('div', { class: 'grid two-col' },
+      h('div', {},
+        section('Job', [['Employee no.', e.employee_no], ['Designation', e.designation], ['Department', e.department],
+          ['Joining date', e.joining_date && fmtDate(e.joining_date)], ['ERP access', ROLE_LABEL[e.role]],
+          ['Left on', e.status === 'left' && e.leaving_date && fmtDate(e.leaving_date)]]),
+        section('Contact', [['Work email', h('a', { href: `mailto:${e.email}` }, e.email)], ['Work phone', e.work_phone],
+          ['Personal email', e.personal_email], ['Personal phone', e.personal_phone], ['Address', e.address]]),
+        section('Personal', [['Date of birth', e.date_of_birth && fmtDate(e.date_of_birth)], ['Gender', e.gender && e.gender[0].toUpperCase() + e.gender.slice(1)],
+          ['Nationality', e.nationality],
+          ['Emergency contact', [e.emergency_name, e.emergency_relation && `(${e.emergency_relation})`, e.emergency_phone].filter(Boolean).join(' ')]])),
+      h('div', {},
+        section('Documents', [['Emirates ID', e.emirates_id], ['Emirates ID expiry', expiryBadge(e.emirates_id_expiry, e.today)],
+          ['Passport', e.passport_no], ['Passport expiry', expiryBadge(e.passport_expiry, e.today)], ['Visa expiry', expiryBadge(e.visa_expiry, e.today)]]),
+        section('Salary and bank', [['Basic salary', Number(e.basic_salary) ? money(e.basic_salary) : null],
+          ['Housing allowance', Number(e.housing_allowance) ? money(e.housing_allowance) : null],
+          ['Transport allowance', Number(e.transport_allowance) ? money(e.transport_allowance) : null],
+          ['Other allowance', Number(e.other_allowance) ? money(e.other_allowance) : null],
+          ['Total package', total ? h('strong', {}, `${money(total)} / month`) : null], ['Bank', e.bank_name], ['IBAN', e.iban]]),
+        h('section', { class: 'card' }, h('h2', {}, `Leave in ${leave.year}`),
+          h('dl', { class: 'facts' },
+            h('dt', {}, 'Annual'), h('dd', {}, `${num(leave.annual.remaining)} of ${num(leave.annual.entitled)} left · ${num(leave.annual.taken)} taken · ${num(leave.annual.pending)} pending`),
+            h('dt', {}, 'Medical'), h('dd', {}, `${num(leave.medical.remaining)} of ${num(leave.medical.entitled)} left · ${num(leave.medical.taken)} taken · ${num(leave.medical.pending)} pending`)),
+          leaveRequestList(leave.requests.slice(0, 5), { showName: false, canCancel: () => false, refresh: () => render() })),
+        payslips && h('section', { class: 'card' }, h('h2', {}, 'Payslips'),
+          payslips.payslips.length
+            ? h('ul', { class: 'list' }, payslips.payslips.map(p => h('li', {},
+                h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/hr/payslips/${p.id}` }, monthLabel(p.period))),
+                h('div', { class: 'badge-stack' }, h('strong', {}, money(p.net)), p.status === 'draft' && h('span', { class: 'badge badge-plain' }, 'Draft')))))
+            : h('p', { class: 'empty' }, 'No payslips yet.')),
+        e.notes && isManager() && section('Notes (managers only)', [['', h('span', { class: 'prewrap' }, e.notes)]]))));
+}
+
+async function viewPersonEdit(id) {
+  if (!isManager()) return viewNotFound();
+  const e = await rpc('get_employee', { p_id: id });
+  const t = (name, label, attrs = {}, opts = {}) => field(label, input(name, e[name] ?? '', attrs), opts);
+  const d = (name, label) => field(label, input(name, e[name] ?? '', { type: 'date' }));
+  const m = (name, label) => field(`${label} (AED)`, input(name, Number(e[name]) ? e[name] : '', { type: 'number', min: 0, step: '0.01' }));
+  const heading = text => h('h2', { class: 'full form-section' }, text);
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      heading('Job'),
+      t('employee_no', 'Employee no.', { maxlength: 30 }), t('designation', 'Designation', { maxlength: 100, placeholder: 'e.g. Customs clearance officer' }),
+      t('department', 'Department', { maxlength: 100, placeholder: 'e.g. Operations' }), d('joining_date', 'Joining date'),
+      field('Status', select('status', e.status || 'active', [['active', 'Working here'], ['left', 'Left the company']])), d('leaving_date', 'Leaving date'),
+      heading('Contact'),
+      t('work_phone', 'Work phone', { type: 'tel', maxlength: 30 }), t('personal_phone', 'Personal phone', { type: 'tel', maxlength: 30 }),
+      t('personal_email', 'Personal email', { type: 'email', maxlength: 200 }),
+      field('Address', textarea('address', e.address, { rows: 2, maxlength: 500 }), { full: true }),
+      heading('Personal'),
+      d('date_of_birth', 'Date of birth'),
+      field('Gender', select('gender', e.gender || '', [['', '—'], ['male', 'Male'], ['female', 'Female']])),
+      t('nationality', 'Nationality', { maxlength: 60 }), h('div'),
+      t('emergency_name', 'Emergency contact name', { maxlength: 100 }), t('emergency_relation', 'Relationship', { maxlength: 50 }),
+      t('emergency_phone', 'Emergency contact phone', { type: 'tel', maxlength: 30 }), h('div'),
+      heading('Documents'),
+      t('emirates_id', 'Emirates ID no.', { maxlength: 30, placeholder: '784-XXXX-XXXXXXX-X' }), d('emirates_id_expiry', 'Emirates ID expiry'),
+      t('passport_no', 'Passport no.', { maxlength: 30 }), d('passport_expiry', 'Passport expiry'),
+      d('visa_expiry', 'Visa expiry'), h('div'),
+      heading('Salary package (monthly) and bank'),
+      m('basic_salary', 'Basic salary'), m('housing_allowance', 'Housing allowance'),
+      m('transport_allowance', 'Transport allowance'), m('other_allowance', 'Other allowance'),
+      t('bank_name', 'Bank', { maxlength: 100 }), t('iban', 'IBAN', { maxlength: 50 }),
+      heading('Leave entitlement per year'),
+      t('annual_leave_days', 'Annual leave days', { type: 'number', min: 0, max: 366, placeholder: `Company default (${e.annual_entitled})` },
+        { hint: 'Leave empty to use the company default.' }),
+      t('medical_leave_days', 'Medical leave days', { type: 'number', min: 0, max: 366, placeholder: `Company default (${e.medical_entitled})` }),
+      field('Notes (managers only)', textarea('notes', e.notes, { rows: 2, maxlength: 2000 }), { full: true })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('a', { class: 'btn btn-secondary', href: `#/hr/people/${id}` }, 'Cancel'))),
+  async data => {
+    await rpc('save_employee', { p_id: id, p_data: data });
+    toast('Employee record saved');
+    location.hash = `#/hr/people/${id}`;
+  });
+  return layout('hr-people',
+    pageHead(`Edit: ${e.name}`, `${e.email} · ERP access: ${ROLE_LABEL[e.role]}${state.user.role === 'admin' ? ' (change it under Users)' : ''}`, null,
+      h('a', { href: `#/hr/people/${id}` }, '← Back')),
+    h('section', { class: 'card' }, form));
+}
+
+// ---------- HR settings (admins, on the Company settings page) ----------
+
+function hrSettingsCard(s) {
+  const lat = input('office_lat', s.office_lat ?? '', { inputmode: 'decimal', placeholder: 'e.g. 25.3463' });
+  const lng = input('office_lng', s.office_lng ?? '', { inputmode: 'decimal', placeholder: 'e.g. 56.3418' });
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Office latitude', lat), field('Office longitude', lng),
+      h('div', { class: 'full' }, h('button', {
+        class: 'btn btn-secondary btn-sm', type: 'button',
+        onclick: async e => {
+          e.currentTarget.disabled = true;
+          const loc = await getLocation();
+          e.currentTarget.disabled = false;
+          if (!loc) { toast('Location not available. Allow location for this site, or type the numbers in.', true); return; }
+          lat.value = loc.lat.toFixed(6);
+          lng.value = loc.lng.toFixed(6);
+          toast(`Location filled in (accurate to about ${Math.round(loc.accuracy)} m). Save to keep it.`);
+        },
+      }, 'Use my current location (do this at the office)')),
+      field('Counts as "at office" within (metres)', input('office_radius_m', s.office_radius_m, { type: 'number', min: 20, max: 5000 })),
+      field('Work starts at', input('work_start', s.work_start, { type: 'time' }), { hint: 'Sign-ins after this are marked late.' }),
+      field('Annual leave days per year (default)', input('annual_leave_days', s.annual_leave_days, { type: 'number', min: 0, max: 366 })),
+      field('Medical leave days per year (default)', input('medical_leave_days', s.medical_leave_days, { type: 'number', min: 0, max: 366 })),
+      h('div', { class: 'field full', 'data-field': 'weekend_days' }, h('label', {}, 'Weekend days (not counted as leave)'),
+        h('div', { class: 'btn-row' }, [1, 2, 3, 4, 5, 6, 0].map(dnum => h('label', { class: 'check' },
+          h('input', { type: 'checkbox', name: 'wd', 'data-group': 'weekend_days', value: String(dnum), checked: s.weekend_days.includes(dnum) }),
+          DAY_NAMES[dnum]))))),
+    h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save HR settings'))),
+  async data => {
+    delete data.wd;
+    data.weekend_days = (data.weekend_days || []).map(Number);
+    await rpc('save_hr_settings', { p_data: data });
+    toast('HR settings saved');
+    render();
+  });
+  return h('section', { class: 'card' }, h('h2', {}, 'HR: office, working hours and leave'), form);
+}
+
 // ---------- users (admin) ----------
 
 function userDialog(u, refresh) {
@@ -2182,7 +2922,7 @@ function userDialog(u, refresh) {
     h('p', { class: 'muted' }, u.email),
     field('Name', input('name', u.name, { required: true, maxlength: 100 })),
     field('Role', select('role', u.role, ROLE_OPTIONS, { disabled: isSelf }),
-      { hint: 'Managers create and assign tasks and can delete customers. Administrators can also manage users.' }),
+      { hint: 'Employees only see HR (their attendance, leave, payslips). Team members use the whole ERP. Managers also assign tasks, approve leave and see everyone\'s HR records. Administrators also manage users.' }),
     h('label', { class: 'check' },
       h('input', { type: 'checkbox', name: 'active', checked: !!u.active, disabled: isSelf }), 'Has access to the ERP'),
     isSelf && h('p', { class: 'muted' }, 'You can\'t remove your own admin access or turn off your own account.'),
@@ -2299,7 +3039,16 @@ async function render() {
         view = (publicPages[path] || viewLogin)();
         if (!publicPages[path]) history.replaceState(null, '', '#/login');
       } else if (!state.user.active) view = viewPending();
-      else if (publicPages[path]) { location.hash = '#/'; return; }
+      else if (publicPages[path]) { location.hash = isEmployee() ? '#/hr' : '#/'; return; }
+      else if (isEmployee() && !path.startsWith('/hr') && path !== '/account') { location.hash = '#/hr'; return; }
+      else if (path === '/hr') view = await viewMyHr();
+      else if (path === '/hr/attendance') view = await viewAttendance(params);
+      else if (path === '/hr/leave') view = await viewLeave(params);
+      else if (path === '/hr/payslips') view = await viewPayslips(params);
+      else if ((m = path.match(/^\/hr\/payslips\/(\d+)$/))) view = await viewPayslip(Number(m[1]));
+      else if (path === '/hr/people') view = await viewPeople();
+      else if ((m = path.match(/^\/hr\/people\/(me|[0-9a-f-]{36})$/))) view = await viewPerson(m[1]);
+      else if ((m = path.match(/^\/hr\/people\/([0-9a-f-]{36})\/edit$/))) view = await viewPersonEdit(m[1]);
       else if (path === '/') view = await viewDashboard();
       else if (path === '/customers') view = await viewCustomers(params);
       else if (path === '/customers/new') view = await viewCustomerNew();
