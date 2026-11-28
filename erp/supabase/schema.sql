@@ -119,6 +119,79 @@ create table if not exists public.task_updates (
 );
 create index if not exists task_updates_task_idx on public.task_updates (task_id);
 
+-- Lowcaps' own details, printed on every invoice (one row).
+create table if not exists public.company_settings (
+  id                 int primary key default 1 check (id = 1),
+  legal_name         text not null default 'Lowcaps' check (char_length(btrim(legal_name)) between 1 and 200),
+  address            text check (char_length(address) <= 500),
+  phone              text check (char_length(phone) <= 50),
+  email              text check (char_length(email) <= 200),
+  trn                text check (trn ~ '^\d{15}$'),
+  bank_name          text check (char_length(bank_name) <= 200),
+  account_name       text check (char_length(account_name) <= 200),
+  iban               text check (char_length(iban) <= 50),
+  swift              text check (char_length(swift) <= 20),
+  payment_terms_days int not null default 30 check (payment_terms_days between 0 and 365),
+  invoice_notes      text check (char_length(invoice_notes) <= 2000),
+  updated_at         timestamptz not null default now()
+);
+insert into public.company_settings (id) values (1) on conflict (id) do nothing;
+
+-- Running invoice numbers per type and year: PRO-2026-0001, INV-2026-0001.
+create table if not exists public.invoice_counters (
+  kind text not null,
+  year int  not null,
+  last int  not null default 0,
+  primary key (kind, year)
+);
+
+-- Proforma and tax invoices. Customer and supplier details are copied in when the invoice is saved,
+-- so a sent invoice never changes if the customer or company details change later.
+create table if not exists public.invoices (
+  id               bigint generated always as identity primary key,
+  kind             text not null check (kind in ('proforma', 'tax')),
+  number           text not null unique,
+  status           text not null default 'draft' check (status in ('draft', 'sent', 'paid', 'cancelled')),
+  task_id          bigint references public.tasks (id) on delete set null,
+  customer_id      bigint references public.customers (id) on delete set null,
+  proforma_id      bigint references public.invoices (id) on delete set null,
+  issue_date       date not null,
+  due_date         date,
+  supply_date      date,
+  customer_name    text not null,
+  customer_address text,
+  customer_trn     text,
+  customer_email   text,
+  supplier         jsonb not null default '{}',
+  notes            text check (char_length(notes) <= 2000),
+  subtotal         numeric(14, 2) not null default 0,
+  vat_total        numeric(14, 2) not null default 0,
+  total            numeric(14, 2) not null default 0,
+  sent_at          timestamptz,
+  sent_to          text,
+  paid_at          timestamptz,
+  cancelled_at     timestamptz,
+  created_by       uuid references public.profiles (id) on delete set null,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now()
+);
+create index if not exists invoices_task_idx     on public.invoices (task_id);
+create index if not exists invoices_customer_idx on public.invoices (customer_id);
+
+-- vat_code: standard (5%), zero (0%, zero-rated), exempt, out_of_scope (e.g. disbursements)
+create table if not exists public.invoice_lines (
+  id          bigint generated always as identity primary key,
+  invoice_id  bigint not null references public.invoices (id) on delete cascade,
+  position    int not null,
+  description text not null check (char_length(btrim(description)) between 1 and 500),
+  quantity    numeric(12, 3) not null check (quantity > 0),
+  unit_price  numeric(14, 2) not null check (unit_price >= 0),
+  vat_code    text not null check (vat_code in ('standard', 'zero', 'exempt', 'out_of_scope')),
+  net         numeric(14, 2) not null,
+  vat         numeric(14, 2) not null
+);
+create index if not exists invoice_lines_invoice_idx on public.invoice_lines (invoice_id);
+
 -- Databases set up before managers existed: allow the new role.
 alter table public.profiles drop constraint if exists profiles_role_check;
 alter table public.profiles add constraint profiles_role_check check (role in ('admin', 'manager', 'staff'));
@@ -136,8 +209,14 @@ alter table public.activities enable row level security;
 alter table public.work_types   enable row level security;
 alter table public.tasks        enable row level security;
 alter table public.task_updates enable row level security;
+alter table public.company_settings enable row level security;
+alter table public.invoice_counters enable row level security;
+alter table public.invoices         enable row level security;
+alter table public.invoice_lines    enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
-              public.work_types, public.tasks, public.task_updates from public, anon, authenticated;
+              public.work_types, public.tasks, public.task_updates,
+              public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines
+  from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
 -- New sign-ups get a profile that has no access until an admin approves it
@@ -419,7 +498,18 @@ begin
     'overdueTasks', (select count(*) from public.tasks
                      where status in ('new', 'in_progress', 'waiting') and due_date < t),
     'unassignedTasks', (select count(*) from public.tasks
-                        where status in ('new', 'in_progress', 'waiting') and assigned_to is null)
+                        where status in ('new', 'in_progress', 'waiting') and assigned_to is null),
+    -- Finished tasks for a customer that have no tax invoice yet (for managers to invoice).
+    'toInvoice', coalesce((
+      select json_agg(x order by x.completed_at desc nulls last, x.id desc) from (
+        select t2.id, t2.title, t2.completed_at, c.name as customer_name
+        from public.tasks t2 join public.customers c on c.id = t2.customer_id
+        where t2.status = 'done'
+          and not exists (select 1 from public.invoices i
+                          where i.task_id = t2.id and i.kind = 'tax' and i.status <> 'cancelled')
+        order by t2.completed_at desc nulls last, t2.id desc limit 10) x), '[]'),
+    'unpaid', (select json_build_object('count', count(*), 'total', coalesce(sum(total), 0))
+               from public.invoices where kind = 'tax' and status = 'sent')
   );
 end $$;
 
@@ -501,7 +591,13 @@ begin
         from public.tasks t
         left join public.profiles u on u.id = t.assigned_to
         left join public.work_types w on w.id = t.work_type_id
-        where t.customer_id = c.id), '[]')))
+        where t.customer_id = c.id), '[]'),
+      'invoices', coalesce((
+        select jsonb_agg(jsonb_build_object(
+            'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status,
+            'issue_date', i.issue_date, 'total', i.total)
+          order by i.issue_date desc, i.id desc)
+        from public.invoices i where i.customer_id = c.id), '[]')))
   into result
   from public.customers c
   left join public.profiles o  on o.id = c.owner_id
@@ -824,7 +920,13 @@ begin
       'updates', coalesce((
         select jsonb_agg(to_jsonb(x) || jsonb_build_object('user_name', xu.name) order by x.created_at desc, x.id desc)
         from public.task_updates x left join public.profiles xu on xu.id = x.user_id
-        where x.task_id = t.id), '[]')))
+        where x.task_id = t.id), '[]'),
+      'invoices', coalesce((
+        select jsonb_agg(jsonb_build_object(
+            'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status,
+            'issue_date', i.issue_date, 'total', i.total)
+          order by i.created_at, i.id)
+        from public.invoices i where i.task_id = t.id), '[]')))
   into result
   from public.tasks t
   left join public.customers c  on c.id = t.customer_id
@@ -1022,6 +1124,347 @@ begin
 end $$;
 
 -- -------------------------------------------------------------------------------------
+-- API: company settings and invoices
+-- -------------------------------------------------------------------------------------
+
+create or replace function public.get_company_settings() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  return (select to_json(s) from public.company_settings s where id = 1);
+end $$;
+
+create or replace function public.save_company_settings(p_data jsonb) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_admin();
+  d  jsonb := private.clean(p_data, '{
+    "legal_name":         {"type": "text", "required": true, "max": 200},
+    "address":            {"type": "text", "max": 500},
+    "phone":              {"type": "text", "max": 50},
+    "email":              {"type": "text", "max": 200, "format": "email"},
+    "trn":                {"type": "text", "format": "trn"},
+    "bank_name":          {"type": "text", "max": 200},
+    "account_name":       {"type": "text", "max": 200},
+    "iban":               {"type": "text", "max": 50},
+    "swift":              {"type": "text", "max": 20},
+    "payment_terms_days": {"type": "int"},
+    "invoice_notes":      {"type": "text", "max": 2000}
+  }');
+begin
+  if coalesce((d ->> 'payment_terms_days')::int, 0) > 365 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = '{"payment_terms_days": "Use 0 to 365 days"}';
+  end if;
+  update public.company_settings set
+    legal_name = d ->> 'legal_name', address = d ->> 'address', phone = d ->> 'phone', email = d ->> 'email',
+    trn = d ->> 'trn', bank_name = d ->> 'bank_name', account_name = d ->> 'account_name',
+    iban = upper(replace(d ->> 'iban', ' ', '')), swift = upper(d ->> 'swift'),
+    payment_terms_days = coalesce((d ->> 'payment_terms_days')::int, 30),
+    invoice_notes = d ->> 'invoice_notes', updated_at = now()
+  where id = 1;
+end $$;
+
+-- Next number for an invoice type in a year, e.g. INV-2026-0007. Never reused, even if an invoice is cancelled.
+create or replace function private.next_invoice_number(p_kind text, p_date date) returns text
+language plpgsql security definer set search_path = '' as $$
+declare
+  y int := extract(year from p_date)::int;
+  n int;
+begin
+  insert into public.invoice_counters (kind, year, last) values (p_kind, y, 1)
+  on conflict (kind, year) do update set last = public.invoice_counters.last + 1
+  returning last into n;
+  return format('%s-%s-%s', case p_kind when 'tax' then 'INV' else 'PRO' end, y, lpad(n::text, 4, '0'));
+end $$;
+
+-- Create (p_id null) or edit a draft invoice. Managers and admins only. Returns its id.
+-- p_data: kind ('proforma' | 'tax', only on create), task_id, customer_id, proforma_id, issue_date,
+--         due_date, supply_date, notes, lines: [{description, quantity, unit_price, vat_code}]
+create or replace function public.save_invoice(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "kind":        {"type": "enum", "values": ["proforma", "tax"], "default": "proforma"},
+    "task_id":     {"type": "int"},
+    "customer_id": {"type": "int", "required": true},
+    "proforma_id": {"type": "int"},
+    "issue_date":  {"type": "date", "required": true},
+    "due_date":    {"type": "date"},
+    "supply_date": {"type": "date"},
+    "notes":       {"type": "text", "max": 2000}
+  }');
+  v_old     public.invoices;
+  v_kind    text;
+  v_id      bigint;
+  cust      public.customers;
+  co        public.company_settings;
+  lines     jsonb := p_data -> 'lines';
+  ln        jsonb;
+  i         int := 0;
+  qty       numeric;
+  price     numeric;
+  net       numeric;
+  vat       numeric;
+  sub_total numeric := 0;
+  vat_sum   numeric := 0;
+  errs      jsonb := '{}';
+  line_errs text[] := '{}';
+  clean_lines jsonb := '[]';
+begin
+  if p_id is not null then
+    select * into v_old from public.invoices where id = p_id;
+    if v_old.id is null then
+      raise exception 'Invoice not found' using errcode = 'P0002';
+    end if;
+    if v_old.status <> 'draft' then
+      raise exception 'This invoice has already been sent, so it can''t be changed. Cancel it and create a new one instead.'
+        using errcode = '22023';
+    end if;
+    v_kind := v_old.kind;
+  else
+    v_kind := d ->> 'kind';
+  end if;
+
+  select * into cust from public.customers where id = (d ->> 'customer_id')::bigint;
+  if cust.id is null and d ->> 'customer_id' is not null then
+    errs := errs || '{"customer_id": "Pick a customer from the list"}';
+  end if;
+  if d ->> 'task_id' is not null and not exists (select 1 from public.tasks where id = (d ->> 'task_id')::bigint) then
+    errs := errs || '{"task_id": "Task not found"}';
+  end if;
+  if d ->> 'proforma_id' is not null and not exists (
+       select 1 from public.invoices where id = (d ->> 'proforma_id')::bigint and kind = 'proforma') then
+    errs := errs || '{"proforma_id": "Proforma invoice not found"}';
+  end if;
+  if (d ->> 'due_date')::date < (d ->> 'issue_date')::date then
+    errs := errs || '{"due_date": "Can''t be before the invoice date"}';
+  end if;
+
+  select * into co from public.company_settings where id = 1;
+  if v_kind = 'tax' and co.trn is null then
+    raise exception 'Add Lowcaps'' TRN under Company settings before creating a tax invoice' using errcode = '22023';
+  end if;
+
+  -- Lines
+  if lines is null or jsonb_typeof(lines) <> 'array' or jsonb_array_length(lines) = 0 then
+    errs := errs || '{"lines": "Add at least one charge"}';
+  elsif jsonb_array_length(lines) > 100 then
+    errs := errs || '{"lines": "At most 100 lines"}';
+  else
+    for ln in select value from jsonb_array_elements(lines) loop
+      i := i + 1;
+      begin
+        qty := nullif(btrim(ln ->> 'quantity'), '')::numeric;
+        price := nullif(btrim(ln ->> 'unit_price'), '')::numeric;
+      exception when others then
+        line_errs := line_errs || format('Line %s: quantity and price must be numbers', i);
+        continue;
+      end;
+      if nullif(btrim(ln ->> 'description'), '') is null then
+        line_errs := line_errs || format('Line %s: add a description', i);
+      elsif char_length(btrim(ln ->> 'description')) > 500 then
+        line_errs := line_errs || format('Line %s: description is too long', i);
+      elsif qty is null or qty <= 0 or qty >= 1000000000 or scale(qty) > 3 then
+        line_errs := line_errs || format('Line %s: quantity must be more than 0', i);
+      elsif price is null or price < 0 or price >= 1000000000000 or scale(price) > 2 then
+        line_errs := line_errs || format('Line %s: price must be 0 or more, with at most 2 decimals', i);
+      elsif coalesce(ln ->> 'vat_code', '') not in ('standard', 'zero', 'exempt', 'out_of_scope') then
+        line_errs := line_errs || format('Line %s: pick a VAT treatment', i);
+      else
+        net := round(qty * price, 2);
+        vat := case when ln ->> 'vat_code' = 'standard' then round(net * 0.05, 2) else 0 end;
+        sub_total := sub_total + net;
+        vat_sum := vat_sum + vat;
+        clean_lines := clean_lines || jsonb_build_object('description', btrim(ln ->> 'description'), 'quantity', qty,
+          'unit_price', price, 'vat_code', ln ->> 'vat_code', 'net', net, 'vat', vat);
+      end if;
+    end loop;
+    if array_length(line_errs, 1) > 0 then
+      errs := errs || jsonb_build_object('lines', array_to_string(line_errs, '. '));
+    end if;
+  end if;
+
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  if p_id is null then
+    insert into public.invoices (kind, number, task_id, customer_id, proforma_id, issue_date, due_date, supply_date,
+                                 customer_name, customer_address, customer_trn, customer_email, supplier, notes,
+                                 subtotal, vat_total, total, created_by)
+    values (v_kind, private.next_invoice_number(v_kind, (d ->> 'issue_date')::date),
+            (d ->> 'task_id')::bigint, cust.id, (d ->> 'proforma_id')::bigint, (d ->> 'issue_date')::date,
+            (d ->> 'due_date')::date, (d ->> 'supply_date')::date,
+            cust.name, concat_ws(E'\n', cust.address, cust.city, cust.country), cust.trn, cust.email,
+            to_jsonb(co) - 'id' - 'updated_at', d ->> 'notes', sub_total, vat_sum, sub_total + vat_sum, me.id)
+    returning id into v_id;
+  else
+    v_id := p_id;
+    update public.invoices set
+      task_id = (d ->> 'task_id')::bigint, customer_id = cust.id, proforma_id = (d ->> 'proforma_id')::bigint,
+      issue_date = (d ->> 'issue_date')::date, due_date = (d ->> 'due_date')::date, supply_date = (d ->> 'supply_date')::date,
+      customer_name = cust.name, customer_address = concat_ws(E'\n', cust.address, cust.city, cust.country),
+      customer_trn = cust.trn, customer_email = cust.email, supplier = to_jsonb(co) - 'id' - 'updated_at',
+      notes = d ->> 'notes', subtotal = sub_total, vat_total = vat_sum, total = sub_total + vat_sum, updated_at = now()
+    where id = v_id;
+    delete from public.invoice_lines where invoice_id = v_id;
+  end if;
+
+  insert into public.invoice_lines (invoice_id, position, description, quantity, unit_price, vat_code, net, vat)
+  select v_id, x.ord, x.l ->> 'description', (x.l ->> 'quantity')::numeric, (x.l ->> 'unit_price')::numeric,
+         x.l ->> 'vat_code', (x.l ->> 'net')::numeric, (x.l ->> 'vat')::numeric
+  from jsonb_array_elements(clean_lines) with ordinality as x(l, ord);
+
+  if d ->> 'task_id' is not null then
+    insert into public.task_updates (task_id, user_id, kind, body)
+    select (d ->> 'task_id')::bigint, me.id, 'comment',
+           format('%s %s %s (AED %s)', case when p_id is null then 'Created' else 'Updated' end,
+                  case v_kind when 'tax' then 'tax invoice' else 'proforma invoice' end,
+                  (select number from public.invoices where id = v_id), to_char(sub_total + vat_sum, 'FM999,999,999,990.00'));
+  end if;
+  return v_id;
+end $$;
+
+create or replace function public.get_invoice(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_member();
+  result json;
+begin
+  select json_build_object(
+    'today', private.today(),
+    'invoice', to_jsonb(i) || jsonb_build_object(
+      'task_title', t.title,
+      'task_status', t.status,
+      'proforma_number', p.number,
+      'created_by_name', u.name,
+      'lines', coalesce((select jsonb_agg(to_jsonb(l) order by l.position) from public.invoice_lines l
+                         where l.invoice_id = i.id), '[]'),
+      -- Email addresses the invoice could go to: the customer's, then its contacts' (main contact first).
+      'recipients', coalesce((
+        select jsonb_agg(distinct_emails.email order by distinct_emails.rank, distinct_emails.email) from (
+          select lower(e.email) as email, min(e.rank) as rank from (
+            select c.email, 0 as rank from public.customers c where c.id = i.customer_id and c.email is not null
+            union all
+            select k.email, case when k.is_primary then 1 else 2 end from public.contacts k
+            where k.customer_id = i.customer_id and k.email is not null) e
+          group by lower(e.email)) distinct_emails), '[]')))
+  into result
+  from public.invoices i
+  left join public.tasks t    on t.id = i.task_id
+  left join public.invoices p on p.id = i.proforma_id
+  left join public.profiles u on u.id = i.created_by
+  where i.id = p_id;
+  if result is null then
+    raise exception 'Invoice not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+-- kind: '' | 'proforma' | 'tax'; status: '' | 'draft' | 'sent' | 'paid' | 'cancelled' | 'unpaid' (sent, not paid)
+create or replace function public.list_invoices(
+  p_q text default null, p_kind text default null, p_status text default null, p_page int default 1
+) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_member();
+  page_size constant int := 25;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  pat       text;
+  total     bigint;
+  v_rows    json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+
+  with f as (
+    select i.* from public.invoices i
+    left join public.tasks t on t.id = i.task_id
+    where (pat is null or i.number ilike pat or i.customer_name ilike pat or t.title ilike pat)
+      and (coalesce(p_kind, '') not in ('proforma', 'tax') or i.kind = p_kind)
+      and (case coalesce(p_status, '')
+             when 'unpaid' then i.status = 'sent'
+             when '' then true
+             else i.status = p_status
+           end)
+  )
+  select (select count(*) from f),
+         coalesce((select json_agg(x order by x.issue_date desc, x.id desc) from (
+           select f.id, f.kind, f.number, f.status, f.issue_date, f.due_date, f.customer_id, f.customer_name,
+                  f.task_id, t.title as task_title, f.total, f.sent_at
+           from f left join public.tasks t on t.id = f.task_id
+           order by f.issue_date desc, f.id desc
+           limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, v_rows;
+
+  return json_build_object('invoices', v_rows, 'total', total, 'page', pg, 'pageSize', page_size,
+                           'today', private.today());
+end $$;
+
+-- Record that the invoice was emailed (after the manager sent it from their own mailbox).
+create or replace function public.mark_invoice_sent(p_id bigint, p_to text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  inv public.invoices;
+begin
+  select * into inv from public.invoices where id = p_id;
+  if inv.id is null then
+    raise exception 'Invoice not found' using errcode = 'P0002';
+  end if;
+  if inv.status = 'cancelled' then
+    raise exception 'This invoice is cancelled' using errcode = '22023';
+  end if;
+  update public.invoices set status = case when status = 'draft' then 'sent' else status end,
+    sent_at = now(), sent_to = left(nullif(btrim(p_to), ''), 500), updated_at = now()
+  where id = p_id;
+  if inv.task_id is not null then
+    insert into public.task_updates (task_id, user_id, kind, body)
+    values (inv.task_id, me.id, 'comment',
+            format('Sent %s %s to %s', case inv.kind when 'tax' then 'tax invoice' else 'proforma invoice' end,
+                   inv.number, coalesce(nullif(btrim(p_to), ''), 'the customer')));
+  end if;
+end $$;
+
+create or replace function public.set_invoice_paid(p_id bigint, p_paid boolean) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  inv public.invoices;
+begin
+  select * into inv from public.invoices where id = p_id;
+  if inv.id is null then
+    raise exception 'Invoice not found' using errcode = 'P0002';
+  end if;
+  if inv.status = 'cancelled' then
+    raise exception 'This invoice is cancelled' using errcode = '22023';
+  end if;
+  if p_paid then
+    update public.invoices set status = 'paid', paid_at = now(), updated_at = now() where id = p_id;
+  else
+    update public.invoices set status = case when sent_at is null then 'draft' else 'sent' end,
+      paid_at = null, updated_at = now() where id = p_id;
+  end if;
+end $$;
+
+-- Invoices are never deleted (their numbers must stay in sequence); they are cancelled instead.
+create or replace function public.cancel_invoice(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  update public.invoices set status = 'cancelled', cancelled_at = now(), updated_at = now()
+  where id = p_id and status <> 'cancelled';
+  if not found and not exists (select 1 from public.invoices where id = p_id) then
+    raise exception 'Invoice not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- -------------------------------------------------------------------------------------
 -- Who may call what: signed-in users only. Helpers are not callable from the API at all.
 -- -------------------------------------------------------------------------------------
 
@@ -1055,7 +1498,15 @@ begin
     'public.delete_task(bigint)',
     'public.customer_options()',
     'public.list_work_types()',
-    'public.save_work_type(bigint, text, boolean)'
+    'public.save_work_type(bigint, text, boolean)',
+    'public.get_company_settings()',
+    'public.save_company_settings(jsonb)',
+    'public.save_invoice(bigint, jsonb)',
+    'public.get_invoice(bigint)',
+    'public.list_invoices(text, text, text, int)',
+    'public.mark_invoice_sent(bigint, text)',
+    'public.set_invoice_paid(bigint, boolean)',
+    'public.cancel_invoice(bigint)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);

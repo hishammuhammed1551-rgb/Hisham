@@ -224,6 +224,7 @@ test('tasks: a manager assigns work, the team member updates it', { skip: !playw
   await admin.fill('[name=due_date]', '2020-01-15');
   await admin.selectOption('[name=priority]', 'urgent');
   await admin.fill('[name=description]', 'BL no. MEDU123456. Customer sends invoice + packing list.');
+  await admin.uncheck('[name=make_proforma]');
   await admin.click('button:text("Create task")');
   await admin.waitForSelector('text=Assigned to Sami Staff');
   assert.ok(await admin.isVisible('text=Overdue · 15 Jan 2020'));
@@ -265,5 +266,104 @@ test('tasks: a manager assigns work, the team member updates it', { skip: !playw
     await admin.waitForSelector('h2:text("My tasks")');
     await admin.screenshot({ path: `${SHOTS}/dashboard-tasks.png` });
   }
+  assert.deepEqual(errors, []);
+});
+
+test('invoices: proforma when the task is created, tax invoice when it is done', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await admin.context().route('https://mail.google.com/**', route => route.fulfill({ contentType: 'text/html', body: 'gmail' }));
+  await signIn(admin, 'admin@lowcaps.test');
+
+  // Company details (with TRN) for the invoices
+  await admin.goto(base + '#/settings');
+  await admin.fill('[name=legal_name]', 'Lowcaps Logistics LLC');
+  await admin.fill('[name=address]', 'Office 4, Port Road\nKhor Fakkan, Sharjah, UAE');
+  await admin.fill('[name=phone]', '+971 9 000 0000');
+  await admin.fill('[name=trn]', '100111222333444');
+  await admin.fill('[name=bank_name]', 'Example Bank');
+  await admin.fill('[name=account_name]', 'Lowcaps Logistics LLC');
+  await admin.fill('[name=iban]', 'AE07 0331 2345 6789 0123 456');
+  await admin.click('button:text("Save")');
+  await admin.waitForSelector('text=Company settings saved');
+
+  // New task for a customer -> straight on to the proforma
+  await admin.goto(base + '#/tasks/new');
+  await admin.fill('[name=title]', 'Import 1x40ft MSCU7654321');
+  await admin.selectOption('[name=customer_id]', { label: 'Gulf Traders LLC' });
+  await admin.selectOption('[name=work_type_id]', { label: 'Sea freight' });
+  assert.equal(await admin.isChecked('[name=make_proforma]'), true);
+  await admin.click('button:text("Create task")');
+  await admin.waitForSelector('h1:text("New proforma invoice")');
+  assert.equal(await admin.inputValue('.l-desc'), 'Sea freight: Import 1x40ft MSCU7654321');
+  await admin.selectOption('.l-vat', 'zero');
+  await admin.fill('.l-price', '2500');
+  await admin.click('button:text("+ Add line")');
+  await admin.locator('.l-desc').nth(1).fill('Customs clearance fee');
+  await admin.locator('.l-price').nth(1).fill('350');
+  await admin.waitForSelector('.inv-form-totals dd.grand:text("AED 2,867.50")');
+  await admin.click('button:text("Create proforma invoice")');
+  await admin.waitForSelector('.inv-title:text("PROFORMA INVOICE")');
+  const proNumber = await admin.textContent('h1');
+  assert.match(proNumber, /^PRO-\d{4}-0001$/);
+  assert.ok(await admin.isVisible('.inv-billto >> text=Gulf Traders LLC'));
+  assert.ok(await admin.isVisible('.inv-totals dd.grand:text("AED 2,867.50")'));
+
+  // PDF download
+  const [pdf] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text("PDF")')]);
+  assert.equal(pdf.suggestedFilename(), `${proNumber}.pdf`);
+  const bytes = fs.readFileSync(await pdf.path());
+  assert.equal(bytes.subarray(0, 5).toString(), '%PDF-');
+  assert.ok(bytes.length > 3000);
+  assert.match(bytes.toString('latin1'), /PROFORMA INVOICE/);
+
+  // Email: Gmail opens pre-filled, then mark as sent
+  await admin.click('button:text("Email to customer")');
+  assert.equal(await admin.inputValue('dialog [name=to]'), 'ops@gulftraders.ae');
+  assert.match(await admin.inputValue('dialog [name=body]'), /Total: AED 2,867\.50 \(including VAT of AED 17\.50\)/);
+  const [gmail] = await Promise.all([admin.context().waitForEvent('page'), admin.click('dialog button:text("Open in Gmail")')]);
+  const gmailUrl = new URL(gmail.url());
+  assert.equal(gmailUrl.searchParams.get('to'), 'ops@gulftraders.ae');
+  assert.equal(gmailUrl.searchParams.get('su'), `Proforma Invoice ${proNumber} from Lowcaps Logistics LLC`);
+  await gmail.close();
+  await admin.click('dialog button:text("I\'ve sent it")');
+  await admin.waitForSelector('.crumbs .badge:text("Sent")');
+  assert.equal(await admin.isVisible('a:text("Edit")'), false, 'sent invoices cannot be edited');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/proforma.png`, fullPage: true });
+
+  // Finish the task -> create the tax invoice from the proforma
+  await admin.click('.crumbs a');
+  await admin.waitForSelector('h2:text("Invoices")');
+  await admin.click('button:text("✓ Mark as complete")');
+  await admin.waitForSelector('text=This task is complete. Send the customer the final tax invoice.');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/task-invoices.png`, fullPage: true });
+  await admin.click('.notice a:text("Create tax invoice")');
+  await admin.waitForSelector('h1:text("New tax invoice")');
+  assert.equal(await admin.locator('.l-desc').count(), 2, 'charges copied from the proforma');
+  await admin.locator('.l-price').nth(1).fill('400');
+  await admin.click('button:text("+ Add line")');
+  await admin.locator('.l-desc').nth(2).fill('Customs duty paid on your behalf');
+  await admin.locator('.l-price').nth(2).fill('1200');
+  await admin.locator('.l-vat').nth(2).selectOption('out_of_scope');
+  await admin.waitForSelector('.inv-form-totals dd.grand:text("AED 4,120.00")');
+  await admin.click('button:text("Create tax invoice")');
+  await admin.waitForSelector('.inv-title:text("TAX INVOICE")');
+  assert.match(await admin.textContent('h1'), /^INV-\d{4}-0001$/);
+  assert.ok(await admin.isVisible(`.inv-meta dd:text("${proNumber}")`), 'refers to the proforma');
+  assert.ok(await admin.isVisible('.inv-head >> text=TRN: 100111222333444'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/tax-invoice.png`, fullPage: true });
+  await admin.click('button:text("Email to customer")');
+  await admin.click('dialog button:text("I\'ve sent it")');
+  await admin.click('button:text("Mark as paid")');
+  await admin.waitForSelector('.crumbs .badge:text("Paid")');
+
+  // Invoices list and dashboard
+  await admin.goto(base + '#/invoices');
+  await admin.waitForSelector('td .badge:text("Paid")');
+  assert.equal(await admin.locator('tbody tr').count(), 2);
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/invoices.png` });
+  await admin.goto(base + '#/');
+  await admin.waitForSelector('h2:text("Ready to invoice")');
+  assert.ok(await admin.isVisible('text=Every finished task has a tax invoice.'));
   assert.deepEqual(errors, []);
 });

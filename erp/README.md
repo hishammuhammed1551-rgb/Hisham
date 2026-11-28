@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.3 has Customers (CRM) and Tasks**; quotes/invoicing and expenses are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.4 has Customers (CRM), Tasks and Invoices**; expenses and reports are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -13,6 +13,12 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - **Manager:** everything a team member can do, plus creating, assigning, editing and deleting tasks, managing the **Types of work** list, and deleting customers.
   - **Administrator:** everything, plus managing users.
 - **Tasks.** A manager creates a task (title, customer, type of work, description, due date, priority) and assigns it to someone. It moves through New → In progress → Waiting → Done (or Cancelled), with a history of comments, status changes and re-assignments. Tasks show on a Tasks page (filter by status, person, type of work), on each customer's page, and as **My tasks** on the dashboard.
+- **Invoices.** When a manager creates a task for a customer, the ERP goes straight on to a **proforma invoice** (`PRO-2026-0001`). When the task is marked complete, its page and the dashboard prompt for the final **tax invoice** (`INV-2026-0001`), pre-filled from the proforma's charges.
+  - Each charge line is 5% VAT, 0% (zero-rated, e.g. international transport), exempt, or no VAT (disbursements such as customs duty paid on the customer's behalf). Totals and VAT are calculated in the database.
+  - Invoices are downloaded as PDF (built in the browser) and emailed from your own mailbox: **Email to customer** opens Gmail or your email app with the customer's address, subject and message filled in; attach the PDF, send, then click **I've sent it**.
+  - Status: Draft → Sent → Paid, or Cancelled. Sent invoices can't be edited; cancel and re-issue instead. Numbers are never reused and restart each year.
+  - Lowcaps' name, address, TRN and bank details come from **Company settings** (admins) and are copied onto each invoice when it's saved. Tax invoices can't be created until the TRN is filled in.
+  - Managers and admins create and send invoices; team members can view them.
 - **Customers.** Company or individual, status (lead / active / inactive), UAE TRN (checked as 15 digits), contact details, address, how they found Lowcaps, which services they want (shipping, clearing, customs), notes, and the staff member who owns the account.
 - **Contacts.** Several people per customer, one marked as the main contact.
 - **Activity log.** Notes, calls, meetings and emails on each customer, plus follow-ups with a due date that can be marked done.
@@ -27,7 +33,7 @@ Deleting a customer also deletes its contacts and activity log; its tasks are ke
 erp/
   index.html, app.css, app.js   # the ERP pages (plain HTML/CSS/JS, same brand colours as the website)
   config.js                     # your Supabase project URL and public key
-  vendor/                       # the Supabase browser library (kept here, no CDN needed)
+  vendor/                       # Supabase, jsPDF and jspdf-autotable browser builds (kept here, no CDN needed)
   supabase/schema.sql           # the whole database: tables, rules and permissions
   dev/                          # local test setup (not needed to run the ERP)
 ```

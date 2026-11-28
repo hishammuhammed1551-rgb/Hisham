@@ -39,6 +39,8 @@ const ICONS = {
   box: '<path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z"/><path d="M3 7.5 12 12l9-4.5M12 12v9"/>',
   invoice: '<path d="M6 3h12v18l-3-2-3 2-3-2-3 2z"/><path d="M9 8h6M9 12h6"/>',
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
+  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
+  download: '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
   note: '<path d="M5 3h10l4 4v14H5z"/><path d="M9 11h6M9 15h6"/>',
   call: '<path d="M5 3h4l2 5-2.5 1.5a11 11 0 0 0 6 6L16 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 5a2 2 0 0 1 2-2z"/>',
@@ -66,6 +68,19 @@ const ROLE_LABEL = { admin: 'Administrator', manager: 'Manager', staff: 'Team me
 const ROLE_OPTIONS = [['staff', 'Team member'], ['manager', 'Manager'], ['admin', 'Administrator']];
 const TASK_STATUS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', done: 'Done', cancelled: 'Cancelled' };
 const PRIORITY = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
+const INVOICE_KIND = { proforma: 'Proforma invoice', tax: 'Tax invoice' };
+const INVOICE_STATUS = { draft: 'Draft', sent: 'Sent', paid: 'Paid', cancelled: 'Cancelled' };
+const VAT_CODES = { standard: '5% VAT', zero: '0% (zero-rated)', exempt: 'Exempt', out_of_scope: 'No VAT (disbursement)' };
+const invoiceBadge = st => h('span', { class: `badge inv-${st}` }, INVOICE_STATUS[st] || st);
+const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const amount = n => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const money = n => `AED ${amount(n)}`;
+const localToday = () => new Date().toLocaleDateString('en-CA');
+const addDays = (ymd, days) => {
+  const d = new Date(ymd + 'T00:00:00');
+  d.setDate(d.getDate() + Number(days || 0));
+  return d.toLocaleDateString('en-CA');
+};
 const UPDATE_ICON = { created: 'note', comment: 'note', status: 'task', assigned: 'users' };
 const isManager = () => ['admin', 'manager'].includes(state.user?.role);
 const isOpenTask = status => ['new', 'in_progress', 'waiting'].includes(status);
@@ -243,12 +258,13 @@ function layout(active, ...content) {
         link('#/', 'home', 'Dashboard', 'dashboard'),
         link('#/customers', 'users', 'Customers', 'customers'),
         link('#/tasks', 'task', 'Tasks', 'tasks'),
+        link('#/invoices', 'invoice', 'Invoices', 'invoices'),
         h('div', { class: 'nav-heading' }, 'Next modules'),
-        soon('invoice', 'Quotes & invoices'),
         soon('chart', 'Expenses & reports'),
         isManager() && h('div', { class: 'nav-heading' }, 'Manage'),
         isManager() && link('#/work-types', 'tag', 'Types of work', 'work-types'),
-        isAdmin && link('#/users', 'key', 'Users', 'users')),
+        isAdmin && link('#/users', 'key', 'Users', 'users'),
+        isAdmin && link('#/settings', 'gear', 'Company settings', 'settings')),
       h('div', { class: 'sidebar-user' },
         h('strong', {}, state.user.name),
         h('span', { class: 'muted' }, ROLE_LABEL[state.user.role] || state.user.role),
@@ -423,6 +439,18 @@ async function viewDashboard() {
             : h('p', { class: 'empty' }, 'No open tasks assigned to you.'),
           isManager() && d.unassignedTasks > 0 && h('p', { class: 'notice notice-inline' },
             h('a', { href: '#/tasks?assignee=none' }, `${d.unassignedTasks} open task${d.unassignedTasks > 1 ? 's have' : ' has'} no one assigned`))),
+        isManager() && h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Ready to invoice'),
+            d.unpaid.count > 0 && h('a', { class: 'btn btn-secondary btn-sm', href: '#/invoices?status=unpaid' },
+              `Unpaid: ${money(d.unpaid.total)}`)),
+          d.toInvoice.length
+            ? h('ul', { class: 'list' }, d.toInvoice.map(t => h('li', {},
+                h('span', { class: 'kind-icon' }, icon('invoice')),
+                h('div', { class: 'grow' },
+                  h('a', { class: 'row-link', href: `#/tasks/${t.id}` }, t.title),
+                  h('div', { class: 'meta' }, `${t.customer_name}${t.completed_at ? ' · done ' + fmtDate(t.completed_at) : ''}`)),
+                h('a', { class: 'btn btn-primary btn-sm', href: `#/invoices/new?kind=tax&task=${t.id}` }, 'Create tax invoice'))))
+            : h('p', { class: 'empty' }, 'Every finished task has a tax invoice.')),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', {}, 'Overdue follow-ups'),
             d.overdue.length > 0 && h('span', { class: 'badge badge-overdue' }, d.overdue.length)),
@@ -764,7 +792,17 @@ async function viewCustomer(id) {
           h('dl', { class: 'facts' }, facts.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
           c.notes && [h('h3', { class: 'notes-heading' }, 'Notes'), h('p', { class: 'prewrap' }, c.notes)]),
         contacts,
-        tasksCard),
+        tasksCard,
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Invoices'),
+            isManager() && h('a', { class: 'btn btn-secondary btn-sm', href: `#/invoices/new?kind=proforma&customer=${id}` }, '+ Proforma')),
+          c.invoices.length
+            ? h('ul', { class: 'list' }, c.invoices.map(i => h('li', {},
+                h('div', { class: 'grow' },
+                  h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number),
+                  h('div', { class: 'meta' }, `${INVOICE_KIND[i.kind]} · ${fmtDate(i.issue_date)}`)),
+                h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), invoiceBadge(i.status)))))
+            : h('p', { class: 'empty' }, 'No invoices yet.'))),
       activity));
 }
 
@@ -858,6 +896,8 @@ function taskForm(t, opts, onSubmit, cancelHref) {
         placeholder: 'What needs doing, documents, references (BL / AWB / container no.)…' }), { full: true })),
     h('div', { class: 'btn-row' },
       h('button', { class: 'btn btn-primary', type: 'submit' }, t.id ? 'Save changes' : 'Create task'),
+      !t.id && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'make_proforma', checked: true }),
+        'Then create a proforma invoice for the customer'),
       h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
   onSubmit);
 }
@@ -869,9 +909,11 @@ async function viewTaskNew(params) {
   return layout('tasks',
     pageHead('New task', null, null, h('a', { href: customerId ? `#/customers/${customerId}` : '#/tasks' }, '← Back')),
     h('section', { class: 'card' }, taskForm({ customer_id: customerId }, opts, async data => {
+      const makeProforma = data.make_proforma && data.customer_id;
+      delete data.make_proforma;
       const id = await rpc('save_task', { p_id: null, p_data: data });
       toast('Task created');
-      location.hash = `#/tasks/${id}`;
+      location.hash = makeProforma ? `#/invoices/new?kind=proforma&task=${id}` : `#/tasks/${id}`;
     }, customerId ? `#/customers/${customerId}` : '#/tasks')));
 }
 
@@ -908,7 +950,19 @@ async function viewTask(id) {
       ? handleForm(h('form', { class: 'form' },
           field('Move to', select('status', t.status, Object.entries(TASK_STATUS))),
           field('Note (optional)', textarea('note', '', { rows: 2, maxlength: 5000, placeholder: 'e.g. Waiting for the customer to send the BL' })),
-          h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Update status'))),
+          h('div', { class: 'btn-row' },
+            h('button', { class: 'btn btn-primary', type: 'submit' }, 'Update status'),
+            isOpenTask(t.status) && h('button', {
+              class: 'btn btn-secondary', type: 'button',
+              onclick: async e => {
+                const note = e.currentTarget.form.elements.note.value.trim();
+                try {
+                  await rpc('update_task_status', { p_id: id, p_status: 'done', p_note: note || null });
+                  toast('Task completed');
+                  refresh();
+                } catch (err) { toast(err.message, true); }
+              },
+            }, '✓ Mark as complete'))),
         async data => {
           if (data.status === t.status && !data.note.trim()) return;
           if (data.status === t.status) {
@@ -921,6 +975,23 @@ async function viewTask(id) {
         })
       : h('p', { class: 'muted' },
           `Only ${t.assignee_name || 'the person this task is assigned to'} or a manager can change the status. You can still add a comment.`));
+
+  const activeTax = t.invoices.find(i => i.kind === 'tax' && i.status !== 'cancelled');
+  const invoicesCard = h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', {}, 'Invoices'),
+      isManager() && t.customer_id && h('div', { class: 'btn-row' },
+        h('a', { class: 'btn btn-secondary btn-sm', href: `#/invoices/new?kind=proforma&task=${id}` }, '+ Proforma'),
+        h('a', { class: 'btn btn-secondary btn-sm', href: `#/invoices/new?kind=tax&task=${id}` }, '+ Tax invoice'))),
+    isManager() && t.status === 'done' && t.customer_id && !activeTax && h('div', { class: 'notice' },
+      h('p', {}, 'This task is complete. Send the customer the final tax invoice.'),
+      h('a', { class: 'btn btn-primary btn-sm', href: `#/invoices/new?kind=tax&task=${id}` }, 'Create tax invoice')),
+    t.invoices.length
+      ? h('ul', { class: 'list' }, t.invoices.map(i => h('li', {},
+          h('div', { class: 'grow' },
+            h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number),
+            h('div', { class: 'meta' }, `${INVOICE_KIND[i.kind]} · ${fmtDate(i.issue_date)}`)),
+          h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), invoiceBadge(i.status)))))
+      : h('p', { class: 'empty' }, t.customer_id ? 'No invoices yet.' : 'Link a customer to this task (Edit) to invoice it.'));
 
   const commentForm = handleForm(h('form', { class: 'form' },
     field('Add a comment', textarea('body', '', { rows: 3, required: true, maxlength: 5000, placeholder: 'Progress, questions, document numbers…' })),
@@ -961,7 +1032,8 @@ async function viewTask(id) {
           h('div', { class: 'card-head' }, h('h2', {}, 'Details')),
           h('dl', { class: 'facts' }, facts.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
           t.description && [h('h3', { class: 'notes-heading' }, 'Description'), h('p', { class: 'prewrap' }, t.description)]),
-        statusCard),
+        statusCard,
+        invoicesCard),
       h('section', { class: 'card' },
         h('div', { class: 'card-head' }, h('h2', {}, 'Updates')),
         commentForm,
@@ -1010,6 +1082,533 @@ async function viewWorkTypes() {
         h('td', {}, w.open_tasks),
         h('td', {}, w.active ? h('span', { class: 'badge badge-active' }, 'In use') : h('span', { class: 'badge badge-inactive' }, 'Switched off')),
         h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => workTypeDialog(w, refresh) }, 'Edit')))))))));
+}
+
+// ---------- invoices ----------
+
+async function viewInvoices(params) {
+  const query = new URLSearchParams(params);
+  const data = await rpc('list_invoices', {
+    p_q: query.get('q') || null, p_kind: query.get('kind') || null, p_status: query.get('status') || null,
+    p_page: Number(query.get('page')) || 1,
+  });
+  const setParam = (key, value) => {
+    const q = new URLSearchParams(params);
+    if (value) q.set(key, value); else q.delete(key);
+    if (key !== 'page') q.delete('page');
+    location.hash = '#/invoices' + (q.toString() ? '?' + q : '');
+  };
+  let searchTimer;
+  const filterBar = h('div', { class: 'filters' },
+    input('q', query.get('q'), {
+      type: 'search', placeholder: 'Search number, customer or task…', 'aria-label': 'Search invoices',
+      oninput: e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => setParam('q', e.target.value.trim()), 350); },
+    }),
+    select('kind', query.get('kind'), [['', 'All invoices'], ['proforma', 'Proforma invoices'], ['tax', 'Tax invoices']],
+      { 'aria-label': 'Type', onchange: e => setParam('kind', e.target.value) }),
+    select('status', query.get('status'), [['', 'Any status'], ['draft', 'Draft'], ['sent', 'Sent'],
+      ['unpaid', 'Sent, not paid'], ['paid', 'Paid'], ['cancelled', 'Cancelled']],
+      { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value) }));
+
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  const table = data.invoices.length
+    ? h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {},
+          h('th', {}, 'Number'), h('th', { class: 'hide-sm' }, 'Type'), h('th', {}, 'Customer'),
+          h('th', { class: 'hide-sm' }, 'Task'), h('th', { class: 'hide-sm' }, 'Date'),
+          h('th', { class: 'num' }, 'Total'), h('th', {}, 'Status'))),
+        h('tbody', {}, data.invoices.map(i => h('tr', {},
+          h('td', {}, h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number)),
+          h('td', { class: 'hide-sm' }, INVOICE_KIND[i.kind]),
+          h('td', {}, i.customer_name),
+          h('td', { class: 'hide-sm' }, i.task_id ? h('a', { href: `#/tasks/${i.task_id}` }, i.task_title) : h('span', { class: 'muted' }, '—')),
+          h('td', { class: 'hide-sm' }, fmtDate(i.issue_date)),
+          h('td', { class: 'num' }, money(i.total)),
+          h('td', {}, invoiceBadge(i.status)))))))
+    : h('p', { class: 'empty' }, [...query.keys()].length ? 'No invoices match these filters.'
+        : 'No invoices yet. They are created from a task (or "+ New proforma").');
+
+  return layout('invoices',
+    pageHead('Invoices', `${data.total} invoice${data.total === 1 ? '' : 's'}`,
+      isManager() && h('a', { class: 'btn btn-primary', href: '#/invoices/new?kind=proforma' }, '+ New proforma')),
+    h('section', { class: 'card' },
+      filterBar,
+      table,
+      data.total > data.pageSize && h('div', { class: 'pager' },
+        h('span', { class: 'muted' }, `Page ${data.page} of ${pages}`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
+/** The form for a draft invoice: customer, dates, charge lines with live VAT totals. */
+function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
+  const tbody = h('tbody', {});
+  const totals = h('dl', { class: 'inv-form-totals' });
+
+  const recalc = () => {
+    let net = 0;
+    let vat = 0;
+    for (const row of tbody.rows) {
+      const lineNet = round2(Number(row.querySelector('.l-qty').value) * Number(row.querySelector('.l-price').value));
+      const lineVat = row.querySelector('.l-vat').value === 'standard' ? round2(lineNet * 0.05) : 0;
+      row.querySelector('.l-amount').textContent = Number.isFinite(lineNet) ? amount(lineNet) : '—';
+      net += Number.isFinite(lineNet) ? lineNet : 0;
+      vat += lineVat || 0;
+    }
+    totals.replaceChildren(
+      h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(net)),
+      h('dt', {}, 'VAT 5%'), h('dd', {}, money(vat)),
+      h('dt', { class: 'grand' }, 'Total'), h('dd', { class: 'grand' }, money(round2(net + vat))));
+  };
+
+  const addLine = (l = {}) => {
+    const row = h('tr', {},
+      h('td', {}, h('input', { class: 'l-desc', value: l.description ?? '', required: true, maxlength: 500,
+        'aria-label': 'Description', placeholder: 'e.g. Customs clearance fee' })),
+      h('td', {}, h('input', { class: 'l-qty', type: 'number', min: '0.001', step: '0.001', value: l.quantity ?? 1,
+        required: true, 'aria-label': 'Quantity', oninput: recalc })),
+      h('td', {}, h('input', { class: 'l-price', type: 'number', min: '0', step: '0.01', value: l.unit_price ?? '',
+        required: true, 'aria-label': 'Unit price in AED', placeholder: '0.00', oninput: recalc })),
+      h('td', {}, select('', l.vat_code || 'standard', Object.entries(VAT_CODES), { class: 'l-vat', 'aria-label': 'VAT', onchange: recalc })),
+      h('td', { class: 'num l-amount' }),
+      h('td', {}, h('button', {
+        class: 'btn btn-danger btn-sm', type: 'button', 'aria-label': 'Remove line',
+        onclick: () => { if (tbody.rows.length > 1) { row.remove(); recalc(); } },
+      }, '×')));
+    tbody.append(row);
+    recalc();
+  };
+  (inv.lines && inv.lines.length ? inv.lines : [{}]).forEach(addLine);
+
+  const customerOptions = [['', 'Pick a customer…'], ...customers.map(c => [String(c.id), c.name])];
+  return handleForm(h('form', { class: 'form' },
+    h('input', { type: 'hidden', name: 'task_id', value: inv.task_id ?? '' }),
+    h('input', { type: 'hidden', name: 'proforma_id', value: inv.proforma_id ?? '' }),
+    h('div', { class: 'form-grid' },
+      field('Customer', select('customer_id', inv.customer_id ? String(inv.customer_id) : '', customerOptions, { required: true }), { full: true }),
+      field('Invoice date', input('issue_date', inv.issue_date, { type: 'date', required: true })),
+      field(kind === 'tax' ? 'Payment due' : 'Valid until', input('due_date', inv.due_date, { type: 'date' })),
+      kind === 'tax' && field('Date of supply', input('supply_date', inv.supply_date, { type: 'date' }),
+        { hint: 'When the work was done, if different from the invoice date.' })),
+    h('div', { class: 'field', 'data-field': 'lines' },
+      h('label', {}, 'Charges (AED)'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'inv-edit' },
+        h('thead', {}, h('tr', {},
+          h('th', {}, 'Description'), h('th', {}, 'Qty'), h('th', {}, 'Unit price'), h('th', {}, 'VAT'),
+          h('th', { class: 'num' }, 'Amount'), h('th', {}, ''))),
+        tbody)),
+      h('div', { class: 'inv-edit-foot' },
+        h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => addLine() }, '+ Add line'),
+        totals),
+      h('div', { class: 'hint' },
+        'Use 0% for international transport, and "No VAT (disbursement)" for costs paid on the customer\'s behalf, such as customs duty.')),
+    field('Notes on the invoice (optional)', textarea('notes', inv.notes, { rows: 2, maxlength: 2000,
+      placeholder: 'e.g. BL no. MEDU123456, container MSKU1234567' })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, inv.id ? 'Save changes' : `Create ${INVOICE_KIND[kind].toLowerCase()}`),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  data => {
+    data.kind = kind;
+    data.lines = [...tbody.rows].map(row => ({
+      description: row.querySelector('.l-desc').value,
+      quantity: row.querySelector('.l-qty').value,
+      unit_price: row.querySelector('.l-price').value,
+      vat_code: row.querySelector('.l-vat').value,
+    }));
+    return onSubmit(data);
+  });
+}
+
+function missingTrnNotice(settings) {
+  return h('p', { class: 'notice' },
+    'Tax invoices must show Lowcaps\' TRN. ',
+    state.user.role === 'admin'
+      ? h('a', { href: '#/settings' }, 'Add it under Company settings first.')
+      : 'Ask an administrator to add it under Company settings first.');
+}
+
+async function viewInvoiceNew(params) {
+  if (!isManager()) return viewNotFound();
+  const kind = params.kind === 'tax' ? 'tax' : 'proforma';
+  const taskId = Number(params.task) || null;
+  const [customers, settings, taskRes] = await Promise.all([
+    rpc('customer_options'), rpc('get_company_settings'), taskId ? rpc('get_task', { p_id: taskId }) : null]);
+  const task = taskRes && taskRes.task;
+
+  let lines = [];
+  let proformaId = null;
+  if (task && kind === 'tax') {
+    // Start the tax invoice from the latest proforma's charges, ready to adjust to the final amounts.
+    const pro = [...task.invoices].reverse().find(i => i.kind === 'proforma' && i.status !== 'cancelled');
+    if (pro) {
+      lines = (await rpc('get_invoice', { p_id: pro.id })).invoice.lines;
+      proformaId = pro.id;
+    }
+  }
+  if (task && !lines.length) {
+    lines = [{ description: task.work_type ? `${task.work_type}: ${task.title}` : task.title, quantity: 1, vat_code: 'standard' }];
+  }
+  const issue = localToday();
+  const inv = {
+    task_id: taskId, proforma_id: proformaId, lines, issue_date: issue,
+    customer_id: (task && task.customer_id) || Number(params.customer) || null,
+    due_date: kind === 'tax' ? addDays(issue, settings.payment_terms_days) : addDays(issue, 7),
+    supply_date: kind === 'tax' ? (task && task.completed_at ? new Date(task.completed_at).toLocaleDateString('en-CA') : issue) : null,
+  };
+  const back = taskId ? `#/tasks/${taskId}` : '#/invoices';
+  return layout('invoices',
+    pageHead(`New ${INVOICE_KIND[kind].toLowerCase()}`,
+      task ? `For task: ${task.title}${proformaId ? ' · charges copied from the proforma, adjust them to the final amounts' : ''}`
+        : 'The invoice number is given when you save.',
+      null, h('a', { href: back }, '← Back')),
+    kind === 'tax' && !settings.trn && missingTrnNotice(settings),
+    h('section', { class: 'card' }, invoiceForm(inv, kind, customers, async data => {
+      const id = await rpc('save_invoice', { p_id: null, p_data: data });
+      toast(`${INVOICE_KIND[kind]} created`);
+      location.hash = `#/invoices/${id}`;
+    }, back)));
+}
+
+async function viewInvoiceEdit(id) {
+  if (!isManager()) return viewNotFound();
+  const [{ invoice: inv }, customers] = await Promise.all([rpc('get_invoice', { p_id: id }), rpc('customer_options')]);
+  if (inv.status !== 'draft') {
+    return layout('invoices', pageHead(`${inv.number} can't be edited`, null, null, h('a', { href: `#/invoices/${id}` }, '← Back')),
+      h('section', { class: 'card' }, h('p', {}, 'Only draft invoices can be changed. To correct a sent invoice, cancel it and create a new one.')));
+  }
+  return layout('invoices',
+    pageHead(`Edit ${inv.number}`, INVOICE_KIND[inv.kind], null, h('a', { href: `#/invoices/${id}` }, '← Back')),
+    h('section', { class: 'card' }, invoiceForm(inv, inv.kind, customers, async data => {
+      await rpc('save_invoice', { p_id: id, p_data: data });
+      toast('Invoice saved');
+      location.hash = `#/invoices/${id}`;
+    }, `#/invoices/${id}`)));
+}
+
+const VAT_SHORT = { standard: '5%', zero: '0%', exempt: 'Exempt', out_of_scope: 'Out of scope' };
+const qtyText = q => Number(q).toLocaleString('en-US', { maximumFractionDigits: 3 });
+
+function supplierLines(sup) {
+  return [...String(sup.address || '').split('\n'), [sup.phone, sup.email].filter(Boolean).join(' · '),
+    sup.trn && `TRN: ${sup.trn}`].filter(Boolean);
+}
+
+function paymentLines(sup) {
+  return [sup.account_name && `Account name: ${sup.account_name}`, sup.bank_name && `Bank: ${sup.bank_name}`,
+    sup.iban && `IBAN: ${sup.iban}`, sup.swift && `SWIFT: ${sup.swift}`].filter(Boolean);
+}
+
+const PROFORMA_NOTE = 'This proforma invoice is not a tax invoice. A tax invoice will be issued when the work is completed.';
+
+/** On-screen version of the invoice, laid out like the PDF. */
+function invoiceDocument(inv) {
+  const sup = inv.supplier || {};
+  const meta = [
+    ['Invoice no.', inv.number], ['Date', fmtDate(inv.issue_date)],
+    inv.supply_date && ['Date of supply', fmtDate(inv.supply_date)],
+    inv.due_date && [inv.kind === 'tax' ? 'Payment due' : 'Valid until', fmtDate(inv.due_date)],
+    inv.proforma_number && ['Proforma ref.', inv.proforma_number],
+  ].filter(Boolean);
+  const pay = paymentLines(sup);
+  return h('article', { class: 'inv-doc', 'aria-label': `${INVOICE_KIND[inv.kind]} ${inv.number}` },
+    h('header', { class: 'inv-head' },
+      h('div', {},
+        h('div', { class: 'inv-supplier' }, sup.legal_name || 'Lowcaps'),
+        supplierLines(sup).map(l => h('div', { class: 'muted' }, l))),
+      h('div', { class: 'inv-title-block' },
+        h('div', { class: 'inv-title' }, inv.kind === 'tax' ? 'TAX INVOICE' : 'PROFORMA INVOICE'),
+        h('dl', { class: 'inv-meta' }, meta.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])))),
+    h('section', { class: 'inv-billto' },
+      h('div', { class: 'inv-label' }, 'Bill to'),
+      h('strong', {}, inv.customer_name),
+      inv.customer_address && h('div', { class: 'prewrap' }, inv.customer_address),
+      inv.customer_trn && h('div', {}, `TRN: ${inv.customer_trn}`)),
+    h('div', { class: 'table-wrap' }, h('table', { class: 'inv-lines' },
+      h('thead', {}, h('tr', {},
+        h('th', {}, '#'), h('th', {}, 'Description'), h('th', { class: 'num' }, 'Qty'), h('th', { class: 'num' }, 'Unit price'),
+        h('th', {}, 'VAT'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'VAT (AED)'))),
+      h('tbody', {}, inv.lines.map((l, i) => h('tr', {},
+        h('td', {}, i + 1), h('td', { class: 'prewrap' }, l.description), h('td', { class: 'num' }, qtyText(l.quantity)),
+        h('td', { class: 'num' }, amount(l.unit_price)), h('td', {}, VAT_SHORT[l.vat_code]),
+        h('td', { class: 'num' }, amount(l.net)), h('td', { class: 'num' }, amount(l.vat))))))),
+    h('dl', { class: 'inv-totals' },
+      h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(inv.subtotal)),
+      h('dt', {}, 'VAT 5%'), h('dd', {}, money(inv.vat_total)),
+      h('dt', { class: 'grand' }, 'Total (AED)'), h('dd', { class: 'grand' }, money(inv.total))),
+    inv.notes && h('p', { class: 'prewrap' }, inv.notes),
+    pay.length > 0 && h('section', { class: 'inv-pay' }, h('div', { class: 'inv-label' }, 'Payment details'), pay.map(l => h('div', {}, l))),
+    sup.invoice_notes && h('p', { class: 'muted prewrap' }, sup.invoice_notes),
+    inv.kind === 'proforma' && h('p', { class: 'muted' }, PROFORMA_NOTE));
+}
+
+/** The standard PDF fonts only cover Western European characters; swap or drop anything else. */
+function pdfText(text) {
+  return String(text ?? '')
+    .replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, '-')
+    .replace(/→/g, '->').replace(/…/g, '...').replace(/[^\n\x20-\x7E\xA0-\xFF]/g, '?');
+}
+
+function buildInvoicePdf(inv) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const sup = inv.supplier || {};
+  const GREEN = [74, 122, 92];
+  const DARK = [28, 42, 34];
+  const GREY = [90, 107, 96];
+  const W = 210;
+  const M = 15;
+  const LH = 4.3;
+  const ensureSpace = (y, needed) => (y + needed > 280 ? (doc.addPage(), M + 5) : y);
+
+  // Supplier (left) and title + invoice details (right)
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(...GREEN);
+  doc.text(pdfText(sup.legal_name || 'Lowcaps'), M, M + 5);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...GREY);
+  const supLines = supplierLines(sup).map(pdfText);
+  supLines.forEach((l, i) => doc.text(l, M, M + 11 + i * LH));
+
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(...DARK);
+  doc.text(inv.kind === 'tax' ? 'TAX INVOICE' : 'PROFORMA INVOICE', W - M, M + 5, { align: 'right' });
+  const meta = [
+    ['Invoice no.', inv.number], ['Date', fmtDate(inv.issue_date)],
+    inv.supply_date && ['Date of supply', fmtDate(inv.supply_date)],
+    inv.due_date && [inv.kind === 'tax' ? 'Payment due' : 'Valid until', fmtDate(inv.due_date)],
+    inv.proforma_number && ['Proforma ref.', inv.proforma_number],
+  ].filter(Boolean);
+  doc.setFontSize(9);
+  meta.forEach(([k, v], i) => {
+    doc.setFont('helvetica', 'bold'); doc.setTextColor(...GREY); doc.text(`${k}:`, W - M - 32, M + 12 + i * 5, { align: 'right' });
+    doc.setFont('helvetica', 'normal'); doc.setTextColor(...DARK); doc.text(pdfText(v), W - M, M + 12 + i * 5, { align: 'right' });
+  });
+  let y = Math.max(M + 11 + supLines.length * LH, M + 12 + meta.length * 5) + 6;
+  doc.setDrawColor(219, 229, 222); doc.line(M, y, W - M, y);
+  y += 7;
+
+  // Bill to
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text('BILL TO', M, y);
+  doc.setFontSize(11); doc.setTextColor(...DARK); doc.text(pdfText(inv.customer_name), M, y + 5.5);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+  const billLines = [...String(inv.customer_address || '').split('\n'), inv.customer_trn && `TRN: ${inv.customer_trn}`].filter(Boolean).map(pdfText);
+  billLines.forEach((l, i) => doc.text(l, M, y + 10.5 + i * LH));
+  y += 10.5 + billLines.length * LH + 3;
+
+  // Charges
+  window.autoTable(doc, {
+    startY: y,
+    margin: { left: M, right: M },
+    head: [['#', 'Description', 'Qty', 'Unit price', 'VAT', 'Amount', 'VAT (AED)']],
+    body: inv.lines.map((l, i) => [i + 1, pdfText(l.description), qtyText(l.quantity), amount(l.unit_price),
+      VAT_SHORT[l.vat_code], amount(l.net), amount(l.vat)]),
+    styles: { font: 'helvetica', fontSize: 8.5, cellPadding: 2, textColor: DARK, lineColor: [219, 229, 222], lineWidth: 0.1 },
+    headStyles: { fillColor: GREEN, textColor: 255, fontStyle: 'bold' },
+    columnStyles: {
+      0: { cellWidth: 8 }, 2: { halign: 'right', cellWidth: 14 }, 3: { halign: 'right', cellWidth: 24 },
+      4: { cellWidth: 23 }, 5: { halign: 'right', cellWidth: 25 }, 6: { halign: 'right', cellWidth: 22 },
+    },
+    didParseCell: cell => {
+      if (cell.section === 'head' && [2, 3, 5, 6].includes(cell.column.index)) cell.cell.styles.halign = 'right';
+    },
+  });
+  y = ensureSpace(doc.lastAutoTable.finalY + 7, 24);
+
+  // Totals
+  const rows = [['Total excl. VAT', money(inv.subtotal)], ['VAT 5%', money(inv.vat_total)], ['Total (AED)', money(inv.total)]];
+  rows.forEach(([k, v], i) => {
+    const last = i === rows.length - 1;
+    doc.setFont('helvetica', last ? 'bold' : 'normal'); doc.setFontSize(last ? 11 : 9.5); doc.setTextColor(...DARK);
+    doc.text(k, W - M - 45, y + i * 6, { align: 'right' });
+    doc.text(v, W - M, y + i * 6, { align: 'right' });
+  });
+  y += rows.length * 6 + 6;
+
+  // Notes, payment details, footer text
+  const block = (title, lines) => {
+    if (!lines.length) return;
+    const wrapped = lines.flatMap(l => doc.splitTextToSize(pdfText(l), W - 2 * M));
+    y = ensureSpace(y, 6 + wrapped.length * LH);
+    if (title) {
+      doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(...GREY); doc.text(title.toUpperCase(), M, y);
+      y += 5;
+    }
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(...DARK);
+    wrapped.forEach(l => { doc.text(l, M, y); y += LH; });
+    y += 4;
+  };
+  block('Notes', inv.notes ? String(inv.notes).split('\n') : []);
+  block('Payment details', paymentLines(sup));
+  block('', sup.invoice_notes ? String(sup.invoice_notes).split('\n') : []);
+  if (inv.kind === 'proforma') block('', [PROFORMA_NOTE]);
+
+  const pages = doc.getNumberOfPages();
+  for (let p = 1; p <= pages; p++) {
+    doc.setPage(p);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(8); doc.setTextColor(...GREY);
+    doc.text(`${inv.number} · Page ${p} of ${pages}`, W - M, 290, { align: 'right' });
+  }
+  return doc;
+}
+
+function downloadInvoicePdf(inv) {
+  try {
+    buildInvoicePdf(inv).save(`${inv.number}.pdf`);
+  } catch (err) {
+    console.error(err);
+    toast('Could not create the PDF: ' + err.message, true);
+  }
+}
+
+function invoiceEmail(inv) {
+  const sup = inv.supplier || {};
+  const label = inv.kind === 'tax' ? 'Tax Invoice' : 'Proforma Invoice';
+  const about = inv.task_title ? ` for ${inv.task_title}` : '';
+  const pay = paymentLines(sup);
+  const body = [
+    `Dear ${inv.customer_name},`, '',
+    `Please find attached our ${label.toLowerCase()} ${inv.number}${about}.`, '',
+    `Total: ${money(inv.total)} (including VAT of ${money(inv.vat_total)})`,
+    inv.due_date ? `${inv.kind === 'tax' ? 'Payment due' : 'Valid until'}: ${fmtDate(inv.due_date)}` : null,
+    ...(pay.length ? ['', 'Payment details:', ...pay] : []),
+    '', 'Kind regards,', state.user.name, sup.legal_name, sup.phone,
+  ].filter(l => typeof l === 'string').join('\n');
+  return { subject: `${label} ${inv.number} from ${sup.legal_name || 'Lowcaps'}`, body };
+}
+
+/** "Prepare email" flow: download the PDF, open Gmail or the email app pre-filled, then record it as sent. */
+function emailDialog(inv, refresh) {
+  const draft = invoiceEmail(inv);
+  const to = input('to', inv.sent_to || inv.recipients[0] || '', { type: 'email', multiple: true, required: true, list: 'inv-recipients' });
+  const subject = input('subject', draft.subject, { maxlength: 300 });
+  const body = textarea('body', draft.body, { rows: 9 });
+  const enc = encodeURIComponent;
+  const addresses = () => to.value.split(',').map(a => a.trim()).filter(Boolean);
+  const needTo = () => {
+    if (addresses().length) return true;
+    to.reportValidity();
+    return false;
+  };
+  const dlg = openDialog(`Email ${inv.number} to the customer`, h('div', { class: 'form' },
+    h('datalist', { id: 'inv-recipients' }, inv.recipients.map(r => h('option', { value: r }))),
+    field('To', to, { hint: inv.recipients.length ? 'From the customer and its contacts. Separate several with commas.' : 'No email saved for this customer.' }),
+    field('Subject', subject),
+    field('Message', body),
+    h('ol', { class: 'steps' },
+      h('li', {}, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => downloadInvoicePdf(inv) },
+        icon('download'), `Download ${inv.number}.pdf`)),
+      h('li', {}, h('div', { class: 'btn-row' },
+        h('button', {
+          class: 'btn btn-secondary btn-sm', type: 'button',
+          onclick: () => {
+            if (!needTo()) return;
+            window.open(`https://mail.google.com/mail/?view=cm&fs=1&to=${enc(addresses().join(','))}&su=${enc(subject.value)}&body=${enc(body.value)}`,
+              '_blank', 'noopener');
+          },
+        }, 'Open in Gmail'),
+        h('button', {
+          class: 'btn btn-secondary btn-sm', type: 'button',
+          onclick: () => {
+            if (!needTo()) return;
+            location.href = `mailto:${addresses().map(enc).join(',')}?subject=${enc(subject.value)}&body=${enc(body.value)}`;
+          },
+        }, 'Open email app'),
+        h('button', {
+          class: 'btn btn-secondary btn-sm', type: 'button',
+          onclick: async () => {
+            try { await navigator.clipboard.writeText(body.value); toast('Message copied'); } catch { toast('Could not copy; select the text instead', true); }
+          },
+        }, 'Copy message'))),
+      h('li', {}, 'Attach the PDF to the email and send it. Then:')),
+    h('div', { class: 'btn-row' },
+      h('button', {
+        class: 'btn btn-primary', type: 'button',
+        onclick: async () => {
+          if (!needTo()) return;
+          try {
+            await rpc('mark_invoice_sent', { p_id: inv.id, p_to: addresses().join(', ') });
+            dlg.close();
+            toast(`${inv.number} marked as sent`);
+            refresh();
+          } catch (err) { toast(err.message, true); }
+        },
+      }, 'I\'ve sent it'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Close'))));
+}
+
+async function viewInvoice(id) {
+  const { invoice: inv } = await rpc('get_invoice', { p_id: id });
+  const refresh = () => render();
+  const act = (fn, args, message) => async () => {
+    try {
+      await rpc(fn, args);
+      toast(message);
+      refresh();
+    } catch (err) { toast(err.message, true); }
+  };
+  const live = inv.status !== 'cancelled';
+  const actions = [
+    h('button', { class: 'btn btn-secondary', onclick: () => downloadInvoicePdf(inv) }, icon('download'), 'PDF'),
+    isManager() && live && h('button', { class: 'btn btn-primary', onclick: () => emailDialog(inv, refresh) },
+      inv.sent_at ? 'Email again' : 'Email to customer'),
+    isManager() && inv.status === 'draft' && h('a', { class: 'btn btn-secondary', href: `#/invoices/${id}/edit` }, 'Edit'),
+    isManager() && live && inv.kind === 'proforma' && inv.task_id &&
+      h('a', { class: 'btn btn-secondary', href: `#/invoices/new?kind=tax&task=${inv.task_id}` }, 'Create tax invoice'),
+    isManager() && inv.status === 'sent' && h('button', { class: 'btn btn-secondary', onclick: act('set_invoice_paid', { p_id: id, p_paid: true }, 'Marked as paid') }, 'Mark as paid'),
+    isManager() && inv.status === 'paid' && h('button', { class: 'btn btn-secondary', onclick: act('set_invoice_paid', { p_id: id, p_paid: false }, 'Marked as not paid') }, 'Mark as not paid'),
+    isManager() && live && h('button', {
+      class: 'btn btn-danger',
+      onclick: () => {
+        if (confirmAction(`Cancel ${inv.number}? It stays on record as cancelled; its number is not reused.`)) {
+          act('cancel_invoice', { p_id: id }, 'Invoice cancelled')();
+        }
+      },
+    }, 'Cancel invoice'),
+  ];
+  const history = [
+    `Created ${fmtDate(inv.created_at, true)}${inv.created_by_name ? ' by ' + inv.created_by_name : ''}`,
+    inv.sent_at && `Sent to ${inv.sent_to || 'the customer'} on ${fmtDate(inv.sent_at, true)}`,
+    inv.paid_at && `Paid on ${fmtDate(inv.paid_at, true)}`,
+    inv.cancelled_at && `Cancelled on ${fmtDate(inv.cancelled_at, true)}`,
+  ].filter(Boolean).join(' · ');
+
+  return layout('invoices',
+    pageHead(inv.number, history, actions, [
+      h('a', { href: inv.task_id ? `#/tasks/${inv.task_id}` : '#/invoices' }, inv.task_id ? `← ${inv.task_title}` : '← Invoices'),
+      ' ', invoiceBadge(inv.status)]),
+    inv.status === 'draft' && isManager() && h('p', { class: 'notice' },
+      'Draft: check the charges, then click "Email to customer". Once sent, the invoice can no longer be changed.'),
+    h('section', { class: 'card' }, invoiceDocument(inv)));
+}
+
+// ---------- company settings (admins) ----------
+
+async function viewCompanySettings() {
+  if (state.user.role !== 'admin') return viewNotFound();
+  const c = await rpc('get_company_settings');
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Company legal name', input('legal_name', c.legal_name, { required: true, maxlength: 200 }), { full: true }),
+      field('Address', textarea('address', c.address, { rows: 3, maxlength: 500 }), { full: true }),
+      field('Phone', input('phone', c.phone, { maxlength: 50 })),
+      field('Accounts email', input('email', c.email, { type: 'email', maxlength: 200 })),
+      field('TRN (VAT registration number)', input('trn', c.trn, { inputmode: 'numeric', placeholder: '15 digits' }),
+        { hint: 'Required on tax invoices.' }),
+      field('Payment terms (days)', input('payment_terms_days', c.payment_terms_days, { type: 'number', min: 0, max: 365 }),
+        { hint: 'Sets the default due date on tax invoices.' }),
+      field('Bank name', input('bank_name', c.bank_name, { maxlength: 200 })),
+      field('Account name', input('account_name', c.account_name, { maxlength: 200 })),
+      field('IBAN', input('iban', c.iban, { maxlength: 50, placeholder: 'AE07 0331 2345 6789 0123 456' })),
+      field('SWIFT / BIC', input('swift', c.swift, { maxlength: 20 })),
+      field('Note printed on every invoice (optional)', textarea('invoice_notes', c.invoice_notes, { rows: 2, maxlength: 2000,
+        placeholder: 'e.g. Thank you for your business. Please quote the invoice number with your payment.' }), { full: true })),
+    h('div', {}, h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'))),
+  async data => {
+    await rpc('save_company_settings', { p_data: data });
+    toast('Company settings saved');
+    render();
+  });
+  return layout('settings',
+    pageHead('Company settings', 'Printed on every new invoice. Invoices already created keep the details they were made with.'),
+    h('section', { class: 'card' }, form));
 }
 
 // ---------- users (admin) ----------
@@ -1150,6 +1749,11 @@ async function render() {
       else if ((m = path.match(/^\/tasks\/(\d+)$/))) view = await viewTask(Number(m[1]));
       else if ((m = path.match(/^\/tasks\/(\d+)\/edit$/))) view = await viewTaskEdit(Number(m[1]));
       else if (path === '/work-types') view = await viewWorkTypes();
+      else if (path === '/invoices') view = await viewInvoices(params);
+      else if (path === '/invoices/new') view = await viewInvoiceNew(params);
+      else if ((m = path.match(/^\/invoices\/(\d+)$/))) view = await viewInvoice(Number(m[1]));
+      else if ((m = path.match(/^\/invoices\/(\d+)\/edit$/))) view = await viewInvoiceEdit(Number(m[1]));
+      else if (path === '/settings') view = await viewCompanySettings();
       else if (path === '/coming-soon') view = viewComingSoon();
       else view = viewNotFound();
     }
