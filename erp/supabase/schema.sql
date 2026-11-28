@@ -22,7 +22,7 @@ create table if not exists public.profiles (
   id         uuid primary key references auth.users (id) on delete cascade,
   name       text not null check (char_length(name) between 1 and 100),
   email      text not null,
-  role       text not null default 'staff' check (role in ('admin', 'manager', 'staff')),
+  role       text not null default 'staff' check (role in ('admin', 'manager', 'staff', 'employee')),
   active     boolean not null default false,   -- new sign-ups wait for an admin's approval
   created_at timestamptz not null default now()
 );
@@ -210,6 +210,114 @@ create table if not exists public.payments (
 );
 create index if not exists payments_invoice_idx on public.payments (invoice_id);
 
+-- HR settings (on the same one-row settings table).
+alter table public.company_settings add column if not exists office_lat double precision;
+alter table public.company_settings add column if not exists office_lng double precision;
+alter table public.company_settings add column if not exists office_radius_m int not null default 200;
+alter table public.company_settings add column if not exists work_start time not null default '09:00';
+alter table public.company_settings add column if not exists weekend_days int[] not null default '{0,6}';  -- 0 = Sunday ... 6 = Saturday
+alter table public.company_settings add column if not exists annual_leave_days int not null default 30;
+alter table public.company_settings add column if not exists medical_leave_days int not null default 15;
+
+-- One HR record per user. Who sees what is decided in the functions below.
+create table if not exists public.employees (
+  profile_id          uuid primary key references public.profiles (id) on delete cascade,
+  employee_no         text check (char_length(employee_no) <= 30),
+  designation         text check (char_length(designation) <= 100),
+  department          text check (char_length(department) <= 100),
+  joining_date        date,
+  work_phone          text check (char_length(work_phone) <= 30),
+  date_of_birth       date,
+  gender              text check (gender in ('male', 'female')),
+  nationality         text check (char_length(nationality) <= 60),
+  personal_email      text check (char_length(personal_email) <= 200),
+  personal_phone      text check (char_length(personal_phone) <= 30),
+  address             text check (char_length(address) <= 500),
+  emergency_name      text check (char_length(emergency_name) <= 100),
+  emergency_relation  text check (char_length(emergency_relation) <= 50),
+  emergency_phone     text check (char_length(emergency_phone) <= 30),
+  emirates_id         text check (char_length(emirates_id) <= 30),
+  emirates_id_expiry  date,
+  passport_no         text check (char_length(passport_no) <= 30),
+  passport_expiry     date,
+  visa_expiry         date,
+  bank_name           text check (char_length(bank_name) <= 100),
+  iban                text check (char_length(iban) <= 50),
+  basic_salary        numeric(12, 2) not null default 0 check (basic_salary >= 0),
+  housing_allowance   numeric(12, 2) not null default 0 check (housing_allowance >= 0),
+  transport_allowance numeric(12, 2) not null default 0 check (transport_allowance >= 0),
+  other_allowance     numeric(12, 2) not null default 0 check (other_allowance >= 0),
+  annual_leave_days   int check (annual_leave_days between 0 and 366),   -- empty = company default
+  medical_leave_days  int check (medical_leave_days between 0 and 366),
+  status              text not null default 'active' check (status in ('active', 'left')),
+  leaving_date        date,
+  notes               text check (char_length(notes) <= 2000),
+  updated_at          timestamptz not null default now()
+);
+
+-- One attendance record per person per day: sign in on arrival, sign out when leaving.
+-- A remark is required when signing in or out away from the office (or without location).
+create table if not exists public.attendance (
+  id             bigint generated always as identity primary key,
+  profile_id     uuid not null references public.profiles (id) on delete cascade,
+  work_date      date not null,
+  sign_in        timestamptz,
+  sign_out       timestamptz,
+  in_lat         double precision,
+  in_lng         double precision,
+  in_distance_m  int,
+  in_at_office   boolean,
+  in_remark      text check (char_length(in_remark) <= 300),
+  out_lat        double precision,
+  out_lng        double precision,
+  out_distance_m int,
+  out_at_office  boolean,
+  out_remark     text check (char_length(out_remark) <= 300),
+  edited_by      uuid references public.profiles (id) on delete set null,
+  edit_note      text check (char_length(edit_note) <= 300),
+  unique (profile_id, work_date)
+);
+create index if not exists attendance_date_idx on public.attendance (work_date);
+
+create table if not exists public.leave_requests (
+  id            bigint generated always as identity primary key,
+  profile_id    uuid not null references public.profiles (id) on delete cascade,
+  kind          text not null check (kind in ('annual', 'medical')),
+  start_date    date not null,
+  end_date      date not null,
+  days          numeric(5, 1) not null check (days > 0),
+  reason        text check (char_length(reason) <= 1000),
+  status        text not null default 'pending' check (status in ('pending', 'approved', 'rejected', 'cancelled')),
+  decided_by    uuid references public.profiles (id) on delete set null,
+  decided_at    timestamptz,
+  decision_note text check (char_length(decision_note) <= 500),
+  created_at    timestamptz not null default now(),
+  check (end_date >= start_date)
+);
+create index if not exists leave_requests_profile_idx on public.leave_requests (profile_id, start_date);
+
+-- Monthly payslips. Employees only ever see their own, and only once published.
+create table if not exists public.payslips (
+  id                  bigint generated always as identity primary key,
+  profile_id          uuid not null references public.profiles (id) on delete cascade,
+  period              date not null check (extract(day from period) = 1),   -- first day of the month
+  basic_salary        numeric(12, 2) not null default 0 check (basic_salary >= 0),
+  housing_allowance   numeric(12, 2) not null default 0 check (housing_allowance >= 0),
+  transport_allowance numeric(12, 2) not null default 0 check (transport_allowance >= 0),
+  other_allowance     numeric(12, 2) not null default 0 check (other_allowance >= 0),
+  overtime            numeric(12, 2) not null default 0 check (overtime >= 0),
+  bonus               numeric(12, 2) not null default 0 check (bonus >= 0),
+  deductions          numeric(12, 2) not null default 0 check (deductions >= 0),
+  deduction_note      text check (char_length(deduction_note) <= 300),
+  notes               text check (char_length(notes) <= 1000),
+  status              text not null default 'draft' check (status in ('draft', 'published')),
+  published_at        timestamptz,
+  created_by          uuid references public.profiles (id) on delete set null,
+  created_at          timestamptz not null default now(),
+  unique (profile_id, period),
+  check (basic_salary + housing_allowance + transport_allowance + other_allowance + overtime + bonus >= deductions)
+);
+
 -- Running totals on each invoice, kept up to date by private.refresh_invoice_payments().
 alter table public.invoices add column if not exists amount_paid numeric(14, 2) not null default 0;
 alter table public.invoices add column if not exists payment_reminded_at timestamptz;
@@ -279,7 +387,7 @@ alter table public.tasks add column if not exists renewal_id bigint references p
 
 -- Databases set up before managers existed: allow the new role.
 alter table public.profiles drop constraint if exists profiles_role_check;
-alter table public.profiles add constraint profiles_role_check check (role in ('admin', 'manager', 'staff'));
+alter table public.profiles add constraint profiles_role_check check (role in ('admin', 'manager', 'staff', 'employee'));
 
 -- Starting list of work types (only when the list is empty).
 insert into public.work_types (name)
@@ -302,10 +410,15 @@ alter table public.renewal_types    enable row level security;
 alter table public.renewals         enable row level security;
 alter table public.renewal_events   enable row level security;
 alter table public.payments         enable row level security;
+alter table public.employees        enable row level security;
+alter table public.attendance       enable row level security;
+alter table public.leave_requests   enable row level security;
+alter table public.payslips         enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
               public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
-              public.renewal_types, public.renewals, public.renewal_events, public.payments
+              public.renewal_types, public.renewals, public.renewal_events, public.payments,
+              public.employees, public.attendance, public.leave_requests, public.payslips
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -354,8 +467,9 @@ language sql immutable as $$
   select case p when 'urgent' then 4 when 'high' then 3 when 'normal' then 2 else 1 end
 $$;
 
--- The caller's profile; raises unless they are signed in and approved.
-create or replace function private.current_member() returns public.profiles
+-- The caller's profile; raises unless they are signed in and approved. Used by the HR functions,
+-- which every role (including "employee") can use.
+create or replace function private.current_person() returns public.profiles
 language plpgsql stable security definer set search_path = '' as $$
 declare
   me public.profiles;
@@ -366,6 +480,19 @@ begin
   end if;
   if not me.active then
     raise exception 'Your account is waiting for an administrator to give it access' using errcode = '42501';
+  end if;
+  return me;
+end $$;
+
+-- Like current_person, but for the business side of the ERP (customers, tasks, invoices, ...):
+-- accounts with the "employee" role only have access to HR.
+create or replace function private.current_member() returns public.profiles
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_person();
+begin
+  if me.role = 'employee' then
+    raise exception 'Your account has access to HR only' using errcode = '42501';
   end if;
   return me;
 end $$;
@@ -935,7 +1062,7 @@ declare
   d  jsonb := private.clean(
     jsonb_build_object('name', p_name, 'role', p_role),
     '{"name": {"type": "text", "required": true, "max": 100},
-      "role": {"type": "enum", "required": true, "values": ["admin", "manager", "staff"]}}');
+      "role": {"type": "enum", "required": true, "values": ["admin", "manager", "staff", "employee"]}}');
 begin
   if p_id = me.id and (d ->> 'role' <> 'admin' or not coalesce(p_active, false)) then
     raise exception 'You cannot remove your own admin access or turn off your own account' using errcode = '22023';
@@ -2111,6 +2238,742 @@ begin
 end $$;
 
 -- -------------------------------------------------------------------------------------
+-- API: HR (employee records, attendance, leave, payslips). Every role can use these;
+-- managers and admins see everyone's full details, others their own plus colleagues' basics.
+-- -------------------------------------------------------------------------------------
+
+create or replace function private.is_hr_manager(p public.profiles) returns boolean
+language sql immutable as $$ select p.role in ('admin', 'manager') $$;
+
+-- Straight-line distance in metres between two points (haversine).
+create or replace function private.distance_m(lat1 double precision, lng1 double precision,
+                                              lat2 double precision, lng2 double precision) returns double precision
+language sql immutable as $$
+  select 2 * 6371000 * asin(sqrt(power(sin(radians(lat2 - lat1) / 2), 2)
+         + cos(radians(lat1)) * cos(radians(lat2)) * power(sin(radians(lng2 - lng1) / 2), 2)))
+$$;
+
+-- Leave days between two dates, skipping the company's weekend days.
+create or replace function private.count_leave_days(p_start date, p_end date) returns int
+language sql stable security definer set search_path = '' as $$
+  select count(*)::int
+  from generate_series(p_start, p_end, interval '1 day') as d
+  where extract(dow from d)::int <> all (coalesce((select weekend_days from public.company_settings where id = 1), '{}'::int[]))
+$$;
+
+create or replace function private.leave_entitlement(p_profile uuid, p_kind text) returns int
+language sql stable security definer set search_path = '' as $$
+  select coalesce(case p_kind when 'annual' then e.annual_leave_days else e.medical_leave_days end,
+                  case p_kind when 'annual' then c.annual_leave_days else c.medical_leave_days end)
+  from public.company_settings c left join public.employees e on e.profile_id = p_profile
+  where c.id = 1
+$$;
+
+-- {entitled, taken, pending, remaining} for one person, kind and year.
+create or replace function private.leave_balance(p_profile uuid, p_kind text, p_year int) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  with x as (
+    select private.leave_entitlement(p_profile, p_kind) as entitled,
+           coalesce(sum(days) filter (where status = 'approved'), 0) as taken,
+           coalesce(sum(days) filter (where status = 'pending'), 0) as pending
+    from public.leave_requests
+    where profile_id = p_profile and kind = p_kind and extract(year from start_date)::int = p_year
+  )
+  select jsonb_build_object('entitled', entitled, 'taken', taken, 'pending', pending,
+                            'remaining', entitled - taken - pending)
+  from x
+$$;
+
+create or replace function public.get_hr_settings() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_person();
+begin
+  return (select json_build_object(
+    'office_lat', office_lat, 'office_lng', office_lng, 'office_radius_m', office_radius_m,
+    'office_set', office_lat is not null and office_lng is not null,
+    'work_start', to_char(work_start, 'HH24:MI'), 'weekend_days', weekend_days,
+    'annual_leave_days', annual_leave_days, 'medical_leave_days', medical_leave_days)
+    from public.company_settings where id = 1);
+end $$;
+
+-- Admins: office location, work start time, weekend days, default leave entitlements.
+create or replace function public.save_hr_settings(p_data jsonb) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_admin();
+  errs   jsonb := '{}';
+  lat    double precision;
+  lng    double precision;
+  radius int;
+  start  time;
+  annual int;
+  medical int;
+  weekend int[];
+begin
+  begin
+    lat := nullif(btrim(p_data ->> 'office_lat'), '')::double precision;
+    lng := nullif(btrim(p_data ->> 'office_lng'), '')::double precision;
+  exception when others then
+    errs := errs || '{"office_lat": "Enter the location as numbers, e.g. 25.3463 and 56.3418"}';
+  end;
+  if errs = '{}' and ((lat is null) <> (lng is null) or lat not between -90 and 90 or lng not between -180 and 180) then
+    errs := errs || '{"office_lat": "Enter both latitude (-90 to 90) and longitude (-180 to 180), or neither"}';
+  end if;
+  begin
+    radius := coalesce(nullif(btrim(p_data ->> 'office_radius_m'), '')::int, 200);
+    annual := coalesce(nullif(btrim(p_data ->> 'annual_leave_days'), '')::int, 30);
+    medical := coalesce(nullif(btrim(p_data ->> 'medical_leave_days'), '')::int, 15);
+  exception when others then
+    errs := errs || '{"office_radius_m": "Use whole numbers"}';
+  end;
+  if radius not between 20 and 5000 then errs := errs || '{"office_radius_m": "Use 20 to 5000 metres"}'; end if;
+  if annual not between 0 and 366 then errs := errs || '{"annual_leave_days": "Use 0 to 366 days"}'; end if;
+  if medical not between 0 and 366 then errs := errs || '{"medical_leave_days": "Use 0 to 366 days"}'; end if;
+  begin
+    start := coalesce(nullif(btrim(p_data ->> 'work_start'), ''), '09:00')::time;
+  exception when others then
+    errs := errs || '{"work_start": "Use a time like 09:00"}';
+  end;
+  begin
+    select coalesce(array_agg(distinct x::int order by x::int), '{}') into weekend
+    from jsonb_array_elements_text(coalesce(p_data -> 'weekend_days', '[]')) as x;
+  exception when others then
+    errs := errs || '{"weekend_days": "Pick the weekend days"}';
+  end;
+  if weekend is not null and (cardinality(weekend) > 6 or exists (select 1 from unnest(weekend) w where w not between 0 and 6)) then
+    errs := errs || '{"weekend_days": "Pick at most 6 weekend days"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  update public.company_settings set office_lat = lat, office_lng = lng, office_radius_m = radius, work_start = start,
+    weekend_days = weekend, annual_leave_days = annual, medical_leave_days = medical, updated_at = now()
+  where id = 1;
+end $$;
+
+-- Everyone: name, designation, department, email and work phone of active colleagues.
+-- Managers also get employee no., joining date and people who have left.
+create or replace function public.hr_directory() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_person();
+  mgr boolean := private.is_hr_manager(me);
+begin
+  return coalesce((select json_agg(json_build_object(
+      'id', p.id, 'name', p.name, 'email', p.email, 'role', p.role,
+      'designation', e.designation, 'department', e.department, 'work_phone', e.work_phone,
+      'employee_no', case when mgr then e.employee_no end,
+      'joining_date', case when mgr or p.id = me.id then e.joining_date end,
+      'status', coalesce(e.status, 'active'))
+    order by coalesce(e.status, 'active'), lower(p.name))
+    from public.profiles p left join public.employees e on e.profile_id = p.id
+    where p.active and (mgr or coalesce(e.status, 'active') = 'active')), '[]');
+end $$;
+
+-- Full record for managers and for the person themself; basic details for anyone else.
+create or replace function public.get_employee(p_id uuid) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_person();
+  p   public.profiles;
+  e   public.employees;
+begin
+  select * into p from public.profiles where id = p_id;
+  if p.id is null or (not p.active and not private.is_hr_manager(me)) then
+    raise exception 'Employee not found' using errcode = 'P0002';
+  end if;
+  select * into e from public.employees where profile_id = p_id;
+  if private.is_hr_manager(me) or me.id = p_id then
+    return (coalesce(to_jsonb(e), '{}') || jsonb_build_object(
+      'id', p.id, 'name', p.name, 'email', p.email, 'role', p.role, 'active', p.active, 'full', true,
+      'status', coalesce(e.status, 'active'),
+      'annual_entitled', private.leave_entitlement(p.id, 'annual'),
+      'medical_entitled', private.leave_entitlement(p.id, 'medical'),
+      'today', private.today()))::json;
+  end if;
+  return json_build_object('id', p.id, 'name', p.name, 'email', p.email, 'role', p.role, 'full', false,
+    'designation', e.designation, 'department', e.department, 'work_phone', e.work_phone);
+end $$;
+
+create or replace function private.money(p_data jsonb, p_key text, inout errs jsonb, out val numeric)
+language plpgsql immutable as $$
+declare
+  v text := nullif(btrim(p_data ->> p_key), '');
+begin
+  if v is null then
+    val := 0;
+  elsif v ~ '^\d{1,10}(\.\d{1,2})?$' then
+    val := v::numeric;
+  else
+    errs := errs || jsonb_build_object(p_key, 'Enter an amount like 4500 or 4500.50');
+    val := 0;
+  end if;
+end $$;
+
+-- Managers and admins: create or update someone's HR record.
+create or replace function public.save_employee(p_id uuid, p_data jsonb) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  d    jsonb := private.clean(p_data, '{
+    "employee_no":        {"type": "text", "max": 30},
+    "designation":        {"type": "text", "max": 100},
+    "department":         {"type": "text", "max": 100},
+    "joining_date":       {"type": "date"},
+    "work_phone":         {"type": "text", "max": 30},
+    "date_of_birth":      {"type": "date"},
+    "gender":             {"type": "enum", "values": ["male", "female"]},
+    "nationality":        {"type": "text", "max": 60},
+    "personal_email":     {"type": "text", "max": 200, "format": "email"},
+    "personal_phone":     {"type": "text", "max": 30},
+    "address":            {"type": "text", "max": 500},
+    "emergency_name":     {"type": "text", "max": 100},
+    "emergency_relation": {"type": "text", "max": 50},
+    "emergency_phone":    {"type": "text", "max": 30},
+    "emirates_id":        {"type": "text", "max": 30},
+    "emirates_id_expiry": {"type": "date"},
+    "passport_no":        {"type": "text", "max": 30},
+    "passport_expiry":    {"type": "date"},
+    "visa_expiry":        {"type": "date"},
+    "bank_name":          {"type": "text", "max": 100},
+    "iban":               {"type": "text", "max": 50},
+    "annual_leave_days":  {"type": "int"},
+    "medical_leave_days": {"type": "int"},
+    "status":             {"type": "enum", "values": ["active", "left"], "default": "active"},
+    "leaving_date":       {"type": "date"},
+    "notes":              {"type": "text", "max": 2000}
+  }');
+  errs jsonb := '{}';
+  basic numeric; housing numeric; transport numeric; other numeric;
+begin
+  if not exists (select 1 from public.profiles where id = p_id) then
+    raise exception 'Employee not found' using errcode = 'P0002';
+  end if;
+  select x.errs, x.val into errs, basic from private.money(p_data, 'basic_salary', errs) x;
+  select x.errs, x.val into errs, housing from private.money(p_data, 'housing_allowance', errs) x;
+  select x.errs, x.val into errs, transport from private.money(p_data, 'transport_allowance', errs) x;
+  select x.errs, x.val into errs, other from private.money(p_data, 'other_allowance', errs) x;
+  if (d ->> 'annual_leave_days')::int > 366 then errs := errs || '{"annual_leave_days": "Use 0 to 366 days"}'; end if;
+  if (d ->> 'medical_leave_days')::int > 366 then errs := errs || '{"medical_leave_days": "Use 0 to 366 days"}'; end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  insert into public.employees as e (profile_id, employee_no, designation, department, joining_date, work_phone,
+    date_of_birth, gender, nationality, personal_email, personal_phone, address, emergency_name, emergency_relation,
+    emergency_phone, emirates_id, emirates_id_expiry, passport_no, passport_expiry, visa_expiry, bank_name, iban,
+    basic_salary, housing_allowance, transport_allowance, other_allowance, annual_leave_days, medical_leave_days,
+    status, leaving_date, notes, updated_at)
+  values (p_id, d ->> 'employee_no', d ->> 'designation', d ->> 'department', (d ->> 'joining_date')::date, d ->> 'work_phone',
+    (d ->> 'date_of_birth')::date, d ->> 'gender', d ->> 'nationality', d ->> 'personal_email', d ->> 'personal_phone',
+    d ->> 'address', d ->> 'emergency_name', d ->> 'emergency_relation', d ->> 'emergency_phone', d ->> 'emirates_id',
+    (d ->> 'emirates_id_expiry')::date, d ->> 'passport_no', (d ->> 'passport_expiry')::date, (d ->> 'visa_expiry')::date,
+    d ->> 'bank_name', upper(replace(d ->> 'iban', ' ', '')), basic, housing, transport, other,
+    (d ->> 'annual_leave_days')::int, (d ->> 'medical_leave_days')::int, d ->> 'status', (d ->> 'leaving_date')::date,
+    d ->> 'notes', now())
+  on conflict (profile_id) do update set
+    employee_no = excluded.employee_no, designation = excluded.designation, department = excluded.department,
+    joining_date = excluded.joining_date, work_phone = excluded.work_phone, date_of_birth = excluded.date_of_birth,
+    gender = excluded.gender, nationality = excluded.nationality, personal_email = excluded.personal_email,
+    personal_phone = excluded.personal_phone, address = excluded.address, emergency_name = excluded.emergency_name,
+    emergency_relation = excluded.emergency_relation, emergency_phone = excluded.emergency_phone,
+    emirates_id = excluded.emirates_id, emirates_id_expiry = excluded.emirates_id_expiry,
+    passport_no = excluded.passport_no, passport_expiry = excluded.passport_expiry, visa_expiry = excluded.visa_expiry,
+    bank_name = excluded.bank_name, iban = excluded.iban, basic_salary = excluded.basic_salary,
+    housing_allowance = excluded.housing_allowance, transport_allowance = excluded.transport_allowance,
+    other_allowance = excluded.other_allowance, annual_leave_days = excluded.annual_leave_days,
+    medical_leave_days = excluded.medical_leave_days, status = excluded.status, leaving_date = excluded.leaving_date,
+    notes = excluded.notes, updated_at = now();
+end $$;
+
+-- ---------- attendance ----------
+
+-- Sign in (p_action 'in') on arrival or sign out ('out') when leaving, with the device's location if available.
+-- Away from the office (or with no location) a remark saying why is required.
+create or replace function public.attendance_sign(p_action text, p_lat double precision, p_lng double precision,
+                                                  p_accuracy double precision, p_remark text) returns json
+language plpgsql security definer set search_path = '' as $$
+declare
+  me       public.profiles := private.current_person();
+  co       public.company_settings;
+  t        date := private.today();
+  rec      public.attendance;
+  dist     int;
+  at_off   boolean;
+  remark   text := nullif(btrim(p_remark), '');
+begin
+  if p_action not in ('in', 'out') then
+    raise exception 'Unknown action' using errcode = '22023';
+  end if;
+  if char_length(remark) > 300 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"remark": "Keep it under 300 characters"}';
+  end if;
+  select * into co from public.company_settings where id = 1;
+  if co.office_lat is not null and p_lat is not null and p_lng is not null then
+    dist := round(private.distance_m(co.office_lat, co.office_lng, p_lat, p_lng));
+  end if;
+  at_off := case when co.office_lat is null then null else coalesce(dist <= co.office_radius_m, false) end;
+  if at_off is false and remark is null then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = jsonb_build_object('remark', case when dist is null
+        then 'Your location isn''t available. Add a remark saying where you are, e.g. "Client visit at Sharjah port".'
+        else format('You''re about %s m from the office. Add a remark saying why, e.g. "Client visit at Sharjah port".',
+                    to_char(dist, 'FM999,999,990')) end)::text;
+  end if;
+
+  select * into rec from public.attendance where profile_id = me.id and work_date = t;
+  if p_action = 'in' then
+    if rec.sign_in is not null then
+      raise exception 'You already signed in today at %', to_char(rec.sign_in at time zone 'Asia/Dubai', 'HH24:MI') using errcode = '22023';
+    end if;
+    insert into public.attendance (profile_id, work_date, sign_in, in_lat, in_lng, in_distance_m, in_at_office, in_remark)
+    values (me.id, t, now(), p_lat, p_lng, dist, at_off, remark)
+    on conflict (profile_id, work_date) do update set sign_in = excluded.sign_in, in_lat = excluded.in_lat,
+      in_lng = excluded.in_lng, in_distance_m = excluded.in_distance_m, in_at_office = excluded.in_at_office,
+      in_remark = excluded.in_remark
+    returning * into rec;
+  else
+    if rec.sign_in is null then
+      raise exception 'Sign in first' using errcode = '22023';
+    end if;
+    if rec.sign_out is not null then
+      raise exception 'You already signed out today at %', to_char(rec.sign_out at time zone 'Asia/Dubai', 'HH24:MI') using errcode = '22023';
+    end if;
+    update public.attendance set sign_out = now(), out_lat = p_lat, out_lng = p_lng, out_distance_m = dist,
+      out_at_office = at_off, out_remark = remark
+    where id = rec.id returning * into rec;
+  end if;
+  return to_json(rec);
+end $$;
+
+-- One person's attendance for a month (their own, or anyone's for managers), with approved leave.
+create or replace function public.my_attendance(p_month date default null, p_profile uuid default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_person();
+  target uuid := coalesce(p_profile, me.id);
+  m      date := date_trunc('month', coalesce(p_month, private.today()))::date;
+  m_end  date := (date_trunc('month', coalesce(p_month, private.today())) + interval '1 month - 1 day')::date;
+begin
+  if target <> me.id and not private.is_hr_manager(me) then
+    raise exception 'You can only see your own attendance' using errcode = '42501';
+  end if;
+  return json_build_object(
+    'month', m, 'today', private.today(),
+    'name', (select name from public.profiles where id = target),
+    'work_start', (select to_char(work_start, 'HH24:MI') from public.company_settings where id = 1),
+    'weekend_days', (select weekend_days from public.company_settings where id = 1),
+    'days', coalesce((select json_agg(a order by a.work_date) from public.attendance a
+                      where a.profile_id = target and a.work_date between m and m_end), '[]'),
+    'leaves', coalesce((select json_agg(json_build_object('kind', l.kind, 'start_date', l.start_date, 'end_date', l.end_date))
+                        from public.leave_requests l
+                        where l.profile_id = target and l.status = 'approved' and l.start_date <= m_end and l.end_date >= m), '[]'));
+end $$;
+
+-- Managers: everyone's attendance for one day.
+create or replace function public.team_attendance(p_date date default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  d  date := coalesce(p_date, private.today());
+begin
+  return json_build_object(
+    'date', d, 'today', private.today(),
+    'work_start', (select to_char(work_start, 'HH24:MI') from public.company_settings where id = 1),
+    'weekend', extract(dow from d)::int = any (coalesce((select weekend_days from public.company_settings where id = 1), '{}'::int[])),
+    'people', coalesce((select json_agg(x order by lower(x.name)) from (
+      select p.id, p.name, e.designation, a.sign_in, a.sign_out, a.in_at_office, a.in_distance_m, a.in_remark,
+             a.out_at_office, a.out_distance_m, a.out_remark, a.edit_note,
+             (a.sign_in at time zone 'Asia/Dubai')::time > (select work_start from public.company_settings where id = 1) as late,
+             (select l.kind from public.leave_requests l where l.profile_id = p.id and l.status = 'approved'
+                and d between l.start_date and l.end_date limit 1) as on_leave
+      from public.profiles p
+      left join public.employees e on e.profile_id = p.id
+      left join public.attendance a on a.profile_id = p.id and a.work_date = d
+      where p.active and coalesce(e.status, 'active') = 'active') x), '[]'));
+end $$;
+
+-- Managers: correct a day's record (times as HH:MM, Dubai time). Both empty removes the record.
+create or replace function public.save_attendance(p_profile uuid, p_date date, p_in text, p_out text, p_note text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  t_in  timestamptz;
+  t_out timestamptz;
+  errs  jsonb := '{}';
+begin
+  if not exists (select 1 from public.profiles where id = p_profile) then
+    raise exception 'Employee not found' using errcode = 'P0002';
+  end if;
+  begin
+    t_in := ((p_date + nullif(btrim(p_in), '')::time) at time zone 'Asia/Dubai');
+  exception when others then errs := errs || '{"in": "Use a time like 09:05"}';
+  end;
+  begin
+    t_out := ((p_date + nullif(btrim(p_out), '')::time) at time zone 'Asia/Dubai');
+  exception when others then errs := errs || '{"out": "Use a time like 18:00"}';
+  end;
+  if t_out is not null and t_in is null then errs := errs || '{"in": "Add the sign-in time too"}'; end if;
+  if t_out <= t_in then errs := errs || '{"out": "Must be after the sign-in time"}'; end if;
+  if char_length(p_note) > 300 then errs := errs || '{"note": "Keep it under 300 characters"}'; end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  if t_in is null then
+    delete from public.attendance where profile_id = p_profile and work_date = p_date;
+    return;
+  end if;
+  insert into public.attendance (profile_id, work_date, sign_in, sign_out, edited_by, edit_note)
+  values (p_profile, p_date, t_in, t_out, me.id, coalesce(nullif(btrim(p_note), ''), 'Corrected by ' || me.name))
+  on conflict (profile_id, work_date) do update set sign_in = excluded.sign_in, sign_out = excluded.sign_out,
+    edited_by = excluded.edited_by, edit_note = excluded.edit_note;
+end $$;
+
+-- ---------- leave ----------
+
+-- Balances and requests for a person (own, or anyone's for managers) in a year.
+create or replace function public.leave_summary(p_profile uuid default null, p_year int default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_person();
+  target uuid := coalesce(p_profile, me.id);
+  y      int := coalesce(p_year, extract(year from private.today())::int);
+begin
+  if target <> me.id and not private.is_hr_manager(me) then
+    raise exception 'You can only see your own leave' using errcode = '42501';
+  end if;
+  return json_build_object(
+    'year', y, 'today', private.today(),
+    'weekend_days', (select weekend_days from public.company_settings where id = 1),
+    'annual', private.leave_balance(target, 'annual', y),
+    'medical', private.leave_balance(target, 'medical', y),
+    'requests', coalesce((select json_agg(to_jsonb(l) || jsonb_build_object('decided_by_name', u.name)
+                                          order by l.start_date desc, l.id desc)
+                          from public.leave_requests l left join public.profiles u on u.id = l.decided_by
+                          where l.profile_id = target and extract(year from l.start_date)::int = y), '[]'));
+end $$;
+
+-- Ask for annual or medical leave (for yourself). Goes to managers for approval.
+create or replace function public.request_leave(p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_person();
+  d    jsonb := private.clean(p_data, '{
+    "kind":       {"type": "enum", "required": true, "values": ["annual", "medical"]},
+    "start_date": {"type": "date", "required": true},
+    "end_date":   {"type": "date", "required": true},
+    "reason":     {"type": "text", "max": 1000}
+  }');
+  s    date := (d ->> 'start_date')::date;
+  e    date := (d ->> 'end_date')::date;
+  n    int;
+  bal  jsonb;
+  v_id bigint;
+begin
+  if e < s then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"end_date": "Must be on or after the first day"}';
+  end if;
+  if extract(year from s) <> extract(year from e) then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = '{"end_date": "Leave can''t cross into the next year; send two requests (up to 31 Dec, and from 1 Jan)"}';
+  end if;
+  n := private.count_leave_days(s, e);
+  if n = 0 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"end_date": "Those dates are all weekend days"}';
+  end if;
+  if exists (select 1 from public.leave_requests where profile_id = me.id and status in ('pending', 'approved')
+             and start_date <= e and end_date >= s) then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = '{"start_date": "You already have leave requested or approved on some of these days"}';
+  end if;
+  bal := private.leave_balance(me.id, d ->> 'kind', extract(year from s)::int);
+  if n > (bal ->> 'remaining')::numeric then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = jsonb_build_object('end_date', format('That is %s days, but you only have %s %s leave days left this year (including requests waiting for approval)',
+                                                    n, trim_scale((bal ->> 'remaining')::numeric), d ->> 'kind'))::text;
+  end if;
+  insert into public.leave_requests (profile_id, kind, start_date, end_date, days, reason)
+  values (me.id, d ->> 'kind', s, e, n, d ->> 'reason')
+  returning id into v_id;
+  return v_id;
+end $$;
+
+-- Withdraw your own pending request; managers can also cancel approved leave.
+create or replace function public.cancel_leave(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_person();
+  r  public.leave_requests;
+begin
+  select * into r from public.leave_requests where id = p_id;
+  if r.id is null or (r.profile_id <> me.id and not private.is_hr_manager(me)) then
+    raise exception 'Leave request not found' using errcode = 'P0002';
+  end if;
+  if r.status = 'approved' and not private.is_hr_manager(me) then
+    raise exception 'Approved leave can only be cancelled by a manager' using errcode = '42501';
+  end if;
+  if r.status not in ('pending', 'approved') then
+    raise exception 'This request is already %', r.status using errcode = '22023';
+  end if;
+  update public.leave_requests set status = 'cancelled',
+    decided_by = case when me.id <> r.profile_id then me.id else decided_by end,
+    decided_at = case when me.id <> r.profile_id then now() else decided_at end
+  where id = p_id;
+end $$;
+
+-- Managers approve or reject. Managers can't decide their own requests (an admin or another manager does).
+create or replace function public.decide_leave(p_id bigint, p_approve boolean, p_note text default null) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  r   public.leave_requests;
+  bal jsonb;
+begin
+  select * into r from public.leave_requests where id = p_id;
+  if r.id is null then
+    raise exception 'Leave request not found' using errcode = 'P0002';
+  end if;
+  if r.status <> 'pending' then
+    raise exception 'This request is already %', r.status using errcode = '22023';
+  end if;
+  if r.profile_id = me.id and me.role <> 'admin' then
+    raise exception 'Another manager or an administrator has to decide your own leave' using errcode = '42501';
+  end if;
+  if char_length(p_note) > 500 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"note": "Keep it under 500 characters"}';
+  end if;
+  if p_approve then
+    bal := private.leave_balance(r.profile_id, r.kind, extract(year from r.start_date)::int);
+    if (bal ->> 'taken')::numeric + r.days > (bal ->> 'entitled')::numeric then
+      raise exception 'Approving would go over % days of % leave for the year. Change their entitlement first if this is agreed.',
+        bal ->> 'entitled', r.kind using errcode = '22023';
+    end if;
+  end if;
+  update public.leave_requests set status = case when p_approve then 'approved' else 'rejected' end,
+    decided_by = me.id, decided_at = now(), decision_note = nullif(btrim(p_note), '')
+  where id = p_id;
+end $$;
+
+-- Managers: everyone's requests (default: waiting for approval). Others: their own.
+create or replace function public.list_leave_requests(p_status text default 'pending', p_year int default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_person();
+  mgr boolean := private.is_hr_manager(me);
+begin
+  return coalesce((select json_agg(x order by x.start_date desc, x.id desc) from (
+    select l.*, p.name, e.designation, u.name as decided_by_name,
+           (private.leave_balance(l.profile_id, l.kind, extract(year from l.start_date)::int) ->> 'remaining')::numeric as remaining,
+           private.leave_balance(l.profile_id, l.kind, extract(year from l.start_date)::int) ->> 'entitled' as entitled
+    from public.leave_requests l
+    join public.profiles p on p.id = l.profile_id
+    left join public.employees e on e.profile_id = l.profile_id
+    left join public.profiles u on u.id = l.decided_by
+    where (mgr or l.profile_id = me.id)
+      and (coalesce(p_status, '') = '' or l.status = p_status)
+      and (p_year is null or extract(year from l.start_date)::int = p_year)
+    order by l.start_date desc, l.id desc limit 200) x), '[]');
+end $$;
+
+-- ---------- payslips ----------
+
+-- Managers: payslips for a month (default this month) plus who has none yet, or all of one person's.
+-- Everyone else: their own published payslips.
+create or replace function public.list_payslips(p_period date default null, p_profile uuid default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_person();
+  per date := date_trunc('month', coalesce(p_period, private.today()))::date;
+begin
+  if not private.is_hr_manager(me) then
+    return json_build_object('mine', true, 'payslips', coalesce((
+      select json_agg(json_build_object('id', s.id, 'period', s.period, 'published_at', s.published_at,
+        'net', s.basic_salary + s.housing_allowance + s.transport_allowance + s.other_allowance + s.overtime + s.bonus - s.deductions)
+        order by s.period desc)
+      from public.payslips s where s.profile_id = me.id and s.status = 'published'), '[]'));
+  end if;
+  return json_build_object('mine', false, 'period', per,
+    'payslips', coalesce((
+      select json_agg(json_build_object('id', s.id, 'profile_id', s.profile_id, 'name', p.name, 'designation', e.designation,
+        'period', s.period, 'status', s.status, 'published_at', s.published_at,
+        'gross', s.basic_salary + s.housing_allowance + s.transport_allowance + s.other_allowance + s.overtime + s.bonus,
+        'deductions', s.deductions,
+        'net', s.basic_salary + s.housing_allowance + s.transport_allowance + s.other_allowance + s.overtime + s.bonus - s.deductions)
+        order by case when p_profile is null then lower(p.name) end, s.period desc)
+      from public.payslips s join public.profiles p on p.id = s.profile_id left join public.employees e on e.profile_id = s.profile_id
+      where (p_profile is null and s.period = per) or s.profile_id = p_profile), '[]'),
+    'missing', case when p_profile is null then coalesce((
+      select json_agg(json_build_object('id', p.id, 'name', p.name, 'basic_salary', coalesce(e.basic_salary, 0)) order by lower(p.name))
+      from public.profiles p left join public.employees e on e.profile_id = p.id
+      where p.active and coalesce(e.status, 'active') = 'active'
+        and not exists (select 1 from public.payslips s where s.profile_id = p.id and s.period = per)), '[]') end);
+end $$;
+
+create or replace function public.get_payslip(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_person();
+  s  public.payslips;
+begin
+  select * into s from public.payslips where id = p_id;
+  if s.id is null or (not private.is_hr_manager(me) and (s.profile_id <> me.id or s.status <> 'published')) then
+    raise exception 'Payslip not found' using errcode = 'P0002';
+  end if;
+  return (select json_build_object(
+    'payslip', to_jsonb(s) || jsonb_build_object(
+      'gross', s.basic_salary + s.housing_allowance + s.transport_allowance + s.other_allowance + s.overtime + s.bonus,
+      'net', s.basic_salary + s.housing_allowance + s.transport_allowance + s.other_allowance + s.overtime + s.bonus - s.deductions),
+    'employee', json_build_object('name', p.name, 'email', p.email, 'employee_no', e.employee_no, 'designation', e.designation,
+      'department', e.department, 'joining_date', e.joining_date, 'bank_name', e.bank_name, 'iban', e.iban),
+    'company', json_build_object('legal_name', c.legal_name, 'address', c.address, 'phone', c.phone, 'email', c.email))
+    from public.profiles p left join public.employees e on e.profile_id = p.id, public.company_settings c
+    where p.id = s.profile_id and c.id = 1);
+end $$;
+
+-- Managers: create (p_id null) or edit a draft payslip. Amounts left empty count as 0.
+create or replace function public.save_payslip(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  d    jsonb := private.clean(p_data, '{
+    "profile_id":     {"type": "uuid"},
+    "period":         {"type": "date"},
+    "deduction_note": {"type": "text", "max": 300},
+    "notes":          {"type": "text", "max": 1000}
+  }');
+  errs jsonb := '{}';
+  v_old public.payslips;
+  basic numeric; housing numeric; transport numeric; other numeric; ot numeric; v_bonus numeric; ded numeric;
+  v_id bigint;
+begin
+  if p_id is not null then
+    select * into v_old from public.payslips where id = p_id;
+    if v_old.id is null then
+      raise exception 'Payslip not found' using errcode = 'P0002';
+    end if;
+    if v_old.status <> 'draft' then
+      raise exception 'This payslip is published. Unpublish it first to make changes.' using errcode = '22023';
+    end if;
+  else
+    if d ->> 'profile_id' is null or not exists (select 1 from public.profiles where id = (d ->> 'profile_id')::uuid) then
+      errs := errs || '{"profile_id": "Pick an employee"}';
+    end if;
+    if d ->> 'period' is null then errs := errs || '{"period": "Pick the month"}'; end if;
+  end if;
+  select x.errs, x.val into errs, basic from private.money(p_data, 'basic_salary', errs) x;
+  select x.errs, x.val into errs, housing from private.money(p_data, 'housing_allowance', errs) x;
+  select x.errs, x.val into errs, transport from private.money(p_data, 'transport_allowance', errs) x;
+  select x.errs, x.val into errs, other from private.money(p_data, 'other_allowance', errs) x;
+  select x.errs, x.val into errs, ot from private.money(p_data, 'overtime', errs) x;
+  select x.errs, x.val into errs, v_bonus from private.money(p_data, 'bonus', errs) x;
+  select x.errs, x.val into errs, ded from private.money(p_data, 'deductions', errs) x;
+  if errs = '{}' and ded > basic + housing + transport + other + ot + v_bonus then
+    errs := errs || '{"deductions": "Deductions can''t be more than the total earnings"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  if p_id is null then
+    begin
+      insert into public.payslips (profile_id, period, basic_salary, housing_allowance, transport_allowance, other_allowance,
+                                   overtime, bonus, deductions, deduction_note, notes, created_by)
+      values ((d ->> 'profile_id')::uuid, date_trunc('month', (d ->> 'period')::date)::date, basic, housing, transport, other,
+              ot, v_bonus, ded, d ->> 'deduction_note', d ->> 'notes', me.id)
+      returning id into v_id;
+    exception when unique_violation then
+      raise exception 'Please fix the highlighted fields' using errcode = '22023',
+        detail = '{"period": "This employee already has a payslip for that month"}';
+    end;
+    return v_id;
+  end if;
+  update public.payslips set basic_salary = basic, housing_allowance = housing, transport_allowance = transport,
+    other_allowance = other, overtime = ot, bonus = v_bonus, deductions = ded, deduction_note = d ->> 'deduction_note',
+    notes = d ->> 'notes'
+  where id = p_id;
+  return p_id;
+end $$;
+
+-- Managers: draft payslips for everyone active with a salary set, from their salary package. Returns how many were created.
+create or replace function public.generate_payslips(p_period date) returns int
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  per date := date_trunc('month', coalesce(p_period, private.today()))::date;
+  n   int;
+begin
+  insert into public.payslips (profile_id, period, basic_salary, housing_allowance, transport_allowance, other_allowance, created_by)
+  select p.id, per, e.basic_salary, e.housing_allowance, e.transport_allowance, e.other_allowance, me.id
+  from public.profiles p join public.employees e on e.profile_id = p.id
+  where p.active and e.status = 'active' and e.basic_salary > 0
+    and not exists (select 1 from public.payslips s where s.profile_id = p.id and s.period = per);
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+create or replace function public.set_payslip_published(p_id bigint, p_published boolean) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  update public.payslips set status = case when p_published then 'published' else 'draft' end,
+    published_at = case when p_published then now() end
+  where id = p_id;
+  if not found then
+    raise exception 'Payslip not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+create or replace function public.delete_payslip(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  st text;
+begin
+  select status into st from public.payslips where id = p_id;
+  if st is null then
+    raise exception 'Payslip not found' using errcode = 'P0002';
+  end if;
+  if st <> 'draft' then
+    raise exception 'Unpublish the payslip before deleting it' using errcode = '22023';
+  end if;
+  delete from public.payslips where id = p_id;
+end $$;
+
+-- The HR home page in one call: today's attendance, leave balances, latest payslips, approvals waiting.
+create or replace function public.my_hr() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_person();
+  y  int := extract(year from private.today())::int;
+begin
+  return json_build_object(
+    'today', private.today(),
+    'designation', (select designation from public.employees where profile_id = me.id),
+    'attendance', (select to_json(a) from public.attendance a where a.profile_id = me.id and a.work_date = private.today()),
+    'on_leave', (select l.kind from public.leave_requests l where l.profile_id = me.id and l.status = 'approved'
+                 and private.today() between l.start_date and l.end_date limit 1),
+    'settings', public.get_hr_settings(),
+    'annual', private.leave_balance(me.id, 'annual', y),
+    'medical', private.leave_balance(me.id, 'medical', y),
+    'payslips', coalesce((select json_agg(x order by x.period desc) from (
+      select s.id, s.period,
+             s.basic_salary + s.housing_allowance + s.transport_allowance + s.other_allowance + s.overtime + s.bonus - s.deductions as net
+      from public.payslips s where s.profile_id = me.id and s.status = 'published' order by s.period desc limit 3) x), '[]'),
+    'pendingApprovals', case when private.is_hr_manager(me) then
+      (select count(*) from public.leave_requests where status = 'pending' and (profile_id <> me.id or me.role = 'admin')) end,
+    'expiringDocuments', case when private.is_hr_manager(me) then coalesce((
+      select json_agg(x order by x.expiry) from (
+        select p.id, p.name, doc.label, doc.expiry
+        from public.employees e join public.profiles p on p.id = e.profile_id
+        cross join lateral (values ('Visa', e.visa_expiry), ('Emirates ID', e.emirates_id_expiry), ('Passport', e.passport_expiry))
+          as doc(label, expiry)
+        where p.active and e.status = 'active' and doc.expiry is not null and doc.expiry <= private.today() + 60
+        order by doc.expiry limit 20) x), '[]') end);
+end $$;
+
+-- -------------------------------------------------------------------------------------
 -- Who may call what: signed-in users only. Helpers are not callable from the API at all.
 -- -------------------------------------------------------------------------------------
 
@@ -2167,7 +3030,28 @@ begin
     'public.set_cheque_status(bigint, text)',
     'public.delete_payment(bigint)',
     'public.mark_payment_reminded(bigint, text)',
-    'public.list_payments(text, text, text, int)'
+    'public.list_payments(text, text, text, int)',
+    'public.get_hr_settings()',
+    'public.save_hr_settings(jsonb)',
+    'public.my_hr()',
+    'public.hr_directory()',
+    'public.get_employee(uuid)',
+    'public.save_employee(uuid, jsonb)',
+    'public.attendance_sign(text, double precision, double precision, double precision, text)',
+    'public.my_attendance(date, uuid)',
+    'public.team_attendance(date)',
+    'public.save_attendance(uuid, date, text, text, text)',
+    'public.leave_summary(uuid, int)',
+    'public.request_leave(jsonb)',
+    'public.cancel_leave(bigint)',
+    'public.decide_leave(bigint, boolean, text)',
+    'public.list_leave_requests(text, int)',
+    'public.list_payslips(date, uuid)',
+    'public.get_payslip(bigint)',
+    'public.save_payslip(bigint, jsonb)',
+    'public.generate_payslips(date)',
+    'public.set_payslip_published(bigint, boolean)',
+    'public.delete_payslip(bigint)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);
