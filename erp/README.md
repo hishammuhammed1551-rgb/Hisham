@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.4 has Customers (CRM), Tasks and Invoices**; expenses and reports are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.5 has Customers (CRM), Tasks, Invoices and Renewals**; expenses and reports are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -19,6 +19,12 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - Status: Draft → Sent → Paid, or Cancelled. Sent invoices can't be edited; cancel and re-issue instead. Numbers are never reused and restart each year.
   - Lowcaps' name, address, TRN and bank details come from **Company settings** (admins) and are copied onto each invoice when it's saved. Tax invoices can't be created until the TRN is filled in.
   - Managers and admins create and send invoices; team members can view them.
+- **Renewals.** Recurring services per customer (VAT return every 3 months, trade license every year, residence visa every 2 years…), each with what it's for (e.g. an employee's name or a license number), the next due date, when to start reminding, and who looks after it.
+  - The dashboard's **Renewals due** list shows everything inside its reminder period or overdue (red), so nothing is missed.
+  - **Remind customer** opens Gmail or your email app with a reminder filled in and records when the customer was reminded.
+  - **Mark as renewed** moves the due date on by the repeat period (or to a date you choose) and keeps a history.
+  - Managers can **Create task** from a renewal to hand the work to a team member; from there the usual task → proforma → tax invoice flow applies.
+  - Renewal types and their default period and reminder are edited by managers under **Types**. Anyone with access can add renewals; managers can delete them (others can **Stop** one instead).
 - **Customers.** Company or individual, status (lead / active / inactive), UAE TRN (checked as 15 digits), contact details, address, how they found Lowcaps, which services they want (shipping, clearing, customs), notes, and the staff member who owns the account.
 - **Contacts.** Several people per customer, one marked as the main contact.
 - **Activity log.** Notes, calls, meetings and emails on each customer, plus follow-ups with a due date that can be marked done.

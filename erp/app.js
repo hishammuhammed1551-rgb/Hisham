@@ -41,6 +41,7 @@ const ICONS = {
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   download: '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+  renew: '<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
   note: '<path d="M5 3h10l4 4v14H5z"/><path d="M9 11h6M9 15h6"/>',
   call: '<path d="M5 3h4l2 5-2.5 1.5a11 11 0 0 0 6 6L16 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 5a2 2 0 0 1 2-2z"/>',
@@ -258,11 +259,12 @@ function layout(active, ...content) {
         link('#/', 'home', 'Dashboard', 'dashboard'),
         link('#/customers', 'users', 'Customers', 'customers'),
         link('#/tasks', 'task', 'Tasks', 'tasks'),
+        link('#/renewals', 'renew', 'Renewals', 'renewals'),
         link('#/invoices', 'invoice', 'Invoices', 'invoices'),
         h('div', { class: 'nav-heading' }, 'Next modules'),
         soon('chart', 'Expenses & reports'),
         isManager() && h('div', { class: 'nav-heading' }, 'Manage'),
-        isManager() && link('#/work-types', 'tag', 'Types of work', 'work-types'),
+        isManager() && link('#/work-types', 'tag', 'Types', 'work-types'),
         isAdmin && link('#/users', 'key', 'Users', 'users'),
         isAdmin && link('#/settings', 'gear', 'Company settings', 'settings')),
       h('div', { class: 'sidebar-user' },
@@ -426,6 +428,21 @@ async function viewDashboard() {
         : stat('Customers I own', d.myCustomers, '#/customers?owner=me')),
     h('div', { class: 'grid two-col' },
       h('div', {},
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Renewals due'),
+            d.renewalsOverdue > 0 && h('span', { class: 'badge badge-overdue' }, `${d.renewalsOverdue} overdue`),
+            h('a', { class: 'btn btn-secondary btn-sm', href: '#/renewals' }, 'See all')),
+          d.renewalsDue.length
+            ? h('ul', { class: 'list' }, d.renewalsDue.map(r => h('li', {},
+                h('span', { class: 'kind-icon' }, icon('renew')),
+                h('div', { class: 'grow' },
+                  h('a', { class: 'row-link', href: `#/renewals/${r.id}` }, renewalLabel(r)),
+                  h('div', { class: 'meta' }, [r.customer_name, r.last_reminded_at ? `reminded ${fmtDate(r.last_reminded_at)}` : 'not reminded yet']
+                    .join(' · '))),
+                renewalBadge(r.due_date, d.today, Infinity))))
+            : h('p', { class: 'empty' }, 'No renewals due right now.'),
+          d.renewalsDueCount > d.renewalsDue.length && h('p', { class: 'notice-inline' },
+            h('a', { href: '#/renewals' }, `See all ${d.renewalsDueCount} renewals due`))),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', {}, 'My tasks'),
             h('a', { class: 'btn btn-secondary btn-sm', href: '#/tasks?assignee=me' }, 'See all')),
@@ -802,7 +819,17 @@ async function viewCustomer(id) {
                   h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number),
                   h('div', { class: 'meta' }, `${INVOICE_KIND[i.kind]} · ${fmtDate(i.issue_date)}`)),
                 h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), invoiceBadge(i.status)))))
-            : h('p', { class: 'empty' }, 'No invoices yet.'))),
+            : h('p', { class: 'empty' }, 'No invoices yet.')),
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Renewals'),
+            h('a', { class: 'btn btn-secondary btn-sm', href: `#/renewals/new?customer=${id}` }, '+ Add renewal')),
+          c.renewals.length
+            ? h('ul', { class: 'list' }, c.renewals.map(r => h('li', {},
+                h('div', { class: 'grow' },
+                  h('a', { class: 'row-link', href: `#/renewals/${r.id}` }, renewalLabel(r)),
+                  h('div', { class: 'meta' }, periodText(r.interval_months))),
+                renewalBadge(r.due_date, today, r.remind_days, r.active))))
+            : h('p', { class: 'empty' }, 'No renewals yet. Add VAT returns, trade license, visas… to get reminded in time.'))),
       activity));
 }
 
@@ -1061,20 +1088,21 @@ function workTypeDialog(w, refresh) {
 
 async function viewWorkTypes() {
   if (!isManager()) return viewNotFound();
-  const types = await rpc('list_work_types');
+  const [types, renewalTypes] = await Promise.all([rpc('list_work_types'), rpc('list_renewal_types')]);
   const refresh = () => render();
   const addForm = handleForm(h('form', { class: 'form' },
     h('div', { class: 'inline-form' },
       field('New type of work', input('name', '', { required: true, maxlength: 100, placeholder: 'e.g. Warehousing' })),
-      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Add'))),
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Add type of work'))),
   async data => {
     await rpc('save_work_type', { p_id: null, p_name: data.name, p_active: true });
     toast(`Added "${data.name.trim()}"`);
     refresh();
   });
   return layout('work-types',
-    pageHead('Types of work', 'The choices managers pick from when creating a task.'),
-    h('section', { class: 'card' }, addForm),
+    pageHead('Types', 'The lists people pick from when creating tasks and renewals.'),
+    renewalTypesCard(renewalTypes, refresh),
+    h('section', { class: 'card' }, h('h2', {}, 'Types of work'), addForm),
     h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
       h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Open tasks'), h('th', {}, 'Status'), h('th', {}, ''))),
       h('tbody', {}, types.map(w => h('tr', {},
@@ -1474,12 +1502,14 @@ function invoiceEmail(inv) {
   return { subject: `${label} ${inv.number} from ${sup.legal_name || 'Lowcaps'}`, body };
 }
 
-/** "Prepare email" flow: download the PDF, open Gmail or the email app pre-filled, then record it as sent. */
-function emailDialog(inv, refresh) {
-  const draft = invoiceEmail(inv);
-  const to = input('to', inv.sent_to || inv.recipients[0] || '', { type: 'email', multiple: true, required: true, list: 'inv-recipients' });
-  const subject = input('subject', draft.subject, { maxlength: 300 });
-  const body = textarea('body', draft.body, { rows: 9 });
+/**
+ * Email from the user's own mailbox: Gmail or the email app opens pre-filled (an attachment, if any,
+ * is downloaded first and attached by hand); "I've sent it" then calls onSent(addresses).
+ */
+function composeEmail({ title, recipients, to: toValue, subject: subjectValue, body: bodyValue, attachment, onSent }) {
+  const to = input('to', toValue, { type: 'email', multiple: true, required: true, list: 'compose-recipients' });
+  const subject = input('subject', subjectValue, { maxlength: 300 });
+  const body = textarea('body', bodyValue, { rows: 9 });
   const enc = encodeURIComponent;
   const addresses = () => to.value.split(',').map(a => a.trim()).filter(Boolean);
   const needTo = () => {
@@ -1487,14 +1517,14 @@ function emailDialog(inv, refresh) {
     to.reportValidity();
     return false;
   };
-  const dlg = openDialog(`Email ${inv.number} to the customer`, h('div', { class: 'form' },
-    h('datalist', { id: 'inv-recipients' }, inv.recipients.map(r => h('option', { value: r }))),
-    field('To', to, { hint: inv.recipients.length ? 'From the customer and its contacts. Separate several with commas.' : 'No email saved for this customer.' }),
+  const dlg = openDialog(title, h('div', { class: 'form' },
+    h('datalist', { id: 'compose-recipients' }, recipients.map(r => h('option', { value: r }))),
+    field('To', to, { hint: recipients.length ? 'From the customer and its contacts. Separate several with commas.' : 'No email saved for this customer.' }),
     field('Subject', subject),
     field('Message', body),
     h('ol', { class: 'steps' },
-      h('li', {}, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => downloadInvoicePdf(inv) },
-        icon('download'), `Download ${inv.number}.pdf`)),
+      attachment && h('li', {}, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: attachment.download },
+        icon('download'), attachment.label)),
       h('li', {}, h('div', { class: 'btn-row' },
         h('button', {
           class: 'btn btn-secondary btn-sm', type: 'button',
@@ -1517,21 +1547,36 @@ function emailDialog(inv, refresh) {
             try { await navigator.clipboard.writeText(body.value); toast('Message copied'); } catch { toast('Could not copy; select the text instead', true); }
           },
         }, 'Copy message'))),
-      h('li', {}, 'Attach the PDF to the email and send it. Then:')),
+      h('li', {}, attachment ? 'Attach the PDF to the email and send it. Then:' : 'Send the email. Then:')),
     h('div', { class: 'btn-row' },
       h('button', {
         class: 'btn btn-primary', type: 'button',
         onclick: async () => {
           if (!needTo()) return;
           try {
-            await rpc('mark_invoice_sent', { p_id: inv.id, p_to: addresses().join(', ') });
+            await onSent(addresses().join(', '));
             dlg.close();
-            toast(`${inv.number} marked as sent`);
-            refresh();
           } catch (err) { toast(err.message, true); }
         },
       }, 'I\'ve sent it'),
       h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Close'))));
+}
+
+function emailDialog(inv, refresh) {
+  const draft = invoiceEmail(inv);
+  composeEmail({
+    title: `Email ${inv.number} to the customer`,
+    recipients: inv.recipients,
+    to: inv.sent_to || inv.recipients[0] || '',
+    subject: draft.subject,
+    body: draft.body,
+    attachment: { label: `Download ${inv.number}.pdf`, download: () => downloadInvoicePdf(inv) },
+    onSent: async to => {
+      await rpc('mark_invoice_sent', { p_id: inv.id, p_to: to });
+      toast(`${inv.number} marked as sent`);
+      refresh();
+    },
+  });
 }
 
 async function viewInvoice(id) {
@@ -1609,6 +1654,310 @@ async function viewCompanySettings() {
   return layout('settings',
     pageHead('Company settings', 'Printed on every new invoice. Invoices already created keep the details they were made with.'),
     h('section', { class: 'card' }, form));
+}
+
+// ---------- renewals ----------
+
+const daysBetween = (from, to) => Math.round((Date.parse(to + 'T00:00:00Z') - Date.parse(from + 'T00:00:00Z')) / 86400000);
+
+/** Add months like PostgreSQL does: 31 Jan + 1 month = 28/29 Feb. */
+function addMonths(ymd, months) {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const first = new Date(Date.UTC(y, m - 1 + Number(months), 1));
+  const lastDay = new Date(Date.UTC(first.getUTCFullYear(), first.getUTCMonth() + 1, 0)).getUTCDate();
+  first.setUTCDate(Math.min(d, lastDay));
+  return first.toISOString().slice(0, 10);
+}
+
+function periodText(months) {
+  if (months % 12 === 0) return months === 12 ? 'Every year' : `Every ${months / 12} years`;
+  return months === 1 ? 'Every month' : `Every ${months} months`;
+}
+
+/** Red when overdue, amber inside the reminder window, plain otherwise. */
+function renewalBadge(due, today, remindDays, active = true) {
+  if (!active) return h('span', { class: 'badge badge-inactive' }, 'Stopped');
+  const left = daysBetween(today, due);
+  if (left < 0) return h('span', { class: 'badge badge-overdue' }, `Overdue by ${-left} day${left === -1 ? '' : 's'} · ${fmtDate(due)}`);
+  if (left <= remindDays) {
+    return h('span', { class: 'badge badge-lead' }, left === 0 ? `Due today · ${fmtDate(due)}` : `Due in ${left} day${left === 1 ? '' : 's'} · ${fmtDate(due)}`);
+  }
+  return h('span', { class: 'badge badge-plain' }, `Due ${fmtDate(due)}`);
+}
+
+const renewalLabel = r => [r.type_name || 'Renewal', r.reference].filter(Boolean).join(' · ');
+
+async function viewRenewals(params) {
+  const query = new URLSearchParams(params);
+  const win = query.get('window') || 'due';
+  const [types, data] = await Promise.all([
+    rpc('list_renewal_types'),
+    rpc('list_renewals', {
+      p_q: query.get('q') || null, p_window: win, p_type: Number(query.get('type')) || null,
+      p_assignee: query.get('assignee') || null, p_page: Number(query.get('page')) || 1,
+    }),
+    loadUsers(),
+  ]);
+  const setParam = (key, value) => {
+    const q = new URLSearchParams(params);
+    if (value) q.set(key, value); else q.delete(key);
+    if (key !== 'page') q.delete('page');
+    location.hash = '#/renewals' + (q.toString() ? '?' + q : '');
+  };
+  let searchTimer;
+  const filterBar = h('div', { class: 'filters' },
+    input('q', query.get('q'), {
+      type: 'search', placeholder: 'Search customer, name or document…', 'aria-label': 'Search renewals',
+      oninput: e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => setParam('q', e.target.value.trim()), 350); },
+    }),
+    select('window', win, [['due', 'Due for a reminder'], ['overdue', 'Overdue'], ['30', 'Due within 30 days'],
+      ['90', 'Due within 90 days'], ['all', 'All active'], ['stopped', 'Stopped']],
+      { 'aria-label': 'When', onchange: e => setParam('window', e.target.value === 'due' ? '' : e.target.value) }),
+    select('type', query.get('type'), [['', 'All types'], ...types.map(t => [String(t.id), t.name])],
+      { 'aria-label': 'Type', onchange: e => setParam('type', e.target.value) }),
+    select('assignee', query.get('assignee'), [['', 'Anyone'], ['me', 'Looked after by me'], ['none', 'No one assigned'],
+      ...state.users.filter(u => u.active).map(u => [u.id, u.name])],
+      { 'aria-label': 'Looked after by', onchange: e => setParam('assignee', e.target.value) }));
+
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  const filtered = ['q', 'type', 'assignee'].some(k => query.get(k)) || win !== 'due';
+  const table = data.renewals.length
+    ? h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {},
+          h('th', {}, 'Renewal'), h('th', {}, 'Customer'), h('th', {}, 'Due'),
+          h('th', { class: 'hide-sm' }, 'Last reminded'), h('th', { class: 'hide-sm' }, 'Looked after by'))),
+        h('tbody', {}, data.renewals.map(r => h('tr', {},
+          h('td', {}, h('a', { class: 'row-link', href: `#/renewals/${r.id}` }, r.type_name || 'Renewal'),
+            r.reference && h('div', { class: 'meta muted' }, r.reference)),
+          h('td', {}, h('a', { href: `#/customers/${r.customer_id}` }, r.customer_name)),
+          h('td', {}, renewalBadge(r.due_date, data.today, r.remind_days, r.active)),
+          h('td', { class: 'hide-sm' }, r.last_reminded_at ? fmtDate(r.last_reminded_at) : h('span', { class: 'muted' }, 'Not yet')),
+          h('td', { class: 'hide-sm' }, r.assignee_name || h('span', { class: 'muted' }, '—')))))))
+    : h('p', { class: 'empty' }, filtered ? 'No renewals match these filters.'
+        : 'Nothing is due for a reminder right now. Add renewals from a customer\'s page or with "+ Add renewal".');
+
+  return layout('renewals',
+    pageHead('Renewals', win === 'due'
+      ? `${data.total} due for a reminder (inside their reminder period, or overdue)`
+      : `${data.total} renewal${data.total === 1 ? '' : 's'}`,
+      h('a', { class: 'btn btn-primary', href: '#/renewals/new' }, '+ Add renewal')),
+    h('section', { class: 'card' },
+      filterBar,
+      table,
+      data.total > data.pageSize && h('div', { class: 'pager' },
+        h('span', { class: 'muted' }, `Page ${data.page} of ${pages}`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
+function renewalForm(r, customers, types, onSubmit, cancelHref) {
+  const usable = types.filter(t => t.active || t.id === r.type_id);
+  const months = input('interval_months', r.interval_months, { type: 'number', min: 1, max: 120, required: true });
+  const days = input('remind_days', r.remind_days, { type: 'number', min: 0, max: 365, required: true });
+  // Picking a type fills in its usual period and reminder, unless they were changed by hand.
+  const touched = { months: Boolean(r.id), days: Boolean(r.id) };
+  months.addEventListener('input', () => { touched.months = true; });
+  days.addEventListener('input', () => { touched.days = true; });
+  const typeSelect = select('type_id', r.type_id ? String(r.type_id) : '', [['', 'Pick a type…'], ...usable.map(t => [String(t.id), t.name])], {
+    required: true,
+    onchange: e => {
+      const t = types.find(x => String(x.id) === e.target.value);
+      if (!t) return;
+      if (!touched.months) months.value = t.interval_months;
+      if (!touched.days) days.value = t.remind_days;
+    },
+  });
+  const people = [['', 'No one'], ...state.users.filter(u => u.active || u.id === r.assigned_to).map(u => [u.id, u.name])];
+  return handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Customer', select('customer_id', r.customer_id ? String(r.customer_id) : '', [['', 'Pick a customer…'],
+        ...customers.map(c => [String(c.id), c.name])], { required: true })),
+      field('Type', typeSelect),
+      field('For (person, document or reference)', input('reference', r.reference, { maxlength: 200,
+        placeholder: 'e.g. Ahmed Ali, or License no. 12345' }), { full: true,
+        hint: 'One company can have several of the same type, e.g. a visa for each employee.' }),
+      field('Next due date', input('due_date', r.due_date, { type: 'date', required: true })),
+      field('Looked after by', select('assigned_to', r.assigned_to || '', people)),
+      field('Repeats every (months)', months, { hint: '3 = quarterly, 12 = yearly, 24 = every 2 years.' }),
+      field('Start reminding (days before)', days),
+      field('Notes (optional)', textarea('notes', r.notes, { rows: 3, maxlength: 2000,
+        placeholder: 'e.g. Documents needed: passport copy, photo, Emirates ID' }), { full: true })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, r.id ? 'Save changes' : 'Add renewal'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  onSubmit);
+}
+
+async function viewRenewalNew(params) {
+  const [customers, types] = await Promise.all([rpc('customer_options'), rpc('list_renewal_types'), loadUsers()]);
+  const customerId = Number(params.customer) || null;
+  const back = customerId ? `#/customers/${customerId}` : '#/renewals';
+  return layout('renewals',
+    pageHead('Add renewal', 'A service the customer needs again and again, like a VAT return or a visa.', null, h('a', { href: back }, '← Back')),
+    h('section', { class: 'card' }, renewalForm({ customer_id: customerId, assigned_to: state.user.id }, customers, types, async data => {
+      const id = await rpc('save_renewal', { p_id: null, p_data: data });
+      toast('Renewal added');
+      location.hash = `#/renewals/${id}`;
+    }, back)));
+}
+
+async function viewRenewalEdit(id) {
+  const [{ renewal: r }, customers, types] = await Promise.all([
+    rpc('get_renewal', { p_id: id }), rpc('customer_options'), rpc('list_renewal_types'), loadUsers()]);
+  return layout('renewals',
+    pageHead('Edit renewal', renewalLabel(r), null, h('a', { href: `#/renewals/${id}` }, '← Back')),
+    h('section', { class: 'card' }, renewalForm(r, customers, types, async data => {
+      await rpc('save_renewal', { p_id: id, p_data: data });
+      toast('Changes saved');
+      location.hash = `#/renewals/${id}`;
+    }, `#/renewals/${id}`)));
+}
+
+function renewedDialog(r, refresh) {
+  const suggested = addMonths(r.due_date, r.interval_months);
+  const dlg = openDialog('Mark as renewed', handleForm(h('form', { class: 'form' },
+    h('p', { class: 'muted' }, `Current due date: ${fmtDate(r.due_date)}. ${periodText(r.interval_months)}, so the next one is suggested below. Change it if the new expiry date is different.`),
+    field('Next due date', input('new_due', suggested, { type: 'date', required: true })),
+    field('Note (optional)', textarea('note', '', { rows: 2, maxlength: 2000, placeholder: 'e.g. Renewed until 15 Jan 2028, receipt no. 4471' })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    const next = await rpc('mark_renewed', { p_id: r.id, p_new_due: data.new_due, p_note: data.note || null });
+    dlg.close();
+    toast(`Renewed. Next due ${fmtDate(next)}`);
+    refresh();
+  }));
+}
+
+function remindDialog(r, company, refresh) {
+  const what = [r.type_name ? r.type_name.toLowerCase() : 'renewal', r.reference && `for ${r.reference}`].filter(Boolean).join(' ');
+  const body = [
+    `Dear ${r.customer_name},`, '',
+    `This is a friendly reminder that the ${what} is due on ${fmtDate(r.due_date)}.`, '',
+    'To make sure it is completed on time, please send us the required documents, or reply to this email and we will take care of everything for you.',
+    r.notes ? `\nFor your reference: ${r.notes}` : null,
+    '', 'Kind regards,', state.user.name, company.legal_name, company.phone,
+  ].filter(l => typeof l === 'string').join('\n');
+  composeEmail({
+    title: 'Remind the customer',
+    recipients: r.recipients,
+    to: r.last_reminded_to || r.recipients[0] || '',
+    subject: `Reminder: ${r.type_name || 'Renewal'}${r.reference ? ' (' + r.reference + ')' : ''} due ${fmtDate(r.due_date)}`,
+    body,
+    onSent: async to => {
+      await rpc('mark_renewal_reminded', { p_id: r.id, p_to: to });
+      toast('Reminder recorded');
+      refresh();
+    },
+  });
+}
+
+const RENEWAL_EVENT = { created: 'Added', reminded: 'Reminded', renewed: 'Renewed', task: 'Task', stopped: 'Stopped', restarted: 'Restarted' };
+const RENEWAL_ICON = { created: 'note', reminded: 'email', renewed: 'renew', task: 'task', stopped: 'note', restarted: 'renew' };
+
+async function viewRenewal(id) {
+  const [{ renewal: r, today }, company] = await Promise.all([rpc('get_renewal', { p_id: id }), rpc('get_company_settings')]);
+  const refresh = () => render();
+  const act = (fn, args, message, after) => async () => {
+    try {
+      const result = await rpc(fn, args);
+      toast(message);
+      if (after) after(result); else refresh();
+    } catch (err) { toast(err.message, true); }
+  };
+  const facts = [
+    ['Customer', h('a', { href: `#/customers/${r.customer_id}` }, r.customer_name)],
+    r.reference && ['For', r.reference],
+    ['Next due', renewalBadge(r.due_date, today, r.remind_days, r.active)],
+    ['Repeats', periodText(r.interval_months)],
+    ['Reminders from', `${fmtDate(addDays(r.due_date, -r.remind_days))} (${r.remind_days} days before)`],
+    ['Looked after by', r.assignee_name || h('span', { class: 'muted' }, 'No one')],
+    ['Last reminded', r.last_reminded_at ? `${fmtDate(r.last_reminded_at, true)}${r.last_reminded_to ? ' · ' + r.last_reminded_to : ''}` : h('span', { class: 'muted' }, 'Not yet this period')],
+  ].filter(Boolean);
+
+  return layout('renewals',
+    pageHead(r.type_name || 'Renewal', r.reference ? `${r.reference} · ${r.customer_name}` : r.customer_name, [
+      r.active && h('button', { class: 'btn btn-primary', onclick: () => remindDialog(r, company, refresh) }, 'Remind customer'),
+      r.active && h('button', { class: 'btn btn-secondary', onclick: () => renewedDialog(r, refresh) }, '✓ Mark as renewed'),
+      isManager() && r.active && h('button', {
+        class: 'btn btn-secondary',
+        onclick: act('create_renewal_task', { p_id: id }, 'Task created', taskId => { location.hash = `#/tasks/${taskId}`; }),
+      }, 'Create task'),
+      h('a', { class: 'btn btn-secondary', href: `#/renewals/${id}/edit` }, 'Edit'),
+      h('button', {
+        class: 'btn btn-secondary',
+        onclick: act('set_renewal_active', { p_id: id, p_active: !r.active }, r.active ? 'Stopped' : 'Restarted'),
+      }, r.active ? 'Stop' : 'Restart'),
+      isManager() && h('button', {
+        class: 'btn btn-danger',
+        onclick: () => {
+          if (confirmAction('Delete this renewal and its history? To keep the history, use "Stop" instead.')) {
+            act('delete_renewal', { p_id: id }, 'Renewal deleted', () => { location.hash = '#/renewals'; })();
+          }
+        },
+      }, 'Delete'),
+    ], [h('a', { href: '#/renewals' }, '← Renewals')]),
+    h('div', { class: 'grid detail-layout' },
+      h('div', {},
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Details')),
+          h('dl', { class: 'facts' }, facts.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+          r.notes && [h('h3', { class: 'notes-heading' }, 'Notes'), h('p', { class: 'prewrap' }, r.notes)]),
+        h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Tasks')),
+          r.tasks.length
+            ? h('ul', { class: 'list' }, r.tasks.map(t => h('li', {},
+                h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/tasks/${t.id}` }, t.title)),
+                taskStatusBadge(t.status))))
+            : h('p', { class: 'empty' }, isManager() ? 'Use "Create task" to hand the renewal work to a team member.' : 'No tasks yet.'))),
+      h('section', { class: 'card' },
+        h('div', { class: 'card-head' }, h('h2', {}, 'History')),
+        h('ul', { class: 'list' }, r.events.map(e => h('li', {},
+          h('span', { class: 'kind-icon' }, icon(RENEWAL_ICON[e.kind] || 'note')),
+          h('div', { class: 'grow' },
+            h('strong', {}, e.kind === 'renewed' ? `Renewed: ${fmtDate(e.old_due)} → ${fmtDate(e.new_due)}`
+              : e.kind === 'created' ? `Added, due ${fmtDate(e.new_due)}` : e.body || RENEWAL_EVENT[e.kind]),
+            e.kind === 'renewed' && e.body && h('div', { class: 'body' }, e.body),
+            h('div', { class: 'meta' }, `${e.user_name || 'Unknown'} · ${fmtDate(e.created_at, true)}`))))))));
+}
+
+// ---------- types of work and renewal types (managers) ----------
+
+function renewalTypeDialog(t, refresh) {
+  const dlg = openDialog(t.id ? `Edit "${t.name}"` : 'Add renewal type', handleForm(h('form', { class: 'form' },
+    field('Name', input('name', t.name, { required: true, maxlength: 100, placeholder: 'e.g. Establishment card renewal' })),
+    h('div', { class: 'form-grid' },
+      field('Repeats every (months)', input('interval_months', t.interval_months ?? 12, { type: 'number', min: 1, max: 120, required: true })),
+      field('Remind (days before)', input('remind_days', t.remind_days ?? 30, { type: 'number', min: 0, max: 365, required: true }))),
+    h('p', { class: 'hint' }, 'These are the defaults for new renewals of this type. Existing renewals keep their own settings.'),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: t.active !== false }), 'In use'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('save_renewal_type', { p_id: t.id || null, p_data: data });
+    dlg.close();
+    toast('Saved');
+    refresh();
+  }));
+}
+
+function renewalTypesCard(types, refresh) {
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', {}, 'Renewal types'),
+      h('button', { class: 'btn btn-secondary btn-sm', onclick: () => renewalTypeDialog({}, refresh) }, '+ Add')),
+    h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Repeats'), h('th', {}, 'Reminder'),
+        h('th', { class: 'hide-sm' }, 'Active renewals'), h('th', {}, 'Status'), h('th', {}, ''))),
+      h('tbody', {}, types.map(t => h('tr', {},
+        h('td', {}, h('a', { class: 'row-link', href: `#/renewals?type=${t.id}&window=all` }, t.name)),
+        h('td', {}, periodText(t.interval_months)),
+        h('td', {}, `${t.remind_days} days before`),
+        h('td', { class: 'hide-sm' }, t.renewals),
+        h('td', {}, t.active ? h('span', { class: 'badge badge-active' }, 'In use') : h('span', { class: 'badge badge-inactive' }, 'Switched off')),
+        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => renewalTypeDialog(t, refresh) }, 'Edit'))))))));
 }
 
 // ---------- users (admin) ----------
@@ -1754,6 +2103,10 @@ async function render() {
       else if ((m = path.match(/^\/invoices\/(\d+)$/))) view = await viewInvoice(Number(m[1]));
       else if ((m = path.match(/^\/invoices\/(\d+)\/edit$/))) view = await viewInvoiceEdit(Number(m[1]));
       else if (path === '/settings') view = await viewCompanySettings();
+      else if (path === '/renewals') view = await viewRenewals(params);
+      else if (path === '/renewals/new') view = await viewRenewalNew(params);
+      else if ((m = path.match(/^\/renewals\/(\d+)$/))) view = await viewRenewal(Number(m[1]));
+      else if ((m = path.match(/^\/renewals\/(\d+)\/edit$/))) view = await viewRenewalEdit(Number(m[1]));
       else if (path === '/coming-soon') view = viewComingSoon();
       else view = viewNotFound();
     }
