@@ -192,6 +192,37 @@ create table if not exists public.invoice_lines (
 );
 create index if not exists invoice_lines_invoice_idx on public.invoice_lines (invoice_id);
 
+-- Money received against an invoice. Bounced cheques stay on record but don't count as paid.
+create table if not exists public.payments (
+  id            bigint generated always as identity primary key,
+  invoice_id    bigint not null references public.invoices (id) on delete restrict,
+  amount        numeric(14, 2) not null check (amount > 0),
+  method        text not null check (method in ('bank_transfer', 'cash', 'cheque', 'other')),
+  paid_on       date not null,
+  reference     text check (char_length(reference) <= 100),
+  cheque_bank   text check (char_length(cheque_bank) <= 100),
+  cheque_date   date,
+  cheque_status text check (cheque_status in ('pending', 'cleared', 'bounced')),
+  notes         text check (char_length(notes) <= 1000),
+  recorded_by   uuid references public.profiles (id) on delete set null,
+  created_at    timestamptz not null default now(),
+  constraint payments_cheque_status_only_for_cheques check ((method = 'cheque') = (cheque_status is not null))
+);
+create index if not exists payments_invoice_idx on public.payments (invoice_id);
+
+-- Running totals on each invoice, kept up to date by private.refresh_invoice_payments().
+alter table public.invoices add column if not exists amount_paid numeric(14, 2) not null default 0;
+alter table public.invoices add column if not exists payment_reminded_at timestamptz;
+alter table public.invoices add column if not exists payment_reminded_to text;
+
+-- Invoices marked "paid" before payments were recorded get one payment for the full amount, so balances add up.
+insert into public.payments (invoice_id, amount, method, paid_on, notes)
+select i.id, i.total, 'other', coalesce(i.paid_at, i.updated_at)::date, 'Marked as paid before payments were recorded'
+from public.invoices i
+where i.status = 'paid' and i.total > 0 and not exists (select 1 from public.payments p where p.invoice_id = i.id);
+update public.invoices i set amount_paid = coalesce((
+  select sum(p.amount) from public.payments p where p.invoice_id = i.id and p.cheque_status is distinct from 'bounced'), 0);
+
 -- Kinds of recurring service (VAT return every 3 months, trade license every year, ...).
 create table if not exists public.renewal_types (
   id              bigint generated always as identity primary key,
@@ -270,10 +301,11 @@ alter table public.invoice_lines    enable row level security;
 alter table public.renewal_types    enable row level security;
 alter table public.renewals         enable row level security;
 alter table public.renewal_events   enable row level security;
+alter table public.payments         enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
               public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
-              public.renewal_types, public.renewals, public.renewal_events
+              public.renewal_types, public.renewals, public.renewal_events, public.payments
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -566,8 +598,21 @@ begin
           and not exists (select 1 from public.invoices i
                           where i.task_id = t2.id and i.kind = 'tax' and i.status <> 'cancelled')
         order by t2.completed_at desc nulls last, t2.id desc limit 10) x), '[]'),
-    'unpaid', (select json_build_object('count', count(*), 'total', coalesce(sum(total), 0))
-               from public.invoices where kind = 'tax' and status = 'sent'),
+    'unpaid', (select json_build_object('count', count(*), 'total', coalesce(sum(total - amount_paid), 0))
+               from public.invoices where kind = 'tax' and status = 'sent' and total > amount_paid),
+    -- Money owed on sent tax invoices; overdue = past the payment due date.
+    'receivables', (select json_build_object(
+        'outstanding', coalesce(sum(total - amount_paid), 0),
+        'overdue', coalesce(sum(total - amount_paid) filter (where due_date < t), 0),
+        'overdueCount', count(*) filter (where due_date < t))
+      from public.invoices where kind = 'tax' and status = 'sent' and total > amount_paid),
+    'overdueInvoices', coalesce((
+      select json_agg(x order by x.due_date, x.id) from (
+        select i.id, i.number, i.customer_id, i.customer_name, i.due_date, i.total, i.amount_paid,
+               i.total - i.amount_paid as balance, i.payment_reminded_at
+        from public.invoices i
+        where i.kind = 'tax' and i.status = 'sent' and i.total > i.amount_paid and i.due_date < t
+        order by i.due_date, i.id limit 10) x), '[]'),
     -- Active renewals inside their reminder window (or overdue), soonest first.
     'renewalsDue', coalesce((
       select json_agg(x order by x.due_date, x.id) from (
@@ -665,10 +710,16 @@ begin
         where t.customer_id = c.id), '[]'),
       'invoices', coalesce((
         select jsonb_agg(jsonb_build_object(
-            'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status,
-            'issue_date', i.issue_date, 'total', i.total)
+            'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status, 'due_date', i.due_date,
+            'issue_date', i.issue_date, 'total', i.total, 'amount_paid', i.amount_paid)
           order by i.issue_date desc, i.id desc)
         from public.invoices i where i.customer_id = c.id), '[]'),
+      'balance', (
+        select jsonb_build_object(
+          'outstanding', coalesce(sum(i.total - i.amount_paid), 0),
+          'overdue', coalesce(sum(i.total - i.amount_paid) filter (where i.due_date < private.today()), 0))
+        from public.invoices i
+        where i.customer_id = c.id and i.kind = 'tax' and i.status = 'sent' and i.total > i.amount_paid),
       'renewals', coalesce((
         select jsonb_agg(jsonb_build_object(
             'id', r.id, 'reference', r.reference, 'due_date', r.due_date, 'active', r.active,
@@ -1001,8 +1052,8 @@ begin
         where x.task_id = t.id), '[]'),
       'invoices', coalesce((
         select jsonb_agg(jsonb_build_object(
-            'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status,
-            'issue_date', i.issue_date, 'total', i.total)
+            'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status, 'due_date', i.due_date,
+            'issue_date', i.issue_date, 'total', i.total, 'amount_paid', i.amount_paid)
           order by i.created_at, i.id)
         from public.invoices i where i.task_id = t.id), '[]')))
   into result
@@ -1379,7 +1430,23 @@ begin
             cust.name, concat_ws(E'\n', cust.address, cust.city, cust.country), cust.trn, cust.email,
             to_jsonb(co) - 'id' - 'updated_at', d ->> 'notes', sub_total, vat_sum, sub_total + vat_sum, me.id)
     returning id into v_id;
+    -- Advance payments taken against the proforma now count towards the tax invoice.
+    if v_kind = 'tax' and d ->> 'proforma_id' is not null then
+      update public.payments set invoice_id = v_id where invoice_id = (d ->> 'proforma_id')::bigint;
+      perform private.refresh_invoice_payments((d ->> 'proforma_id')::bigint);
+      perform private.refresh_invoice_payments(v_id);
+      if (select amount_paid from public.invoices where id = v_id) > sub_total + vat_sum then
+        raise exception 'Please fix the highlighted fields' using errcode = '22023',
+          detail = format('{"lines": "The total can''t be less than the AED %s already paid on the proforma"}',
+                          to_char((select amount_paid from public.invoices where id = v_id), 'FM999,999,999,990.00'));
+      end if;
+    end if;
   else
+    if v_old.amount_paid > sub_total + vat_sum then
+      raise exception 'Please fix the highlighted fields' using errcode = '22023',
+        detail = format('{"lines": "The total can''t be less than the AED %s already paid"}',
+                        to_char(v_old.amount_paid, 'FM999,999,999,990.00'));
+    end if;
     v_id := p_id;
     update public.invoices set
       task_id = (d ->> 'task_id')::bigint, customer_id = cust.id, proforma_id = (d ->> 'proforma_id')::bigint,
@@ -1421,6 +1488,10 @@ begin
       'created_by_name', u.name,
       'lines', coalesce((select jsonb_agg(to_jsonb(l) order by l.position) from public.invoice_lines l
                          where l.invoice_id = i.id), '[]'),
+      'payments', coalesce((select jsonb_agg(to_jsonb(pm) || jsonb_build_object('recorded_by_name', pu.name)
+                                             order by pm.paid_on desc, pm.id desc)
+                            from public.payments pm left join public.profiles pu on pu.id = pm.recorded_by
+                            where pm.invoice_id = i.id), '[]'),
       -- Email addresses the invoice could go to: the customer's, then its contacts' (main contact first).
       'recipients', coalesce((
         select jsonb_agg(distinct_emails.email order by distinct_emails.rank, distinct_emails.email) from (
@@ -1465,7 +1536,9 @@ begin
     where (pat is null or i.number ilike pat or i.customer_name ilike pat or t.title ilike pat)
       and (coalesce(p_kind, '') not in ('proforma', 'tax') or i.kind = p_kind)
       and (case coalesce(p_status, '')
-             when 'unpaid' then i.status = 'sent'
+             when 'unpaid' then i.status = 'sent' and i.total > i.amount_paid
+             when 'partial' then i.status = 'sent' and i.amount_paid > 0 and i.total > i.amount_paid
+             when 'overdue' then i.kind = 'tax' and i.status = 'sent' and i.total > i.amount_paid and i.due_date < private.today()
              when '' then true
              else i.status = p_status
            end)
@@ -1473,7 +1546,7 @@ begin
   select (select count(*) from f),
          coalesce((select json_agg(x order by x.issue_date desc, x.id desc) from (
            select f.id, f.kind, f.number, f.status, f.issue_date, f.due_date, f.customer_id, f.customer_name,
-                  f.task_id, t.title as task_title, f.total, f.sent_at
+                  f.task_id, t.title as task_title, f.total, f.amount_paid, f.sent_at
            from f left join public.tasks t on t.id = f.task_id
            order by f.issue_date desc, f.id desc
            limit page_size offset (pg - 1) * page_size) x), '[]')
@@ -1500,6 +1573,7 @@ begin
   update public.invoices set status = case when status = 'draft' then 'sent' else status end,
     sent_at = now(), sent_to = left(nullif(btrim(p_to), ''), 500), updated_at = now()
   where id = p_id;
+  perform private.refresh_invoice_payments(p_id);
   if inv.task_id is not null then
     insert into public.task_updates (task_id, user_id, kind, body)
     values (inv.task_id, me.id, 'comment',
@@ -1508,25 +1582,13 @@ begin
   end if;
 end $$;
 
+-- Kept for older versions of the ERP pages: invoices are now paid by recording payments.
 create or replace function public.set_invoice_paid(p_id bigint, p_paid boolean) returns void
 language plpgsql security definer set search_path = '' as $$
 declare
-  me  public.profiles := private.current_manager();
-  inv public.invoices;
+  me public.profiles := private.current_manager();
 begin
-  select * into inv from public.invoices where id = p_id;
-  if inv.id is null then
-    raise exception 'Invoice not found' using errcode = 'P0002';
-  end if;
-  if inv.status = 'cancelled' then
-    raise exception 'This invoice is cancelled' using errcode = '22023';
-  end if;
-  if p_paid then
-    update public.invoices set status = 'paid', paid_at = now(), updated_at = now() where id = p_id;
-  else
-    update public.invoices set status = case when sent_at is null then 'draft' else 'sent' end,
-      paid_at = null, updated_at = now() where id = p_id;
-  end if;
+  raise exception 'Use "Record payment" on the invoice instead (refresh the page to get the latest version)' using errcode = '22023';
 end $$;
 
 -- Invoices are never deleted (their numbers must stay in sequence); they are cancelled instead.
@@ -1535,6 +1597,9 @@ language plpgsql security definer set search_path = '' as $$
 declare
   me public.profiles := private.current_manager();
 begin
+  if exists (select 1 from public.payments where invoice_id = p_id) then
+    raise exception 'This invoice has payments recorded. Delete them first if the invoice really is to be cancelled.' using errcode = '22023';
+  end if;
   update public.invoices set status = 'cancelled', cancelled_at = now(), updated_at = now()
   where id = p_id and status <> 'cancelled';
   if not found and not exists (select 1 from public.invoices where id = p_id) then
@@ -1860,6 +1925,192 @@ begin
 end $$;
 
 -- -------------------------------------------------------------------------------------
+-- API: payments
+-- -------------------------------------------------------------------------------------
+
+-- Recalculate what has been paid on an invoice and set it to paid / back to sent.
+-- Drafts stay drafts (they become paid when sent, if already paid in full).
+create or replace function private.refresh_invoice_payments(p_invoice_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  paid numeric;
+  last_paid date;
+begin
+  select coalesce(sum(amount), 0), max(paid_on) into paid, last_paid
+  from public.payments where invoice_id = p_invoice_id and cheque_status is distinct from 'bounced';
+  update public.invoices set
+    amount_paid = paid,
+    status = case
+      when status in ('sent', 'paid') and paid >= total and total > 0 then 'paid'
+      when status = 'paid' then 'sent'
+      else status
+    end,
+    paid_at = case when status in ('sent', 'paid') and paid >= total and total > 0 then coalesce(paid_at, last_paid::timestamptz, now()) end,
+    updated_at = now()
+  where id = p_invoice_id;
+end $$;
+
+-- Record money received against an invoice (part or full). Managers and admins only. Returns the payment id.
+-- p_data: amount, method (bank_transfer | cash | cheque | other), paid_on, reference, cheque_bank, cheque_date, notes
+create or replace function public.record_payment(p_invoice_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  d      jsonb := private.clean(p_data, '{
+    "method":      {"type": "enum", "required": true, "values": ["bank_transfer", "cash", "cheque", "other"]},
+    "paid_on":     {"type": "date", "required": true},
+    "reference":   {"type": "text", "max": 100},
+    "cheque_bank": {"type": "text", "max": 100},
+    "cheque_date": {"type": "date"},
+    "notes":       {"type": "text", "max": 1000}
+  }');
+  inv    public.invoices;
+  amt    numeric;
+  errs   jsonb := '{}';
+  v_id   bigint;
+  label  text;
+begin
+  select * into inv from public.invoices where id = p_invoice_id;
+  if inv.id is null then
+    raise exception 'Invoice not found' using errcode = 'P0002';
+  end if;
+  if inv.status = 'cancelled' then
+    raise exception 'This invoice is cancelled' using errcode = '22023';
+  end if;
+
+  begin
+    amt := nullif(btrim(p_data ->> 'amount'), '')::numeric;
+  exception when others then
+    amt := null;
+  end;
+  if amt is null or amt <= 0 or scale(amt) > 2 then
+    errs := errs || '{"amount": "Enter an amount above 0, with at most 2 decimals"}';
+  elsif amt > inv.total - inv.amount_paid then
+    errs := errs || jsonb_build_object('amount', format('More than the balance of AED %s',
+                                                        to_char(inv.total - inv.amount_paid, 'FM999,999,999,990.00')));
+  end if;
+  if (d ->> 'paid_on')::date > private.today() then
+    errs := errs || '{"paid_on": "Can''t be in the future"}';
+  end if;
+  if d ->> 'method' = 'cheque' and d ->> 'reference' is null then
+    errs := errs || '{"reference": "Enter the cheque number"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  insert into public.payments (invoice_id, amount, method, paid_on, reference, cheque_bank, cheque_date, cheque_status, notes, recorded_by)
+  values (p_invoice_id, amt, d ->> 'method', (d ->> 'paid_on')::date, d ->> 'reference',
+          case when d ->> 'method' = 'cheque' then d ->> 'cheque_bank' end,
+          case when d ->> 'method' = 'cheque' then (d ->> 'cheque_date')::date end,
+          case when d ->> 'method' = 'cheque' then 'pending' end, d ->> 'notes', me.id)
+  returning id into v_id;
+  perform private.refresh_invoice_payments(p_invoice_id);
+
+  if inv.task_id is not null then
+    label := case d ->> 'method' when 'bank_transfer' then 'bank transfer' when 'cheque' then 'cheque' when 'cash' then 'cash' else 'payment' end;
+    insert into public.task_updates (task_id, user_id, kind, body)
+    values (inv.task_id, me.id, 'comment',
+            format('Received AED %s by %s for %s', to_char(amt, 'FM999,999,999,990.00'), label, inv.number));
+  end if;
+  return v_id;
+end $$;
+
+-- A cheque was cleared by the bank, or bounced (a bounced cheque no longer counts as paid).
+create or replace function public.set_cheque_status(p_id bigint, p_status text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  pm  public.payments;
+begin
+  select * into pm from public.payments where id = p_id;
+  if pm.id is null then
+    raise exception 'Payment not found' using errcode = 'P0002';
+  end if;
+  if pm.method <> 'cheque' then
+    raise exception 'Only cheques can be cleared or bounced' using errcode = '22023';
+  end if;
+  if coalesce(p_status, '') not in ('pending', 'cleared', 'bounced') then
+    raise exception 'Unknown cheque status' using errcode = '22023';
+  end if;
+  if pm.cheque_status = 'bounced' and p_status <> 'bounced'
+     and pm.amount > (select total - amount_paid from public.invoices where id = pm.invoice_id) then
+    raise exception 'The invoice has been paid since; this cheque can''t count again' using errcode = '22023';
+  end if;
+  update public.payments set cheque_status = p_status where id = p_id;
+  perform private.refresh_invoice_payments(pm.invoice_id);
+end $$;
+
+-- Remove a payment entered by mistake.
+create or replace function public.delete_payment(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  inv bigint;
+begin
+  delete from public.payments where id = p_id returning invoice_id into inv;
+  if inv is null then
+    raise exception 'Payment not found' using errcode = 'P0002';
+  end if;
+  perform private.refresh_invoice_payments(inv);
+end $$;
+
+-- Record that a payment reminder was emailed (from the user's own mailbox).
+create or replace function public.mark_payment_reminded(p_invoice_id bigint, p_to text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  inv public.invoices;
+begin
+  update public.invoices set payment_reminded_at = now(), payment_reminded_to = left(nullif(btrim(p_to), ''), 500)
+  where id = p_invoice_id returning * into inv;
+  if inv.id is null then
+    raise exception 'Invoice not found' using errcode = 'P0002';
+  end if;
+  if inv.task_id is not null then
+    insert into public.task_updates (task_id, user_id, kind, body)
+    values (inv.task_id, me.id, 'comment', format('Sent a payment reminder for %s (balance AED %s) to %s', inv.number,
+            to_char(inv.total - inv.amount_paid, 'FM999,999,999,990.00'), coalesce(nullif(btrim(p_to), ''), 'the customer')));
+  end if;
+end $$;
+
+-- method: '' | bank_transfer | cash | cheque | other; cheques: '' | pending | cleared | bounced
+create or replace function public.list_payments(
+  p_q text default null, p_method text default null, p_cheque_status text default null, p_page int default 1
+) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_member();
+  page_size constant int := 25;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  pat       text;
+  total     bigint;
+  amount    numeric;
+  v_rows    json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  with f as (
+    select pm.*, i.number as invoice_number, i.customer_id, i.customer_name, u.name as recorded_by_name
+    from public.payments pm
+    join public.invoices i on i.id = pm.invoice_id
+    left join public.profiles u on u.id = pm.recorded_by
+    where (pat is null or i.number ilike pat or i.customer_name ilike pat or pm.reference ilike pat)
+      and (coalesce(p_method, '') = '' or pm.method = p_method)
+      and (coalesce(p_cheque_status, '') = '' or pm.cheque_status = p_cheque_status)
+  )
+  select (select count(*) from f),
+         (select coalesce(sum(f.amount) filter (where f.cheque_status is distinct from 'bounced'), 0) from f),
+         coalesce((select json_agg(x order by x.paid_on desc, x.id desc) from (
+           select * from f order by f.paid_on desc, f.id desc
+           limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, amount, v_rows;
+  return json_build_object('payments', v_rows, 'total', total, 'amount', amount, 'page', pg, 'pageSize', page_size,
+                           'today', private.today());
+end $$;
+
+-- -------------------------------------------------------------------------------------
 -- Who may call what: signed-in users only. Helpers are not callable from the API at all.
 -- -------------------------------------------------------------------------------------
 
@@ -1911,7 +2162,12 @@ begin
     'public.mark_renewal_reminded(bigint, text)',
     'public.set_renewal_active(bigint, boolean)',
     'public.create_renewal_task(bigint)',
-    'public.delete_renewal(bigint)'
+    'public.delete_renewal(bigint)',
+    'public.record_payment(bigint, jsonb)',
+    'public.set_cheque_status(bigint, text)',
+    'public.delete_payment(bigint)',
+    'public.mark_payment_reminded(bigint, text)',
+    'public.list_payments(text, text, text, int)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);

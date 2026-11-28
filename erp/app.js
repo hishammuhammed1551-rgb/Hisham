@@ -41,6 +41,7 @@ const ICONS = {
   chart: '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>',
   gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
   download: '<path d="M12 3v12M7 10l5 5 5-5M5 21h14"/>',
+  cash: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 12h.01M18 12h.01"/>',
   renew: '<path d="M21 12a9 9 0 1 1-2.6-6.4L21 8"/><path d="M21 3v5h-5"/>',
   key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
   note: '<path d="M5 3h10l4 4v14H5z"/><path d="M9 11h6M9 15h6"/>',
@@ -73,6 +74,20 @@ const INVOICE_KIND = { proforma: 'Proforma invoice', tax: 'Tax invoice' };
 const INVOICE_STATUS = { draft: 'Draft', sent: 'Sent', paid: 'Paid', cancelled: 'Cancelled' };
 const VAT_CODES = { standard: '5% VAT', zero: '0% (zero-rated)', exempt: 'Exempt', out_of_scope: 'No VAT (disbursement)' };
 const invoiceBadge = st => h('span', { class: `badge inv-${st}` }, INVOICE_STATUS[st] || st);
+/** Status including payments: "Overdue · 12 days" or "Partly paid" for sent invoices with a balance. */
+function invoiceStateBadge(i, today) {
+  const balance = Math.round((Number(i.total) - Number(i.amount_paid || 0)) * 100) / 100;
+  if (i.status === 'sent' && balance > 0) {
+    if (i.kind === 'tax' && i.due_date && today && i.due_date < today) {
+      const days = Math.round((Date.parse(today) - Date.parse(i.due_date)) / 86400000);
+      return h('span', { class: 'badge badge-overdue' }, `Overdue · ${days} day${days === 1 ? '' : 's'}`);
+    }
+    if (Number(i.amount_paid) > 0) return h('span', { class: 'badge inv-partial' }, 'Partly paid');
+  }
+  return invoiceBadge(i.status);
+}
+const balanceText = i => (Number(i.amount_paid) > 0 && Number(i.total) > Number(i.amount_paid)
+  ? `balance ${money(Number(i.total) - Number(i.amount_paid))}` : null);
 const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const amount = n => Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const money = n => `AED ${amount(n)}`;
@@ -261,6 +276,7 @@ function layout(active, ...content) {
         link('#/tasks', 'task', 'Tasks', 'tasks'),
         link('#/renewals', 'renew', 'Renewals', 'renewals'),
         link('#/invoices', 'invoice', 'Invoices', 'invoices'),
+        link('#/payments', 'cash', 'Payments', 'payments'),
         h('div', { class: 'nav-heading' }, 'Next modules'),
         soon('chart', 'Expenses & reports'),
         isManager() && h('div', { class: 'nav-heading' }, 'Manage'),
@@ -457,9 +473,7 @@ async function viewDashboard() {
           isManager() && d.unassignedTasks > 0 && h('p', { class: 'notice notice-inline' },
             h('a', { href: '#/tasks?assignee=none' }, `${d.unassignedTasks} open task${d.unassignedTasks > 1 ? 's have' : ' has'} no one assigned`))),
         isManager() && h('section', { class: 'card' },
-          h('div', { class: 'card-head' }, h('h2', {}, 'Ready to invoice'),
-            d.unpaid.count > 0 && h('a', { class: 'btn btn-secondary btn-sm', href: '#/invoices?status=unpaid' },
-              `Unpaid: ${money(d.unpaid.total)}`)),
+          h('div', { class: 'card-head' }, h('h2', {}, 'Ready to invoice')),
           d.toInvoice.length
             ? h('ul', { class: 'list' }, d.toInvoice.map(t => h('li', {},
                 h('span', { class: 'kind-icon' }, icon('invoice')),
@@ -468,6 +482,23 @@ async function viewDashboard() {
                   h('div', { class: 'meta' }, `${t.customer_name}${t.completed_at ? ' · done ' + fmtDate(t.completed_at) : ''}`)),
                 h('a', { class: 'btn btn-primary btn-sm', href: `#/invoices/new?kind=tax&task=${t.id}` }, 'Create tax invoice'))))
             : h('p', { class: 'empty' }, 'Every finished task has a tax invoice.')),
+        isManager() && h('section', { class: 'card' },
+          h('div', { class: 'card-head' }, h('h2', {}, 'Money owed to us'),
+            h('a', { class: 'btn btn-secondary btn-sm', href: '#/invoices?status=unpaid' }, 'See all')),
+          h('dl', { class: 'pay-summary' },
+            h('div', {}, h('dt', {}, 'Outstanding'), h('dd', {}, money(d.receivables.outstanding))),
+            h('div', { class: d.receivables.overdue > 0 ? 'is-overdue' : '' },
+              h('dt', {}, `Overdue (${d.receivables.overdueCount} invoice${d.receivables.overdueCount === 1 ? '' : 's'})`),
+              h('dd', {}, money(d.receivables.overdue)))),
+          d.overdueInvoices.length
+            ? h('ul', { class: 'list' }, d.overdueInvoices.map(i => h('li', {},
+                h('div', { class: 'grow' },
+                  h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number),
+                  h('div', { class: 'meta' }, [i.customer_name, `due ${fmtDate(i.due_date)}`,
+                    i.payment_reminded_at ? `reminded ${fmtDate(i.payment_reminded_at)}` : 'not reminded yet'].join(' · '))),
+                h('div', { class: 'badge-stack' }, h('strong', {}, money(i.balance)),
+                  h('span', { class: 'badge badge-overdue' }, `${daysBetween(i.due_date, d.today)} days late`)))))
+            : h('p', { class: 'empty' }, 'Nothing overdue.')),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', {}, 'Overdue follow-ups'),
             d.overdue.length > 0 && h('span', { class: 'badge badge-overdue' }, d.overdue.length)),
@@ -690,7 +721,9 @@ async function viewCustomer(id) {
     ['Owner', c.owner_name || 'Unassigned'],
     ['Added', `${fmtDate(c.created_at)}${c.created_by_name ? ' by ' + c.created_by_name : ''}`],
     ['Updated', fmtDate(c.updated_at, true)],
-  ].filter(([, v]) => v);
+    c.balance.outstanding > 0 && ['Balance owed', h('span', {}, money(c.balance.outstanding),
+      c.balance.overdue > 0 && [' ', h('span', { class: 'badge badge-overdue' }, `${money(c.balance.overdue)} overdue`)])],
+  ].filter(f => f && f[1]);
 
   const contacts = h('section', { class: 'card' },
     h('div', { class: 'card-head' }, h('h2', {}, 'Contacts'),
@@ -818,7 +851,8 @@ async function viewCustomer(id) {
                 h('div', { class: 'grow' },
                   h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number),
                   h('div', { class: 'meta' }, `${INVOICE_KIND[i.kind]} · ${fmtDate(i.issue_date)}`)),
-                h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), invoiceBadge(i.status)))))
+                h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), balanceText(i) && h('span', { class: 'meta' }, balanceText(i)),
+                  invoiceStateBadge(i, today)))))
             : h('p', { class: 'empty' }, 'No invoices yet.')),
         h('section', { class: 'card' },
           h('div', { class: 'card-head' }, h('h2', {}, 'Renewals'),
@@ -1017,7 +1051,8 @@ async function viewTask(id) {
           h('div', { class: 'grow' },
             h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number),
             h('div', { class: 'meta' }, `${INVOICE_KIND[i.kind]} · ${fmtDate(i.issue_date)}`)),
-          h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), invoiceBadge(i.status)))))
+          h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), balanceText(i) && h('span', { class: 'meta' }, balanceText(i)),
+            invoiceStateBadge(i, today)))))
       : h('p', { class: 'empty' }, t.customer_id ? 'No invoices yet.' : 'Link a customer to this task (Edit) to invoice it.'));
 
   const commentForm = handleForm(h('form', { class: 'form' },
@@ -1135,7 +1170,7 @@ async function viewInvoices(params) {
     select('kind', query.get('kind'), [['', 'All invoices'], ['proforma', 'Proforma invoices'], ['tax', 'Tax invoices']],
       { 'aria-label': 'Type', onchange: e => setParam('kind', e.target.value) }),
     select('status', query.get('status'), [['', 'Any status'], ['draft', 'Draft'], ['sent', 'Sent'],
-      ['unpaid', 'Sent, not paid'], ['paid', 'Paid'], ['cancelled', 'Cancelled']],
+      ['unpaid', 'Balance owed'], ['overdue', 'Overdue'], ['partial', 'Partly paid'], ['paid', 'Paid'], ['cancelled', 'Cancelled']],
       { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value) }));
 
   const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
@@ -1144,7 +1179,7 @@ async function viewInvoices(params) {
         h('thead', {}, h('tr', {},
           h('th', {}, 'Number'), h('th', { class: 'hide-sm' }, 'Type'), h('th', {}, 'Customer'),
           h('th', { class: 'hide-sm' }, 'Task'), h('th', { class: 'hide-sm' }, 'Date'),
-          h('th', { class: 'num' }, 'Total'), h('th', {}, 'Status'))),
+          h('th', { class: 'num' }, 'Total'), h('th', { class: 'num hide-sm' }, 'Balance'), h('th', {}, 'Status'))),
         h('tbody', {}, data.invoices.map(i => h('tr', {},
           h('td', {}, h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number)),
           h('td', { class: 'hide-sm' }, INVOICE_KIND[i.kind]),
@@ -1152,7 +1187,8 @@ async function viewInvoices(params) {
           h('td', { class: 'hide-sm' }, i.task_id ? h('a', { href: `#/tasks/${i.task_id}` }, i.task_title) : h('span', { class: 'muted' }, '—')),
           h('td', { class: 'hide-sm' }, fmtDate(i.issue_date)),
           h('td', { class: 'num' }, money(i.total)),
-          h('td', {}, invoiceBadge(i.status)))))))
+          h('td', { class: 'num hide-sm' }, i.status === 'cancelled' ? '—' : money(Number(i.total) - Number(i.amount_paid))),
+          h('td', {}, invoiceStateBadge(i, data.today)))))))
     : h('p', { class: 'empty' }, [...query.keys()].length ? 'No invoices match these filters.'
         : 'No invoices yet. They are created from a task (or "+ New proforma").');
 
@@ -1363,7 +1399,10 @@ function invoiceDocument(inv) {
     h('dl', { class: 'inv-totals' },
       h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(inv.subtotal)),
       h('dt', {}, 'VAT 5%'), h('dd', {}, money(inv.vat_total)),
-      h('dt', { class: 'grand' }, 'Total (AED)'), h('dd', { class: 'grand' }, money(inv.total))),
+      h('dt', { class: 'grand' }, 'Total (AED)'), h('dd', { class: 'grand' }, money(inv.total)),
+      Number(inv.amount_paid) > 0 && [
+        h('dt', {}, 'Paid'), h('dd', {}, `- ${money(inv.amount_paid)}`),
+        h('dt', { class: 'grand' }, 'Balance due'), h('dd', { class: 'grand' }, money(Number(inv.total) - Number(inv.amount_paid)))]),
     inv.notes && h('p', { class: 'prewrap' }, inv.notes),
     pay.length > 0 && h('section', { class: 'inv-pay' }, h('div', { class: 'inv-label' }, 'Payment details'), pay.map(l => h('div', {}, l))),
     sup.invoice_notes && h('p', { class: 'muted prewrap' }, sup.invoice_notes),
@@ -1442,8 +1481,11 @@ function buildInvoicePdf(inv) {
 
   // Totals
   const rows = [['Total excl. VAT', money(inv.subtotal)], ['VAT 5%', money(inv.vat_total)], ['Total (AED)', money(inv.total)]];
+  if (Number(inv.amount_paid) > 0) {
+    rows.push(['Paid', `- ${money(inv.amount_paid)}`], ['Balance due', money(Number(inv.total) - Number(inv.amount_paid))]);
+  }
   rows.forEach(([k, v], i) => {
-    const last = i === rows.length - 1;
+    const last = k.startsWith('Total (') || k === 'Balance due';
     doc.setFont('helvetica', last ? 'bold' : 'normal'); doc.setFontSize(last ? 11 : 9.5); doc.setTextColor(...DARK);
     doc.text(k, W - M - 45, y + i * 6, { align: 'right' });
     doc.text(v, W - M, y + i * 6, { align: 'right' });
@@ -1580,7 +1622,8 @@ function emailDialog(inv, refresh) {
 }
 
 async function viewInvoice(id) {
-  const { invoice: inv } = await rpc('get_invoice', { p_id: id });
+  const { invoice: inv, today } = await rpc('get_invoice', { p_id: id });
+  const balance = round2(inv.total - inv.amount_paid);
   const refresh = () => render();
   const act = (fn, args, message) => async () => {
     try {
@@ -1597,8 +1640,8 @@ async function viewInvoice(id) {
     isManager() && inv.status === 'draft' && h('a', { class: 'btn btn-secondary', href: `#/invoices/${id}/edit` }, 'Edit'),
     isManager() && live && inv.kind === 'proforma' && inv.task_id &&
       h('a', { class: 'btn btn-secondary', href: `#/invoices/new?kind=tax&task=${inv.task_id}` }, 'Create tax invoice'),
-    isManager() && inv.status === 'sent' && h('button', { class: 'btn btn-secondary', onclick: act('set_invoice_paid', { p_id: id, p_paid: true }, 'Marked as paid') }, 'Mark as paid'),
-    isManager() && inv.status === 'paid' && h('button', { class: 'btn btn-secondary', onclick: act('set_invoice_paid', { p_id: id, p_paid: false }, 'Marked as not paid') }, 'Mark as not paid'),
+    isManager() && inv.kind === 'tax' && inv.status === 'sent' && balance > 0 &&
+      h('button', { class: 'btn btn-secondary', onclick: () => paymentReminderDialog(inv, refresh) }, 'Payment reminder'),
     isManager() && live && h('button', {
       class: 'btn btn-danger',
       onclick: () => {
@@ -1618,9 +1661,10 @@ async function viewInvoice(id) {
   return layout('invoices',
     pageHead(inv.number, history, actions, [
       h('a', { href: inv.task_id ? `#/tasks/${inv.task_id}` : '#/invoices' }, inv.task_id ? `← ${inv.task_title}` : '← Invoices'),
-      ' ', invoiceBadge(inv.status)]),
+      ' ', invoiceStateBadge(inv, today)]),
     inv.status === 'draft' && isManager() && h('p', { class: 'notice' },
       'Draft: check the charges, then click "Email to customer". Once sent, the invoice can no longer be changed.'),
+    inv.status !== 'cancelled' && paymentsCard(inv, today, refresh),
     h('section', { class: 'card' }, invoiceDocument(inv)));
 }
 
@@ -1960,6 +2004,176 @@ function renewalTypesCard(types, refresh) {
         h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => renewalTypeDialog(t, refresh) }, 'Edit'))))))));
 }
 
+// ---------- payments ----------
+
+const PAY_METHOD = { bank_transfer: 'Bank transfer', cash: 'Cash', cheque: 'Cheque', other: 'Other' };
+const CHEQUE_STATUS = { pending: 'Not cleared yet', cleared: 'Cleared', bounced: 'Bounced' };
+const chequeBadge = st => h('span', { class: `badge cheque-${st}` }, CHEQUE_STATUS[st]);
+
+function recordPaymentDialog(inv, refresh) {
+  const balance = round2(inv.total - inv.amount_paid);
+  const refField = field('Transfer reference', input('reference', '', { maxlength: 100, placeholder: 'e.g. FT2611ABC' }));
+  const chequeFields = h('div', { class: 'form-grid', hidden: true },
+    field('Cheque bank', input('cheque_bank', '', { maxlength: 100 })),
+    field('Cheque date', input('cheque_date', '', { type: 'date' }), { hint: 'For a post-dated cheque, the date written on it.' }));
+  const REF_LABEL = { bank_transfer: 'Transfer reference', cash: 'Receipt number (optional)', cheque: 'Cheque number', other: 'Reference (optional)' };
+  const method = select('method', 'bank_transfer', Object.entries(PAY_METHOD), {
+    onchange: e => {
+      refField.querySelector('label').textContent = REF_LABEL[e.target.value];
+      refField.querySelector('input').required = e.target.value === 'cheque';
+      chequeFields.hidden = e.target.value !== 'cheque';
+    },
+  });
+  const dlg = openDialog(`Record payment for ${inv.number}`, handleForm(h('form', { class: 'form' },
+    h('p', { class: 'muted' }, `Total ${money(inv.total)} · paid so far ${money(inv.amount_paid)} · balance ${money(balance)}`),
+    h('div', { class: 'form-grid' },
+      field('Amount received (AED)', input('amount', balance.toFixed(2), { type: 'number', min: '0.01', max: balance.toFixed(2), step: '0.01', required: true }),
+        { hint: 'Change it for a part payment.' }),
+      field('Received on', input('paid_on', localToday(), { type: 'date', max: localToday(), required: true })),
+      field('Paid by', method),
+      refField),
+    chequeFields,
+    field('Note (optional)', textarea('notes', '', { rows: 2, maxlength: 1000 })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save payment'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('record_payment', { p_invoice_id: inv.id, p_data: data });
+    dlg.close();
+    const left = round2(balance - Number(data.amount));
+    toast(left > 0 ? `Payment saved. Balance now ${money(left)}` : 'Payment saved. Invoice fully paid');
+    refresh();
+  }));
+}
+
+function paymentReminderDialog(inv, refresh) {
+  const sup = inv.supplier || {};
+  const balance = round2(inv.total - inv.amount_paid);
+  const pay = paymentLines(sup);
+  const body = [
+    `Dear ${inv.customer_name},`, '',
+    `This is a friendly reminder that invoice ${inv.number}${inv.due_date ? `, due on ${fmtDate(inv.due_date)},` : ''} has a balance of ${money(balance)}.`,
+    inv.amount_paid > 0 ? `Invoice total ${money(inv.total)}, received so far ${money(inv.amount_paid)}.` : null,
+    '', 'We would be grateful if you could arrange payment at your earliest convenience. If you have already paid, please send us the payment details and ignore this reminder.',
+    ...(pay.length ? ['', 'Payment details:', ...pay] : []),
+    '', 'Kind regards,', state.user.name, sup.legal_name, sup.phone,
+  ].filter(l => typeof l === 'string').join('\n');
+  composeEmail({
+    title: `Payment reminder for ${inv.number}`,
+    recipients: inv.recipients,
+    to: inv.payment_reminded_to || inv.sent_to || inv.recipients[0] || '',
+    subject: `Payment reminder: ${inv.number} (balance ${money(balance)})`,
+    body,
+    attachment: { label: `Download ${inv.number}.pdf`, download: () => downloadInvoicePdf(inv) },
+    onSent: async to => {
+      await rpc('mark_payment_reminded', { p_invoice_id: inv.id, p_to: to });
+      toast('Reminder recorded');
+      refresh();
+    },
+  });
+}
+
+function paymentsCard(inv, today, refresh) {
+  const balance = round2(inv.total - inv.amount_paid);
+  const overdue = inv.kind === 'tax' && inv.status === 'sent' && balance > 0 && inv.due_date && inv.due_date < today;
+  const act = (fn, args, message) => async () => {
+    try { await rpc(fn, args); toast(message); refresh(); } catch (err) { toast(err.message, true); }
+  };
+  return h('section', { class: 'card' },
+    h('div', { class: 'card-head' }, h('h2', {}, 'Payments'),
+      isManager() && inv.status !== 'cancelled' && balance > 0 &&
+        h('button', { class: 'btn btn-primary btn-sm', onclick: () => recordPaymentDialog(inv, refresh) }, '+ Record payment')),
+    h('dl', { class: 'pay-summary' },
+      h('div', {}, h('dt', {}, 'Total'), h('dd', {}, money(inv.total))),
+      h('div', {}, h('dt', {}, 'Paid'), h('dd', {}, money(inv.amount_paid))),
+      h('div', { class: overdue ? 'is-overdue' : balance > 0 ? '' : 'is-paid' },
+        h('dt', {}, overdue ? `Balance · overdue ${daysBetween(inv.due_date, today)} days` : 'Balance'),
+        h('dd', {}, money(balance)))),
+    inv.payment_reminded_at && h('p', { class: 'muted' },
+      `Payment reminder sent ${fmtDate(inv.payment_reminded_at, true)}${inv.payment_reminded_to ? ' to ' + inv.payment_reminded_to : ''}.`),
+    inv.payments.length
+      ? h('ul', { class: 'list' }, inv.payments.map(p => h('li', { class: p.cheque_status === 'bounced' ? 'done' : '' },
+          h('div', { class: 'grow' },
+            h('div', { class: 'body' }, h('strong', {}, money(p.amount)), ` · ${PAY_METHOD[p.method]}`,
+              p.reference ? ` · ${p.method === 'cheque' ? 'Cheque no. ' : ''}${p.reference}` : ''),
+            h('div', { class: 'meta' }, [
+              `Received ${fmtDate(p.paid_on)}`,
+              p.method === 'cheque' && [p.cheque_bank, p.cheque_date && `dated ${fmtDate(p.cheque_date)}`].filter(Boolean).join(', '),
+              p.recorded_by_name && `recorded by ${p.recorded_by_name}`,
+            ].filter(Boolean).join(' · ')),
+            p.notes && h('div', { class: 'meta prewrap' }, p.notes)),
+          h('div', { class: 'badge-stack' },
+            p.cheque_status && chequeBadge(p.cheque_status),
+            isManager() && h('div', { class: 'btn-row' },
+              p.cheque_status && p.cheque_status !== 'cleared' &&
+                h('button', { class: 'btn btn-secondary btn-sm', onclick: act('set_cheque_status', { p_id: p.id, p_status: 'cleared' }, 'Cheque cleared') }, 'Cleared'),
+              p.cheque_status === 'pending' &&
+                h('button', {
+                  class: 'btn btn-danger btn-sm',
+                  onclick: () => {
+                    if (confirmAction(`Mark cheque ${p.reference} as bounced? ${money(p.amount)} goes back on the balance.`)) {
+                      act('set_cheque_status', { p_id: p.id, p_status: 'bounced' }, 'Cheque marked as bounced')();
+                    }
+                  },
+                }, 'Bounced'),
+              h('button', {
+                class: 'btn btn-danger btn-sm', 'aria-label': 'Delete payment',
+                onclick: () => {
+                  if (confirmAction(`Delete this ${money(p.amount)} payment? Only do this if it was entered by mistake.`)) {
+                    act('delete_payment', { p_id: p.id }, 'Payment deleted')();
+                  }
+                },
+              }, 'Delete'))))))
+      : h('p', { class: 'empty' }, 'No payments recorded yet.'));
+}
+
+async function viewPayments(params) {
+  const query = new URLSearchParams(params);
+  const data = await rpc('list_payments', {
+    p_q: query.get('q') || null, p_method: query.get('method') || null, p_cheque_status: query.get('cheque') || null,
+    p_page: Number(query.get('page')) || 1,
+  });
+  const setParam = (key, value) => {
+    const q = new URLSearchParams(params);
+    if (value) q.set(key, value); else q.delete(key);
+    if (key !== 'page') q.delete('page');
+    location.hash = '#/payments' + (q.toString() ? '?' + q : '');
+  };
+  let searchTimer;
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  return layout('payments',
+    pageHead('Payments', `${data.total} payment${data.total === 1 ? '' : 's'} · ${money(data.amount)} received (bounced cheques not counted)`),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' },
+        input('q', query.get('q'), {
+          type: 'search', placeholder: 'Search invoice, customer or reference…', 'aria-label': 'Search payments',
+          oninput: e => { clearTimeout(searchTimer); searchTimer = setTimeout(() => setParam('q', e.target.value.trim()), 350); },
+        }),
+        select('method', query.get('method'), [['', 'Any method'], ...Object.entries(PAY_METHOD)],
+          { 'aria-label': 'Method', onchange: e => setParam('method', e.target.value) }),
+        select('cheque', query.get('cheque'), [['', 'All cheques'], ['pending', 'Cheques not cleared yet'], ['cleared', 'Cleared cheques'], ['bounced', 'Bounced cheques']],
+          { 'aria-label': 'Cheques', onchange: e => setParam('cheque', e.target.value) })),
+      data.payments.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {},
+              h('th', {}, 'Received'), h('th', {}, 'Invoice'), h('th', {}, 'Customer'), h('th', {}, 'Method'),
+              h('th', { class: 'hide-sm' }, 'Reference'), h('th', { class: 'num' }, 'Amount'))),
+            h('tbody', {}, data.payments.map(p => h('tr', {},
+              h('td', {}, fmtDate(p.paid_on)),
+              h('td', {}, h('a', { class: 'row-link', href: `#/invoices/${p.invoice_id}` }, p.invoice_number)),
+              h('td', {}, p.customer_id ? h('a', { href: `#/customers/${p.customer_id}` }, p.customer_name) : p.customer_name),
+              h('td', {}, PAY_METHOD[p.method], p.cheque_status && [' ', chequeBadge(p.cheque_status)],
+                p.cheque_date && h('div', { class: 'meta muted' }, `Cheque dated ${fmtDate(p.cheque_date)}`)),
+              h('td', { class: 'hide-sm' }, p.reference || h('span', { class: 'muted' }, '—')),
+              h('td', { class: 'num' }, money(p.amount)))))))
+        : h('p', { class: 'empty' }, [...query.keys()].length ? 'No payments match these filters.' : 'No payments recorded yet. Record them from an invoice.'),
+      data.total > data.pageSize && h('div', { class: 'pager' },
+        h('span', { class: 'muted' }, `Page ${data.page} of ${pages}`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
 // ---------- users (admin) ----------
 
 function userDialog(u, refresh) {
@@ -2103,6 +2317,7 @@ async function render() {
       else if ((m = path.match(/^\/invoices\/(\d+)$/))) view = await viewInvoice(Number(m[1]));
       else if ((m = path.match(/^\/invoices\/(\d+)\/edit$/))) view = await viewInvoiceEdit(Number(m[1]));
       else if (path === '/settings') view = await viewCompanySettings();
+      else if (path === '/payments') view = await viewPayments(params);
       else if (path === '/renewals') view = await viewRenewals(params);
       else if (path === '/renewals/new') view = await viewRenewalNew(params);
       else if ((m = path.match(/^\/renewals\/(\d+)$/))) view = await viewRenewal(Number(m[1]));

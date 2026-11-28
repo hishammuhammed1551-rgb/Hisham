@@ -354,8 +354,35 @@ test('invoices: proforma when the task is created, tax invoice when it is done',
   if (SHOTS) await admin.screenshot({ path: `${SHOTS}/tax-invoice.png`, fullPage: true });
   await admin.click('button:text("Email to customer")');
   await admin.click('dialog button:text("I\'ve sent it")');
-  await admin.click('button:text("Mark as paid")');
+  // Part payment by cash, then the rest by cheque; a bounced cheque re-opens the balance
+  await admin.click('button:text("Record payment")');
+  assert.equal(await admin.inputValue('dialog [name=amount]'), '4120.00', 'defaults to the full balance');
+  await admin.fill('dialog [name=amount]', '1000');
+  await admin.selectOption('dialog [name=method]', 'cash');
+  await admin.click('dialog button:text("Save payment")');
+  await admin.waitForSelector('text=Payment saved. Balance now AED 3,120.00');
+  await admin.waitForSelector('.crumbs .badge:text("Partly paid")');
+  assert.ok(await admin.isVisible('.inv-totals dd.grand:text("AED 3,120.00")'), 'balance due shown on the invoice');
+  await admin.click('button:text("+ Record payment")');
+  await admin.selectOption('dialog [name=method]', 'cheque');
+  await admin.click('dialog button:text("Save payment")');
+  assert.equal(await admin.$eval('dialog [name=reference]', el => el.checkValidity()), false, 'cheque number is required');
+  await admin.fill('dialog [name=reference]', '000123');
+  await admin.fill('dialog [name=cheque_bank]', 'Example Bank');
+  await admin.click('dialog button:text("Save payment")');
+  await admin.waitForSelector('text=Payment saved. Invoice fully paid');
   await admin.waitForSelector('.crumbs .badge:text("Paid")');
+  assert.ok(await admin.isVisible('.badge:text("Not cleared yet")'));
+  admin.once('dialog', d => d.accept());
+  await admin.click('button:text("Bounced")');
+  await admin.waitForSelector('.crumbs .badge:text("Partly paid")');
+  await admin.click('button:text("Cleared")');
+  await admin.waitForSelector('.crumbs .badge:text("Paid")');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/invoice-payments.png`, fullPage: true });
+  await admin.goto(base + '#/payments');
+  await admin.waitForSelector('h1:text("Payments")');
+  assert.equal(await admin.locator('tbody tr').count(), 2);
+  assert.ok(await admin.isVisible('text=AED 4,120.00 received'));
 
   // Invoices list and dashboard
   await admin.goto(base + '#/invoices');
@@ -444,5 +471,61 @@ test('renewals: add for a customer, see it due, remind, renew, turn into a task'
   await admin.goto(base + '#/work-types');
   await admin.waitForSelector('h2:text("Renewal types")');
   assert.ok(await admin.isVisible('td:text("Every 2 years")'));
+  assert.deepEqual(errors, []);
+});
+
+test('payments: an overdue balance shows on the dashboard and customer, with a payment reminder', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await admin.context().route('https://mail.google.com/**', route => route.fulfill({ contentType: 'text/html', body: 'gmail' }));
+  await signIn(admin, 'admin@lowcaps.test');
+  const today = await admin.evaluate(() => new Date().toLocaleDateString('en-CA'));
+  const inDays = n => new Date(Date.parse(today + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+
+  // A tax invoice that was due 10 days ago, half paid
+  await admin.goto(base + '#/invoices/new?kind=tax');
+  await admin.selectOption('[name=customer_id]', { label: 'Gulf Traders LLC' });
+  await admin.fill('[name=issue_date]', inDays(-40));
+  await admin.fill('[name=due_date]', inDays(-10));
+  await admin.fill('.l-desc', 'Warehousing, October');
+  await admin.fill('.l-price', '1000');
+  await admin.click('button:text("Create tax invoice")');
+  await admin.waitForSelector('.inv-title:text("TAX INVOICE")');
+  const number = await admin.textContent('h1');
+  await admin.click('button:text("Email to customer")');
+  await admin.click('dialog button:text("I\'ve sent it")');
+  await admin.waitForSelector('.crumbs .badge:text("Overdue · 10 days")');
+  await admin.click('button:text("Record payment")');
+  await admin.fill('dialog [name=amount]', '525');
+  await admin.click('dialog [name=reference]');
+  await admin.fill('dialog [name=reference]', 'FT-998877');
+  await admin.click('dialog button:text("Save payment")');
+  await admin.waitForSelector('text=Payment saved. Balance now AED 525.00');
+  await admin.waitForSelector('.pay-summary .is-overdue dd:text("AED 525.00")');
+  assert.ok(await admin.isVisible('.pay-summary .is-overdue dt:text("Balance · overdue 10 days")'));
+
+  // Payment reminder by email
+  await admin.click('button:text("Payment reminder")');
+  assert.match(await admin.inputValue('dialog [name=subject]'), new RegExp(`^Payment reminder: ${number} \\(balance AED 525\\.00\\)$`));
+  assert.match(await admin.inputValue('dialog [name=body]'), /has a balance of AED 525\.00/);
+  const [gmail] = await Promise.all([admin.context().waitForEvent('page'), admin.click('dialog button:text("Open in Gmail")')]);
+  await gmail.close();
+  await admin.click('dialog button:text("I\'ve sent it")');
+  await admin.waitForSelector('text=Payment reminder sent');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/invoice-overdue.png`, fullPage: true });
+
+  // Dashboard, customer page and the overdue filter
+  await admin.goto(base + '#/');
+  await admin.waitForSelector('h2:text("Money owed to us")');
+  assert.ok(await admin.isVisible(`section:has(h2:text("Money owed to us")) a.row-link:text("${number}")`));
+  assert.ok(await admin.isVisible('.badge:text("10 days late")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/dashboard-money.png`, fullPage: true });
+  await admin.goto(base + '#/customers');
+  await admin.click('a.row-link:text("Gulf Traders LLC")');
+  await admin.waitForSelector('dt:text("Balance owed")');
+  assert.ok(await admin.isVisible('.badge:text("AED 525.00 overdue")'));
+  await admin.goto(base + '#/invoices?status=overdue');
+  await admin.waitForSelector(`tbody a.row-link:text("${number}")`);
+  assert.equal(await admin.locator('tbody tr').count(), 1);
   assert.deepEqual(errors, []);
 });
