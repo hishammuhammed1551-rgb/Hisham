@@ -334,3 +334,23 @@ th.num { text-align: right; }
 .sidebar { overflow-y: auto; }
 .sidebar .nav { flex: 0 0 auto; }
 @media (max-height: 820px) { .nav a { padding-top: 0.4rem; padding-bottom: 0.4rem; } .nav-heading { padding-top: 0.5rem; } }
+
+/* finance */
+.value-money { font-size: 1.45rem; }
+.journal-edit td:first-child { width: 30%; }
+.journal-edit select { min-width: 200px; }
+.journal-totals { margin: 0; font-variant-numeric: tabular-nums; }
+.journal-totals .ok { color: var(--color-success); }
+.journal-totals .bad { color: var(--color-error); }
+.row-off td { color: var(--color-muted); }
+.total-row td { font-weight: 700; border-top: 2px solid var(--color-border); }
+.grand-row td { font-weight: 800; font-size: 1.02rem; border-top: 2px solid var(--color-text); }
+.section-row td { font-family: var(--font-serif); font-weight: 700; padding-top: 1rem; background: var(--color-surface); }
+.sub-row td { color: var(--color-muted); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.report td, .report th { font-variant-numeric: tabular-nums; }
+.report-narrow { max-width: 720px; }
+.report-dates { align-items: center; }
+.report-dates input[type="date"] { width: auto; flex: 0 0 auto; }
+.page-head .btn-row input[type="date"] { width: auto; }
+.stat .value.value-money { font-size: 1.35rem; white-space: nowrap; }
+.pay-summary dd { font-size: 1.05rem; white-space: nowrap; }

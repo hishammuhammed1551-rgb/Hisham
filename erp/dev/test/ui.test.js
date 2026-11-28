@@ -668,3 +668,95 @@ test('HR: employee role, sign in with remark when away, leave approval, payslips
   assert.equal(overflow, false, 'no sideways scrolling on a phone');
   assert.deepEqual(errors, []);
 });
+
+test('finance: postings from invoices, opening balances, journals, reversal, bank, reports with export and drill-down', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await signIn(admin, 'admin@lowcaps.test');
+
+  // Earlier tests sent tax invoices and recorded payments: they are already in the books
+  await admin.goto(base + '#/finance/reports?report=tb');
+  await admin.waitForSelector('h2:text("Trial balance")');
+  assert.ok(await admin.isVisible('text=Debits equal credits ✓'));
+  assert.ok(await admin.isVisible('a.row-link:text("Accounts receivable")'));
+  assert.ok(await admin.isVisible('a.row-link:text("VAT output")'));
+
+  // Opening balances, balanced automatically with opening balance equity
+  await admin.goto(base + '#/finance/journals/new?kind=opening');
+  await admin.waitForSelector('h1:text("Opening balances")');
+  await admin.locator('.j-acct').nth(0).selectOption({ label: '1100 · Bank - current account' });
+  await admin.locator('.j-dr').nth(0).fill('50000');
+  await admin.locator('.j-acct').nth(1).selectOption({ label: '3100 · Owner\'s capital' });
+  await admin.locator('.j-cr').nth(1).fill('20000');
+  await admin.waitForSelector('.journal-totals .bad:text("Difference AED 30,000.00")');
+  await admin.click('button:text("Balance with Opening balance equity")');
+  await admin.waitForSelector('.journal-totals .ok:text("Balanced")');
+  await admin.click('button:text("Post entry")');
+  await admin.waitForSelector('text=Entry posted');
+  assert.ok(await admin.isVisible('a.row-link:text("3900 · Opening balance equity")'));
+
+  // A journal that doesn't balance is refused; fixed, posted, then reversed
+  await admin.goto(base + '#/finance/journals/new');
+  await admin.fill('[name=memo]', 'Office rent, this month');
+  await admin.locator('.j-acct').nth(0).selectOption({ label: '6200 · Office rent' });
+  await admin.locator('.j-dr').nth(0).fill('5000');
+  await admin.locator('.j-acct').nth(1).selectOption({ label: '1100 · Bank - current account' });
+  await admin.locator('.j-cr').nth(1).fill('4000');
+  await admin.click('button:text("Post entry")');
+  await admin.waitForSelector('.field.invalid >> text=differ by AED 1,000.00');
+  await admin.locator('.j-cr').nth(1).fill('5000');
+  await admin.click('button:text("Post entry")');
+  await admin.waitForSelector('text=Entry posted');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-journal.png`, fullPage: true });
+  await admin.click('button:text("Reverse")');
+  await admin.click('dialog button:text("Reverse")');
+  await admin.waitForSelector('text=Entry reversed');
+  assert.ok(await admin.isVisible('dt:text("Reverses")'));
+
+  // Bank: money out for bank charges
+  await admin.goto(base + '#/finance/bank');
+  await admin.click('button:text("Money out")');
+  await admin.selectOption('dialog [name=other_account_id]', { label: '6400 · Bank charges' });
+  await admin.fill('dialog [name=amount]', '25');
+  await admin.fill('dialog [name=memo]', 'Bank charges, November');
+  await admin.click('dialog button:text("Save")');
+  await admin.waitForSelector('text=Saved');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-bank.png` });
+
+  // Reports: P&L, balance sheet that balances, exports
+  await admin.goto(base + '#/finance/reports?report=pl');
+  await admin.waitForSelector('h2:text("Profit and loss")');
+  assert.ok(await admin.isVisible('a.row-link:text("6400 · Bank charges")'));
+  assert.ok(await admin.isVisible('tr.grand-row:has-text("Gross profit")'));
+  const [csv] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text("Excel (CSV)")')]);
+  assert.match(fs.readFileSync(await csv.path(), 'utf8'), /^﻿Account,AED\r\nRevenue,/);
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-pl.png`, fullPage: true });
+  await admin.click('.tabs button:text("Balance sheet")');
+  await admin.waitForSelector('text=Assets equal liabilities plus equity ✓');
+  const [pdf] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text("PDF")')]);
+  assert.equal(fs.readFileSync(await pdf.path()).subarray(0, 5).toString(), '%PDF-');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-bs.png`, fullPage: true });
+
+  // Drill down: trial balance -> receivables ledger -> entry -> its invoice
+  await admin.click('.tabs button:text("Trial balance")');
+  await admin.click('a.row-link:text("Accounts receivable")');
+  await admin.waitForSelector('h1:text("1200 · Accounts receivable")');
+  assert.ok(await admin.isVisible('td:text("Opening balance")'));
+  await admin.locator('tbody a.row-link').first().click();
+  await admin.waitForSelector('dt:text("From")');
+  await admin.click('dd a');
+  await admin.waitForSelector('.inv-title:text("TAX INVOICE")');
+
+  // Payments now ask which account the money went into
+  await admin.goto(base + '#/invoices?status=unpaid');
+  await admin.locator('tbody a.row-link').first().click();
+  await admin.click('button:text("+ Record payment")');
+  await admin.selectOption('dialog [name=method]', 'cash');
+  assert.equal(await admin.$eval('dialog [name=account_id]', el => el.selectedOptions[0].textContent), '1010 · Cash in hand');
+  await admin.click('dialog button:text("Cancel")');
+
+  await admin.goto(base + '#/finance');
+  await admin.waitForSelector('h2:text("Recent entries")');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/finance-overview.png`, fullPage: true });
+  assert.deepEqual(errors, []);
+});

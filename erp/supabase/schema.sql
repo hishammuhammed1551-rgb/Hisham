@@ -318,6 +318,154 @@ create table if not exists public.payslips (
   check (basic_salary + housing_allowance + transport_allowance + other_allowance + overtime + bonus >= deductions)
 );
 
+-- -------------------------------------------------------------------------------------
+-- Finance: chart of accounts and the double-entry ledger
+-- -------------------------------------------------------------------------------------
+
+-- type decides the normal side and the report section; subtype groups accounts within reports and
+-- tells the automatic postings what an account is for. system_key marks the accounts automatic
+-- postings use (they can be renamed but not removed or retyped).
+create table if not exists public.accounts (
+  id             bigint generated always as identity primary key,
+  code           text not null unique check (code ~ '^\d{3,6}$'),
+  name           text not null check (char_length(btrim(name)) between 1 and 100),
+  type           text not null check (type in ('asset', 'liability', 'equity', 'income', 'expense')),
+  subtype        text not null check (subtype in ('cash', 'bank', 'pdc', 'receivable', 'current_asset', 'fixed_asset', 'vat_input',
+                                                 'payable', 'vat_output', 'customer_advance', 'current_liability', 'long_term_liability',
+                                                 'equity', 'retained_earnings', 'opening_equity',
+                                                 'revenue', 'other_income', 'cost_of_sales', 'expense')),
+  system_key     text unique,
+  bank_name      text check (char_length(bank_name) <= 100),
+  account_number text check (char_length(account_number) <= 50),
+  description    text check (char_length(description) <= 300),
+  active         boolean not null default true,
+  created_at     timestamptz not null default now()
+);
+
+insert into public.accounts (code, name, type, subtype, system_key)
+select x.code, x.name, x.type, x.subtype, x.system_key
+from (values
+  ('1010', 'Cash in hand',                          'asset',     'cash',                'cash'),
+  ('1020', 'Petty cash',                            'asset',     'cash',                'petty_cash'),
+  ('1100', 'Bank - current account',                'asset',     'bank',                'bank'),
+  ('1150', 'Cheques in hand (not yet cleared)',     'asset',     'pdc',                 'pdc'),
+  ('1200', 'Accounts receivable',                   'asset',     'receivable',          'ar'),
+  ('1300', 'Customs duty & disbursements recoverable', 'asset',  'current_asset',       'disbursements'),
+  ('1350', 'Prepaid expenses',                      'asset',     'current_asset',       'prepaid'),
+  ('1360', 'Staff advances',                        'asset',     'current_asset',       null),
+  ('1400', 'VAT input (recoverable)',               'asset',     'vat_input',           'vat_input'),
+  ('1500', 'Security deposits',                     'asset',     'current_asset',       null),
+  ('1600', 'Office equipment & furniture',          'asset',     'fixed_asset',         null),
+  ('1610', 'Vehicles',                              'asset',     'fixed_asset',         null),
+  ('1690', 'Accumulated depreciation',              'asset',     'fixed_asset',         null),
+  ('2100', 'Accounts payable',                      'liability', 'payable',             'ap'),
+  ('2150', 'Customer advances',                     'liability', 'customer_advance',    'customer_advances'),
+  ('2200', 'VAT output',                            'liability', 'vat_output',          'vat_output'),
+  ('2210', 'VAT payable to FTA',                    'liability', 'current_liability',   'vat_payable'),
+  ('2300', 'Accrued expenses',                      'liability', 'current_liability',   'accruals'),
+  ('2310', 'Salaries payable',                      'liability', 'current_liability',   'salaries_payable'),
+  ('2400', 'End of service benefits provision',     'liability', 'long_term_liability', null),
+  ('3100', 'Owner''s capital',                      'equity',    'equity',              null),
+  ('3200', 'Owner''s drawings',                     'equity',    'equity',              null),
+  ('3300', 'Retained earnings',                     'equity',    'retained_earnings',   'retained_earnings'),
+  ('3900', 'Opening balance equity',                'equity',    'opening_equity',      'opening_equity'),
+  ('4100', 'Sea freight revenue',                   'income',    'revenue',             null),
+  ('4110', 'Air freight revenue',                   'income',    'revenue',             null),
+  ('4120', 'Land transport revenue',                'income',    'revenue',             null),
+  ('4130', 'Customs clearance fees',                'income',    'revenue',             null),
+  ('4140', 'Documentation fees',                    'income',    'revenue',             null),
+  ('4150', 'PRO & visa services',                   'income',    'revenue',             null),
+  ('4190', 'Other operating revenue',               'income',    'revenue',             'revenue_other'),
+  ('4900', 'Other income',                          'income',    'other_income',        null),
+  ('5100', 'Freight & carrier costs',               'expense',   'cost_of_sales',       null),
+  ('5110', 'Port & handling charges',               'expense',   'cost_of_sales',       null),
+  ('5120', 'Transport subcontractors',              'expense',   'cost_of_sales',       null),
+  ('6100', 'Salaries & wages',                      'expense',   'expense',             'salaries'),
+  ('6110', 'Staff allowances & benefits',           'expense',   'expense',             null),
+  ('6120', 'Visa & labour costs',                   'expense',   'expense',             null),
+  ('6200', 'Office rent',                           'expense',   'expense',             null),
+  ('6210', 'Utilities & telecom',                   'expense',   'expense',             null),
+  ('6300', 'Vehicle fuel & maintenance',            'expense',   'expense',             null),
+  ('6400', 'Bank charges',                          'expense',   'expense',             'bank_charges'),
+  ('6500', 'Professional fees',                     'expense',   'expense',             null),
+  ('6600', 'Office supplies & printing',            'expense',   'expense',             null),
+  ('6700', 'Depreciation',                          'expense',   'expense',             null),
+  ('6800', 'Marketing',                             'expense',   'expense',             null),
+  ('6900', 'Miscellaneous expenses',                'expense',   'expense',             null)
+) as x(code, name, type, subtype, system_key)
+where not exists (select 1 from public.accounts);
+
+-- Revenue account per type of work, used when a tax invoice is posted.
+alter table public.work_types add column if not exists revenue_account_id bigint references public.accounts (id) on delete set null;
+update public.work_types w set revenue_account_id = a.id
+from public.accounts a
+where w.revenue_account_id is null and a.code = case lower(w.name)
+  when 'sea freight' then '4100' when 'air freight' then '4110' when 'land transport' then '4120'
+  when 'customs clearance' then '4130' when 'documentation' then '4140' else null end;
+
+-- Optional income account chosen on an invoice line (otherwise worked out when posting).
+alter table public.invoice_lines add column if not exists account_id bigint references public.accounts (id) on delete set null;
+
+-- Which account a payment was received into, and whether its posting credited receivables or customer advances.
+alter table public.payments add column if not exists account_id bigint references public.accounts (id) on delete set null;
+alter table public.payments add column if not exists posted_side text check (posted_side in ('ar', 'advance'));
+
+-- Books closed up to this date (nothing can be posted on or before it).
+alter table public.company_settings add column if not exists books_locked_until date;
+
+create table if not exists public.journals (
+  id             bigint generated always as identity primary key,
+  number         text not null unique,
+  entry_date     date not null,
+  kind           text not null check (kind in ('journal', 'adjustment', 'accrual', 'prepayment', 'opening', 'invoice', 'payment',
+                                               'reversal', 'bank_receipt', 'bank_payment', 'transfer')),
+  memo           text check (char_length(memo) <= 500),
+  reference      text check (char_length(reference) <= 100),
+  source_type    text check (source_type in ('invoice', 'payment')),
+  source_id      bigint,
+  reverses_id    bigint references public.journals (id) on delete set null,
+  reversed_by_id bigint references public.journals (id) on delete set null,
+  created_by     uuid references public.profiles (id) on delete set null,
+  created_at     timestamptz not null default now()
+);
+create index if not exists journals_source_idx on public.journals (source_type, source_id);
+create index if not exists journals_date_idx on public.journals (entry_date);
+
+create table if not exists public.journal_lines (
+  id          bigint generated always as identity primary key,
+  journal_id  bigint not null references public.journals (id) on delete cascade,
+  line_no     int not null,
+  account_id  bigint not null references public.accounts (id) on delete restrict,
+  description text check (char_length(description) <= 300),
+  debit       numeric(14, 2) not null default 0 check (debit >= 0),
+  credit      numeric(14, 2) not null default 0 check (credit >= 0),
+  customer_id bigint references public.customers (id) on delete set null,
+  constraint journal_lines_one_side check ((debit > 0) <> (credit > 0))
+);
+create index if not exists journal_lines_journal_idx on public.journal_lines (journal_id);
+create index if not exists journal_lines_account_idx on public.journal_lines (account_id);
+
+-- Debits must equal credits in every journal. Checked when the transaction commits, so it holds
+-- however the lines were written.
+create or replace function private.check_journal_balanced() returns trigger
+language plpgsql security definer set search_path = '' as $$
+declare
+  jid bigint := coalesce(new.journal_id, old.journal_id);
+  dr  numeric;
+  cr  numeric;
+begin
+  select coalesce(sum(debit), 0), coalesce(sum(credit), 0) into dr, cr from public.journal_lines where journal_id = jid;
+  if dr <> cr then
+    raise exception 'Journal entry % does not balance: debits % and credits %', jid, dr, cr using errcode = '23514';
+  end if;
+  return null;
+end $$;
+drop trigger if exists journal_lines_balanced on public.journal_lines;
+create constraint trigger journal_lines_balanced
+  after insert or update or delete on public.journal_lines
+  deferrable initially deferred
+  for each row execute function private.check_journal_balanced();
+
 -- Running totals on each invoice, kept up to date by private.refresh_invoice_payments().
 alter table public.invoices add column if not exists amount_paid numeric(14, 2) not null default 0;
 alter table public.invoices add column if not exists payment_reminded_at timestamptz;
@@ -414,11 +562,15 @@ alter table public.employees        enable row level security;
 alter table public.attendance       enable row level security;
 alter table public.leave_requests   enable row level security;
 alter table public.payslips         enable row level security;
+alter table public.accounts         enable row level security;
+alter table public.journals         enable row level security;
+alter table public.journal_lines    enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
               public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
               public.renewal_types, public.renewals, public.renewal_events, public.payments,
-              public.employees, public.attendance, public.leave_requests, public.payslips
+              public.employees, public.attendance, public.leave_requests, public.payslips,
+              public.accounts, public.journals, public.journal_lines
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -1350,7 +1502,7 @@ declare
   me public.profiles := private.current_member();
 begin
   return coalesce((select json_agg(json_build_object(
-      'id', w.id, 'name', w.name, 'active', w.active,
+      'id', w.id, 'name', w.name, 'active', w.active, 'revenue_account_id', w.revenue_account_id,
       'open_tasks', (select count(*) from public.tasks t where t.work_type_id = w.id and t.status in ('new', 'in_progress', 'waiting')))
     order by not w.active, lower(w.name)) from public.work_types w), '[]');
 end $$;
@@ -1615,7 +1767,8 @@ begin
       'created_by_name', u.name,
       'lines', coalesce((select jsonb_agg(to_jsonb(l) order by l.position) from public.invoice_lines l
                          where l.invoice_id = i.id), '[]'),
-      'payments', coalesce((select jsonb_agg(to_jsonb(pm) || jsonb_build_object('recorded_by_name', pu.name)
+      'payments', coalesce((select jsonb_agg(to_jsonb(pm) || jsonb_build_object('recorded_by_name', pu.name,
+                                               'account_name', (select name from public.accounts where id = pm.account_id))
                                              order by pm.paid_on desc, pm.id desc)
                             from public.payments pm left join public.profiles pu on pu.id = pm.recorded_by
                             where pm.invoice_id = i.id), '[]'),
@@ -1701,6 +1854,7 @@ begin
     sent_at = now(), sent_to = left(nullif(btrim(p_to), ''), 500), updated_at = now()
   where id = p_id;
   perform private.refresh_invoice_payments(p_id);
+  perform private.post_invoice(p_id);
   if inv.task_id is not null then
     insert into public.task_updates (task_id, user_id, kind, body)
     values (inv.task_id, me.id, 'comment',
@@ -1729,6 +1883,10 @@ begin
   end if;
   update public.invoices set status = 'cancelled', cancelled_at = now(), updated_at = now()
   where id = p_id and status <> 'cancelled';
+  if found then
+    perform private.unpost_invoice(p_id, me.id);
+    return;
+  end if;
   if not found and not exists (select 1 from public.invoices where id = p_id) then
     raise exception 'Invoice not found' using errcode = 'P0002';
   end if;
@@ -2089,6 +2247,7 @@ declare
     "reference":   {"type": "text", "max": 100},
     "cheque_bank": {"type": "text", "max": 100},
     "cheque_date": {"type": "date"},
+    "account_id":  {"type": "int"},
     "notes":       {"type": "text", "max": 1000}
   }');
   inv    public.invoices;
@@ -2122,17 +2281,22 @@ begin
   if d ->> 'method' = 'cheque' and d ->> 'reference' is null then
     errs := errs || '{"reference": "Enter the cheque number"}';
   end if;
+  if d ->> 'account_id' is not null and not exists (
+       select 1 from public.accounts where id = (d ->> 'account_id')::bigint and subtype in ('bank', 'cash') and active) then
+    errs := errs || '{"account_id": "Pick a bank or cash account"}';
+  end if;
   if errs <> '{}' then
     raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
   end if;
 
-  insert into public.payments (invoice_id, amount, method, paid_on, reference, cheque_bank, cheque_date, cheque_status, notes, recorded_by)
+  insert into public.payments (invoice_id, amount, method, paid_on, reference, cheque_bank, cheque_date, cheque_status, notes, recorded_by, account_id)
   values (p_invoice_id, amt, d ->> 'method', (d ->> 'paid_on')::date, d ->> 'reference',
           case when d ->> 'method' = 'cheque' then d ->> 'cheque_bank' end,
           case when d ->> 'method' = 'cheque' then (d ->> 'cheque_date')::date end,
-          case when d ->> 'method' = 'cheque' then 'pending' end, d ->> 'notes', me.id)
+          case when d ->> 'method' = 'cheque' then 'pending' end, d ->> 'notes', me.id, (d ->> 'account_id')::bigint)
   returning id into v_id;
   perform private.refresh_invoice_payments(p_invoice_id);
+  perform private.post_payment(v_id, me.id);
 
   if inv.task_id is not null then
     label := case d ->> 'method' when 'bank_transfer' then 'bank transfer' when 'cheque' then 'cheque' when 'cash' then 'cash' else 'payment' end;
@@ -2165,6 +2329,7 @@ begin
     raise exception 'The invoice has been paid since; this cheque can''t count again' using errcode = '22023';
   end if;
   update public.payments set cheque_status = p_status where id = p_id;
+  perform private.post_cheque_change(p_id, pm.cheque_status, p_status, me.id);
   perform private.refresh_invoice_payments(pm.invoice_id);
 end $$;
 
@@ -2175,6 +2340,7 @@ declare
   me  public.profiles := private.current_manager();
   inv bigint;
 begin
+  perform private.unpost_payment(p_id, me.id);
   delete from public.payments where id = p_id returning invoice_id into inv;
   if inv is null then
     raise exception 'Payment not found' using errcode = 'P0002';
@@ -2974,6 +3140,778 @@ begin
 end $$;
 
 -- -------------------------------------------------------------------------------------
+-- Finance: posting engine (used by invoices, payments and the finance pages)
+-- -------------------------------------------------------------------------------------
+
+-- The account automatic postings use for a purpose, e.g. private.acct('ar').
+create or replace function private.acct(p_key text) returns bigint
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  v bigint;
+begin
+  select id into v from public.accounts where system_key = p_key;
+  if v is null then
+    raise exception 'The "%" account is missing from the chart of accounts', p_key using errcode = 'P0002';
+  end if;
+  return v;
+end $$;
+
+-- First day of the financial year containing a date (Jan-Dec).
+create or replace function private.fy_start(p_date date) returns date
+language sql immutable as $$ select make_date(extract(year from p_date)::int, 1, 1) $$;
+
+create or replace function private.next_journal_number(p_date date) returns text
+language plpgsql security definer set search_path = '' as $$
+declare
+  y int := extract(year from p_date)::int;
+  n int;
+begin
+  insert into public.invoice_counters (kind, year, last) values ('journal', y, 1)
+  on conflict (kind, year) do update set last = public.invoice_counters.last + 1
+  returning last into n;
+  return format('JV-%s-%s', y, lpad(n::text, 4, '0'));
+end $$;
+
+-- Write a journal entry. p_lines: [{account_id, debit, credit, description, customer_id}]. Zero lines are skipped.
+-- Returns the new id, or null if every line was zero. Debits must equal credits.
+create or replace function private.post_journal(p_date date, p_kind text, p_memo text, p_reference text,
+                                                p_source_type text, p_source_id bigint, p_lines jsonb, p_user uuid) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  locked date := (select books_locked_until from public.company_settings where id = 1);
+  dr     numeric := 0;
+  cr     numeric := 0;
+  ln     jsonb;
+  n      int := 0;
+  v_id   bigint;
+begin
+  if p_date is null then
+    raise exception 'The entry needs a date' using errcode = '22023';
+  end if;
+  if locked is not null and p_date <= locked then
+    raise exception 'The books are closed up to %. Use a later date, or ask an administrator to reopen them.', to_char(locked, 'DD Mon YYYY')
+      using errcode = '22023';
+  end if;
+  select coalesce(sum((l ->> 'debit')::numeric), 0), coalesce(sum((l ->> 'credit')::numeric), 0) into dr, cr
+  from jsonb_array_elements(p_lines) l;
+  if dr <> cr then
+    raise exception 'Debits (AED %) and credits (AED %) must be equal', to_char(dr, 'FM999,999,999,990.00'), to_char(cr, 'FM999,999,999,990.00')
+      using errcode = '22023';
+  end if;
+  if dr = 0 then
+    return null;
+  end if;
+  insert into public.journals (number, entry_date, kind, memo, reference, source_type, source_id, created_by)
+  values (private.next_journal_number(p_date), p_date, p_kind, left(p_memo, 500), left(p_reference, 100), p_source_type, p_source_id, p_user)
+  returning id into v_id;
+  for ln in select value from jsonb_array_elements(p_lines) loop
+    if coalesce((ln ->> 'debit')::numeric, 0) = 0 and coalesce((ln ->> 'credit')::numeric, 0) = 0 then
+      continue;
+    end if;
+    n := n + 1;
+    insert into public.journal_lines (journal_id, line_no, account_id, description, debit, credit, customer_id)
+    values (v_id, n, (ln ->> 'account_id')::bigint, left(ln ->> 'description', 300),
+            coalesce((ln ->> 'debit')::numeric, 0), coalesce((ln ->> 'credit')::numeric, 0), (ln ->> 'customer_id')::bigint);
+  end loop;
+  return v_id;
+end $$;
+
+-- Reverse an entry: same lines with debit and credit swapped, linked both ways.
+create or replace function private.reverse_journal(p_id bigint, p_date date, p_memo text, p_user uuid) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  j     public.journals;
+  v_id  bigint;
+begin
+  select * into j from public.journals where id = p_id for update;
+  if j.id is null then
+    raise exception 'Journal entry not found' using errcode = 'P0002';
+  end if;
+  if j.reversed_by_id is not null then
+    raise exception 'This entry has already been reversed' using errcode = '22023';
+  end if;
+  if j.reverses_id is not null then
+    raise exception 'This entry is itself a reversal' using errcode = '22023';
+  end if;
+  v_id := private.post_journal(p_date, 'reversal', coalesce(p_memo, 'Reversal of ' || j.number || coalesce(': ' || j.memo, '')),
+    j.number, j.source_type, j.source_id,
+    (select jsonb_agg(jsonb_build_object('account_id', account_id, 'debit', credit, 'credit', debit,
+                                         'description', description, 'customer_id', customer_id) order by line_no)
+     from public.journal_lines where journal_id = p_id), p_user);
+  update public.journals set reverses_id = p_id where id = v_id;
+  update public.journals set reversed_by_id = v_id where id = p_id;
+  return v_id;
+end $$;
+
+-- Post a tax invoice once it is issued: Dr receivables / Cr income (per line) / Cr VAT output.
+-- Disbursement (out of scope) lines go to "disbursements recoverable"; others to the line's account,
+-- the task's type of work's revenue account, or "other operating revenue".
+-- Advances already received against the invoice then move from customer advances to receivables.
+create or replace function private.post_invoice(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  inv   public.invoices;
+  lines jsonb;
+  pm    public.payments;
+begin
+  select * into inv from public.invoices where id = p_id;
+  if inv.id is null or inv.kind <> 'tax' or inv.status not in ('sent', 'paid') then
+    return;
+  end if;
+  if exists (select 1 from public.journals where source_type = 'invoice' and source_id = p_id and kind = 'invoice' and reversed_by_id is null) then
+    return;
+  end if;
+  lines := jsonb_build_array(jsonb_build_object('account_id', private.acct('ar'), 'debit', inv.total, 'credit', 0,
+                                                'description', inv.customer_name, 'customer_id', inv.customer_id));
+  lines := lines || coalesce((
+    select jsonb_agg(jsonb_build_object('account_id', x.acct, 'debit', 0, 'credit', x.amount, 'description', inv.number))
+    from (
+      select coalesce(l.account_id,
+                      case when l.vat_code = 'out_of_scope' then private.acct('disbursements') end,
+                      w.revenue_account_id, private.acct('revenue_other')) as acct,
+             sum(l.net) as amount
+      from public.invoice_lines l
+      left join public.tasks t on t.id = inv.task_id
+      left join public.work_types w on w.id = t.work_type_id
+      where l.invoice_id = p_id
+      group by 1) x), '[]');
+  if inv.vat_total > 0 then
+    lines := lines || jsonb_build_object('account_id', private.acct('vat_output'), 'debit', 0, 'credit', inv.vat_total,
+                                         'description', 'VAT on ' || inv.number);
+  end if;
+  perform private.post_journal(inv.issue_date, 'invoice', format('Tax invoice %s - %s', inv.number, inv.customer_name),
+                               inv.number, 'invoice', p_id, lines, inv.created_by);
+
+  for pm in select * from public.payments where invoice_id = p_id and posted_side = 'advance' order by id loop
+    if pm.cheque_status is distinct from 'bounced' then
+      perform private.post_journal(greatest(inv.issue_date, pm.paid_on), 'payment',
+        format('Advance applied to %s - %s', inv.number, inv.customer_name), inv.number, 'payment', pm.id,
+        jsonb_build_array(
+          jsonb_build_object('account_id', private.acct('customer_advances'), 'debit', pm.amount, 'credit', 0, 'customer_id', inv.customer_id),
+          jsonb_build_object('account_id', private.acct('ar'), 'debit', 0, 'credit', pm.amount, 'customer_id', inv.customer_id)),
+        inv.created_by);
+    end if;
+    update public.payments set posted_side = 'ar' where id = pm.id;
+  end loop;
+end $$;
+
+-- Undo an invoice's posting (when it is cancelled).
+create or replace function private.unpost_invoice(p_id bigint, p_user uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  jid bigint;
+begin
+  for jid in select id from public.journals where source_type = 'invoice' and source_id = p_id and kind = 'invoice' and reversed_by_id is null loop
+    perform private.reverse_journal(jid, private.today(), null, p_user);
+  end loop;
+end $$;
+
+-- Where a payment's money sits for a cheque state: cheques in hand while pending, the bank once
+-- cleared, and back on the customer's account (receivables or advances) if bounced.
+create or replace function private.payment_account(pm public.payments, p_state text) returns bigint
+language plpgsql stable security definer set search_path = '' as $$
+begin
+  if p_state = 'pending' then
+    return private.acct('pdc');
+  elsif p_state = 'bounced' then
+    return case when pm.posted_side = 'advance' then private.acct('customer_advances') else private.acct('ar') end;
+  end if;
+  return coalesce(pm.account_id, case when pm.method = 'cash' then private.acct('cash') else private.acct('bank') end);
+end $$;
+
+-- Post a payment when recorded: Dr bank/cash (or cheques in hand) / Cr receivables, or customer
+-- advances when the invoice is a proforma or a tax invoice not yet issued.
+create or replace function private.post_payment(p_id bigint, p_user uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  pm   public.payments;
+  inv  public.invoices;
+  side text;
+  state text;
+begin
+  select * into pm from public.payments where id = p_id;
+  if pm.id is null or pm.posted_side is not null then
+    return;
+  end if;
+  select * into inv from public.invoices where id = pm.invoice_id;
+  side := case when inv.kind = 'tax' and inv.status in ('sent', 'paid') then 'ar' else 'advance' end;
+  update public.payments set posted_side = side where id = p_id returning * into pm;
+  state := coalesce(pm.cheque_status, 'cleared');
+  if state = 'bounced' then
+    return;   -- (only when catching up older records) a bounced cheque never moved any money
+  end if;
+  perform private.post_journal(pm.paid_on, 'payment',
+    format('%s received for %s - %s', case pm.method when 'cheque' then 'Cheque ' || coalesce(pm.reference, '')
+                                                     when 'cash' then 'Cash' when 'bank_transfer' then 'Bank transfer' else 'Payment' end,
+           inv.number, inv.customer_name),
+    coalesce(pm.reference, inv.number), 'payment', p_id,
+    jsonb_build_array(
+      jsonb_build_object('account_id', private.payment_account(pm, state), 'debit', pm.amount, 'credit', 0),
+      jsonb_build_object('account_id', case side when 'ar' then private.acct('ar') else private.acct('customer_advances') end,
+                         'debit', 0, 'credit', pm.amount, 'customer_id', inv.customer_id)),
+    p_user);
+end $$;
+
+-- A cheque moved from one state to another: move the money between the matching accounts.
+create or replace function private.post_cheque_change(p_id bigint, p_from text, p_to text, p_user uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  pm  public.payments;
+  inv public.invoices;
+  dr  bigint;
+  cr  bigint;
+begin
+  select * into pm from public.payments where id = p_id;
+  if pm.id is null or p_from is not distinct from p_to then
+    return;
+  end if;
+  select * into inv from public.invoices where id = pm.invoice_id;
+  dr := private.payment_account(pm, p_to);
+  cr := private.payment_account(pm, p_from);
+  perform private.post_journal(private.today(), 'payment',
+    format('Cheque %s %s - %s', coalesce(pm.reference, ''), case p_to when 'cleared' then 'cleared' when 'bounced' then 'bounced' else 'back to not cleared' end,
+           inv.customer_name),
+    coalesce(pm.reference, inv.number), 'payment', p_id,
+    jsonb_build_array(
+      jsonb_build_object('account_id', dr, 'debit', pm.amount, 'credit', 0,
+                         'customer_id', case when dr in (private.acct('ar'), private.acct('customer_advances')) then inv.customer_id end),
+      jsonb_build_object('account_id', cr, 'debit', 0, 'credit', pm.amount,
+                         'customer_id', case when cr in (private.acct('ar'), private.acct('customer_advances')) then inv.customer_id end)),
+    p_user);
+end $$;
+
+-- A payment deleted as a mistake: reverse everything it posted.
+create or replace function private.unpost_payment(p_id bigint, p_user uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  jid bigint;
+begin
+  for jid in select id from public.journals where source_type = 'payment' and source_id = p_id
+             and reversed_by_id is null and reverses_id is null order by id desc loop
+    perform private.reverse_journal(jid, greatest(private.today(), (select entry_date from public.journals where id = jid)), null, p_user);
+  end loop;
+end $$;
+
+-- -------------------------------------------------------------------------------------
+-- API: finance (managers and admins; the chart of accounts and closing the books: admins)
+-- -------------------------------------------------------------------------------------
+
+-- Signed balance in the account's normal direction: debit-normal for assets and expenses.
+create or replace function private.normal_balance(p_type text, p_dr numeric, p_cr numeric) returns numeric
+language sql immutable as $$ select case when p_type in ('asset', 'expense') then p_dr - p_cr else p_cr - p_dr end $$;
+
+create or replace function public.list_accounts(p_include_inactive boolean default true) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  fy date := private.fy_start(private.today());
+begin
+  return coalesce((select json_agg(x order by x.code) from (
+    select a.id, a.code, a.name, a.type, a.subtype, a.system_key, a.bank_name, a.account_number, a.description, a.active,
+           coalesce((select private.normal_balance(a.type, sum(l.debit), sum(l.credit))
+                     from public.journal_lines l join public.journals j on j.id = l.journal_id
+                     where l.account_id = a.id and (a.type not in ('income', 'expense') or j.entry_date >= fy)), 0) as balance,
+           exists (select 1 from public.journal_lines l where l.account_id = a.id) as used
+    from public.accounts a where p_include_inactive or a.active) x), '[]');
+end $$;
+
+create or replace function public.save_account(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_admin();
+  d    jsonb := private.clean(p_data, '{
+    "code":           {"type": "text", "required": true, "max": 6},
+    "name":           {"type": "text", "required": true, "max": 100},
+    "type":           {"type": "enum", "required": true, "values": ["asset", "liability", "equity", "income", "expense"]},
+    "subtype":        {"type": "text", "required": true, "max": 30},
+    "bank_name":      {"type": "text", "max": 100},
+    "account_number": {"type": "text", "max": 50},
+    "description":    {"type": "text", "max": 300},
+    "active":         {"type": "bool"}
+  }');
+  old  public.accounts;
+  errs jsonb := '{}';
+  ok   boolean;
+  v_id bigint;
+begin
+  if p_id is not null then
+    select * into old from public.accounts where id = p_id;
+    if old.id is null then
+      raise exception 'Account not found' using errcode = 'P0002';
+    end if;
+  end if;
+  if d ->> 'code' !~ '^\d{3,6}$' then errs := errs || '{"code": "Use 3 to 6 digits"}'; end if;
+  ok := case d ->> 'type'
+    when 'asset' then d ->> 'subtype' in ('cash', 'bank', 'pdc', 'receivable', 'current_asset', 'fixed_asset', 'vat_input')
+    when 'liability' then d ->> 'subtype' in ('payable', 'vat_output', 'customer_advance', 'current_liability', 'long_term_liability')
+    when 'equity' then d ->> 'subtype' in ('equity', 'retained_earnings', 'opening_equity')
+    when 'income' then d ->> 'subtype' in ('revenue', 'other_income')
+    else d ->> 'subtype' in ('cost_of_sales', 'expense') end;
+  if not ok then errs := errs || '{"subtype": "Pick a group that matches the type"}'; end if;
+  if old.system_key is not null and (d ->> 'type' <> old.type or d ->> 'subtype' <> old.subtype or not (d ->> 'active')::boolean) then
+    errs := errs || '{"type": "This account is used by automatic postings: its type and group can''t change and it can''t be switched off"}';
+  elsif old.id is not null and d ->> 'type' <> old.type and exists (select 1 from public.journal_lines where account_id = p_id) then
+    errs := errs || '{"type": "This account already has entries, so its type can''t change"}';
+  end if;
+  if exists (select 1 from public.accounts where code = d ->> 'code' and id is distinct from p_id) then
+    errs := errs || '{"code": "Another account already uses this code"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  if p_id is null then
+    insert into public.accounts (code, name, type, subtype, bank_name, account_number, description, active)
+    values (d ->> 'code', d ->> 'name', d ->> 'type', d ->> 'subtype', d ->> 'bank_name', d ->> 'account_number', d ->> 'description',
+            coalesce((p_data ->> 'active')::boolean, true))
+    returning id into v_id;
+    return v_id;
+  end if;
+  update public.accounts set code = d ->> 'code', name = d ->> 'name', type = d ->> 'type', subtype = d ->> 'subtype',
+    bank_name = d ->> 'bank_name', account_number = d ->> 'account_number', description = d ->> 'description',
+    active = (d ->> 'active')::boolean
+  where id = p_id;
+  return p_id;
+end $$;
+
+create or replace function public.get_finance_settings() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return (select json_build_object('books_locked_until', books_locked_until, 'today', private.today(),
+                                   'fy_start', private.fy_start(private.today()))
+          from public.company_settings where id = 1);
+end $$;
+
+-- Close the books up to a date (nothing can be posted on or before it). Empty reopens them.
+create or replace function public.set_books_locked_until(p_date date) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_admin();
+begin
+  if p_date > private.today() then
+    raise exception 'You can''t close the books for a future date' using errcode = '22023';
+  end if;
+  update public.company_settings set books_locked_until = p_date where id = 1;
+end $$;
+
+-- Manual journal entry. p_data: entry_date, kind (journal | adjustment | accrual | prepayment | opening),
+-- memo, reference, reverse_on (optional: posts the reversal on that date too),
+-- lines: [{account_id, description, debit, credit, customer_id}]
+create or replace function public.post_manual_journal(p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "entry_date": {"type": "date", "required": true},
+    "kind":       {"type": "enum", "values": ["journal", "adjustment", "accrual", "prepayment", "opening"], "default": "journal"},
+    "memo":       {"type": "text", "required": true, "max": 500},
+    "reference":  {"type": "text", "max": 100},
+    "reverse_on": {"type": "date"}
+  }');
+  ln    jsonb;
+  i     int := 0;
+  dr    numeric;
+  cr    numeric;
+  acc   public.accounts;
+  errs  text[] := '{}';
+  clean jsonb := '[]';
+  tdr   numeric := 0;
+  tcr   numeric := 0;
+  v_id  bigint;
+begin
+  if jsonb_typeof(p_data -> 'lines') <> 'array' or jsonb_array_length(p_data -> 'lines') < 2 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"lines": "Add at least two lines"}';
+  end if;
+  for ln in select value from jsonb_array_elements(p_data -> 'lines') loop
+    i := i + 1;
+    begin
+      dr := coalesce(nullif(btrim(ln ->> 'debit'), '')::numeric, 0);
+      cr := coalesce(nullif(btrim(ln ->> 'credit'), '')::numeric, 0);
+    exception when others then
+      errs := errs || format('Line %s: amounts must be numbers', i);
+      continue;
+    end;
+    if dr = 0 and cr = 0 then
+      continue;
+    end if;
+    select * into acc from public.accounts where id = nullif(ln ->> 'account_id', '')::bigint;
+    if acc.id is null or not acc.active then
+      errs := errs || format('Line %s: pick an account', i);
+    elsif dr < 0 or cr < 0 or (dr > 0 and cr > 0) or scale(dr) > 2 or scale(cr) > 2 then
+      errs := errs || format('Line %s: enter either a debit or a credit, 0 or more, with at most 2 decimals', i);
+    elsif d ->> 'kind' = 'opening' and acc.type in ('income', 'expense') then
+      errs := errs || format('Line %s: opening balances are for balance sheet accounts only (not income or expenses)', i);
+    else
+      tdr := tdr + dr;
+      tcr := tcr + cr;
+      clean := clean || jsonb_build_object('account_id', acc.id, 'debit', dr, 'credit', cr,
+        'description', nullif(btrim(ln ->> 'description'), ''),
+        'customer_id', case when acc.subtype in ('receivable', 'customer_advance') then nullif(ln ->> 'customer_id', '')::bigint end);
+    end if;
+  end loop;
+  if array_length(errs, 1) > 0 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = jsonb_build_object('lines', array_to_string(errs, '. '))::text;
+  end if;
+  if tdr = 0 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"lines": "Enter the amounts"}';
+  end if;
+  if tdr <> tcr then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = jsonb_build_object('lines', format('Debits (AED %s) and credits (AED %s) differ by AED %s',
+        to_char(tdr, 'FM999,999,999,990.00'), to_char(tcr, 'FM999,999,999,990.00'), to_char(abs(tdr - tcr), 'FM999,999,999,990.00')))::text;
+  end if;
+  if (d ->> 'reverse_on')::date <= (d ->> 'entry_date')::date then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"reverse_on": "Must be after the entry date"}';
+  end if;
+  v_id := private.post_journal((d ->> 'entry_date')::date, d ->> 'kind', d ->> 'memo', d ->> 'reference', null, null, clean, me.id);
+  if d ->> 'reverse_on' is not null then
+    perform private.reverse_journal(v_id, (d ->> 'reverse_on')::date, null, me.id);
+  end if;
+  return v_id;
+end $$;
+
+-- Reverse an entry. Automatic entries are changed through their invoice or payment instead.
+create or replace function public.reverse_entry(p_id bigint, p_date date, p_memo text default null) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  j  public.journals;
+begin
+  select * into j from public.journals where id = p_id;
+  if j.id is null then
+    raise exception 'Journal entry not found' using errcode = 'P0002';
+  end if;
+  if j.source_type is not null then
+    raise exception 'This entry was made automatically from an % - cancel or correct the % instead', j.source_type, j.source_type
+      using errcode = '22023';
+  end if;
+  if p_date < j.entry_date then
+    raise exception 'The reversal can''t be dated before the entry' using errcode = '22023';
+  end if;
+  return private.reverse_journal(p_id, coalesce(p_date, private.today()), nullif(btrim(p_memo), ''), me.id);
+end $$;
+
+-- Money in / money out of a bank or cash account, or a transfer between two of them.
+-- p_data: kind (in | out | transfer), entry_date, account_id (the bank/cash account), other_account_id
+-- (what it was for; for a transfer, the account the money goes to), amount, memo, reference
+create or replace function public.bank_transaction(p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "kind":             {"type": "enum", "required": true, "values": ["in", "out", "transfer"]},
+    "entry_date":       {"type": "date", "required": true},
+    "account_id":       {"type": "int", "required": true},
+    "other_account_id": {"type": "int", "required": true},
+    "memo":             {"type": "text", "required": true, "max": 500},
+    "reference":        {"type": "text", "max": 100}
+  }');
+  bank  public.accounts;
+  other public.accounts;
+  amt   numeric;
+  errs  jsonb := '{}';
+begin
+  select * into bank from public.accounts where id = (d ->> 'account_id')::bigint;
+  select * into other from public.accounts where id = (d ->> 'other_account_id')::bigint;
+  if bank.id is null or bank.subtype not in ('bank', 'cash') or not bank.active then
+    errs := errs || '{"account_id": "Pick a bank or cash account"}';
+  end if;
+  if other.id is null or not other.active or other.id = bank.id then
+    errs := errs || '{"other_account_id": "Pick a different account"}';
+  elsif d ->> 'kind' = 'transfer' and other.subtype not in ('bank', 'cash') then
+    errs := errs || '{"other_account_id": "Transfers go to another bank or cash account"}';
+  end if;
+  begin
+    amt := nullif(btrim(p_data ->> 'amount'), '')::numeric;
+  exception when others then amt := null;
+  end;
+  if amt is null or amt <= 0 or scale(amt) > 2 then
+    errs := errs || '{"amount": "Enter an amount above 0, with at most 2 decimals"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  return private.post_journal((d ->> 'entry_date')::date,
+    case d ->> 'kind' when 'in' then 'bank_receipt' when 'out' then 'bank_payment' else 'transfer' end,
+    d ->> 'memo', d ->> 'reference', null, null,
+    case when d ->> 'kind' = 'in' then jsonb_build_array(
+        jsonb_build_object('account_id', bank.id, 'debit', amt, 'credit', 0),
+        jsonb_build_object('account_id', other.id, 'debit', 0, 'credit', amt))
+      else jsonb_build_array(
+        jsonb_build_object('account_id', other.id, 'debit', amt, 'credit', 0),
+        jsonb_build_object('account_id', bank.id, 'debit', 0, 'credit', amt)) end,
+    me.id);
+end $$;
+
+-- Bank and cash accounts (and cheques in hand) with their balances.
+create or replace function public.cash_accounts() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return coalesce((select json_agg(x order by x.subtype desc, x.code) from (
+    select a.id, a.code, a.name, a.subtype, a.bank_name, a.account_number, a.active,
+           coalesce((select sum(l.debit - l.credit) from public.journal_lines l where l.account_id = a.id), 0) as balance
+    from public.accounts a where a.subtype in ('bank', 'cash', 'pdc')) x), '[]');
+end $$;
+
+-- kind: '' | manual (journal, adjustment, accrual, prepayment, opening) | automatic | a single kind
+create or replace function public.list_journals(
+  p_q text default null, p_kind text default null, p_from date default null, p_to date default null, p_page int default 1
+) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_manager();
+  page_size constant int := 50;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  pat       text;
+  total     bigint;
+  v_rows    json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  with f as (
+    select j.* from public.journals j
+    where (pat is null or j.number ilike pat or j.memo ilike pat or j.reference ilike pat)
+      and (case coalesce(p_kind, '')
+             when '' then true
+             when 'manual' then j.kind in ('journal', 'adjustment', 'accrual', 'prepayment', 'opening', 'bank_receipt', 'bank_payment', 'transfer')
+             when 'automatic' then j.source_type is not null
+             else j.kind = p_kind end)
+      and (p_from is null or j.entry_date >= p_from)
+      and (p_to is null or j.entry_date <= p_to)
+  )
+  select (select count(*) from f),
+         coalesce((select json_agg(x order by x.entry_date desc, x.id desc) from (
+           select f.id, f.number, f.entry_date, f.kind, f.memo, f.reference, f.source_type, f.source_id, f.reverses_id, f.reversed_by_id,
+                  (select sum(debit) from public.journal_lines where journal_id = f.id) as amount
+           from f order by f.entry_date desc, f.id desc limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, v_rows;
+  return json_build_object('journals', v_rows, 'total', total, 'page', pg, 'pageSize', page_size);
+end $$;
+
+create or replace function public.get_journal(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  result json;
+begin
+  select json_build_object(
+    'journal', to_jsonb(j) || jsonb_build_object(
+      'created_by_name', u.name,
+      'reverses_number', (select number from public.journals where id = j.reverses_id),
+      'reversed_by_number', (select number from public.journals where id = j.reversed_by_id),
+      'source', case j.source_type
+        when 'invoice' then (select jsonb_build_object('label', i.number, 'invoice_id', i.id) from public.invoices i where i.id = j.source_id)
+        when 'payment' then coalesce(
+          (select jsonb_build_object('label', 'Payment on ' || i.number, 'invoice_id', i.id)
+           from public.payments p join public.invoices i on i.id = p.invoice_id where p.id = j.source_id),
+          jsonb_build_object('label', 'Deleted payment')) end,
+      'lines', (select jsonb_agg(jsonb_build_object('account_id', l.account_id, 'code', a.code, 'account', a.name,
+                  'description', l.description, 'debit', l.debit, 'credit', l.credit,
+                  'customer_id', l.customer_id, 'customer_name', c.name) order by l.line_no)
+                from public.journal_lines l join public.accounts a on a.id = l.account_id
+                left join public.customers c on c.id = l.customer_id
+                where l.journal_id = j.id)))
+  into result
+  from public.journals j left join public.profiles u on u.id = j.created_by
+  where j.id = p_id;
+  if result is null then
+    raise exception 'Journal entry not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+-- Ledger of one account between two dates: opening balance, each line with a running balance, closing balance.
+-- Income and expense accounts start from zero at the beginning of each financial year.
+create or replace function public.account_ledger(p_account bigint, p_from date, p_to date, p_customer bigint default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  a       public.accounts;
+  f       date := coalesce(p_from, private.fy_start(private.today()));
+  t       date := coalesce(p_to, private.today());
+  opening numeric;
+begin
+  select * into a from public.accounts where id = p_account;
+  if a.id is null then
+    raise exception 'Account not found' using errcode = 'P0002';
+  end if;
+  select coalesce(private.normal_balance(a.type, sum(l.debit), sum(l.credit)), 0) into opening
+  from public.journal_lines l join public.journals j on j.id = l.journal_id
+  where l.account_id = a.id and j.entry_date < f
+    and (a.type not in ('income', 'expense') or j.entry_date >= private.fy_start(f))
+    and (p_customer is null or l.customer_id = p_customer);
+  return json_build_object(
+    'account', to_jsonb(a), 'from', f, 'to', t, 'opening', opening,
+    'customer', (select name from public.customers where id = p_customer),
+    'lines', coalesce((select json_agg(x order by x.entry_date, x.journal_id, x.line_id) from (
+      select j.id as journal_id, l.id as line_id, j.number, j.entry_date, j.kind, j.memo, j.source_type, j.source_id,
+             l.description, l.debit, l.credit, l.customer_id, c.name as customer_name,
+             opening + sum(private.normal_balance(a.type, l.debit, l.credit)) over (order by j.entry_date, j.id, l.id) as balance
+      from public.journal_lines l join public.journals j on j.id = l.journal_id
+      left join public.customers c on c.id = l.customer_id
+      where l.account_id = a.id and j.entry_date between f and t and (p_customer is null or l.customer_id = p_customer)) x), '[]'),
+    'closing', opening + coalesce((select sum(private.normal_balance(a.type, l.debit, l.credit))
+      from public.journal_lines l join public.journals j on j.id = l.journal_id
+      where l.account_id = a.id and j.entry_date between f and t and (p_customer is null or l.customer_id = p_customer)), 0));
+end $$;
+
+-- Trial balance between two dates: opening, debits, credits and closing for each account (signed: + debit, - credit).
+-- Income and expense accounts open at zero each financial year; earlier years' profit shows in retained earnings.
+create or replace function public.trial_balance(p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  f     date := coalesce(p_from, private.fy_start(private.today()));
+  t     date := coalesce(p_to, private.today());
+  fy    date := private.fy_start(f);
+  prior numeric;
+  rows  json;
+begin
+  -- Profit or loss of earlier years (debit - credit of income and expense accounts before this financial year).
+  select coalesce(sum(l.debit - l.credit), 0) into prior
+  from public.journal_lines l join public.journals j on j.id = l.journal_id join public.accounts a on a.id = l.account_id
+  where a.type in ('income', 'expense') and j.entry_date < fy;
+
+  select coalesce(json_agg(x order by x.code), '[]') into rows from (
+    select a.id, a.code, a.name, a.type, a.subtype,
+           coalesce(sum(l.debit - l.credit) filter (where j.entry_date < f and (a.type not in ('income', 'expense') or j.entry_date >= fy)), 0)
+             + case when a.system_key = 'retained_earnings' then prior else 0 end as opening,
+           coalesce(sum(l.debit) filter (where j.entry_date between f and t), 0) as debit,
+           coalesce(sum(l.credit) filter (where j.entry_date between f and t), 0) as credit
+    from public.accounts a
+    left join public.journal_lines l on l.account_id = a.id
+    left join public.journals j on j.id = l.journal_id and j.entry_date <= t
+    group by a.id
+    having a.system_key = 'retained_earnings' and prior <> 0
+        or coalesce(sum(l.debit - l.credit) filter (where j.entry_date < f and (a.type not in ('income', 'expense') or j.entry_date >= fy)), 0) <> 0
+        or coalesce(sum(l.debit) filter (where j.entry_date between f and t), 0) <> 0
+        or coalesce(sum(l.credit) filter (where j.entry_date between f and t), 0) <> 0) x;
+  return json_build_object('from', f, 'to', t, 'rows', rows);
+end $$;
+
+-- Profit and loss between two dates, by account (amounts positive when they add to profit or cost).
+create or replace function public.profit_loss(p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  f  date := coalesce(p_from, private.fy_start(private.today()));
+  t  date := coalesce(p_to, private.today());
+begin
+  return json_build_object('from', f, 'to', t, 'rows', coalesce((select json_agg(x order by x.code) from (
+    select a.id, a.code, a.name, a.type, a.subtype, private.normal_balance(a.type, sum(l.debit), sum(l.credit)) as amount
+    from public.accounts a
+    join public.journal_lines l on l.account_id = a.id
+    join public.journals j on j.id = l.journal_id
+    where a.type in ('income', 'expense') and j.entry_date between f and t
+    group by a.id
+    having sum(l.debit) <> sum(l.credit)) x), '[]'));
+end $$;
+
+-- Balance sheet at a date. Profit of earlier years is added to retained earnings; this year's profit is shown separately.
+create or replace function public.balance_sheet(p_as_of date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  t      date := coalesce(p_as_of, private.today());
+  fy     date := private.fy_start(t);
+  prior  numeric;
+  profit numeric;
+begin
+  select coalesce(sum(l.credit - l.debit) filter (where j.entry_date < fy), 0),
+         coalesce(sum(l.credit - l.debit) filter (where j.entry_date between fy and t), 0)
+  into prior, profit
+  from public.journal_lines l join public.journals j on j.id = l.journal_id join public.accounts a on a.id = l.account_id
+  where a.type in ('income', 'expense') and j.entry_date <= t;
+
+  return json_build_object('as_of', t, 'fy_start', fy, 'current_year_profit', profit,
+    'rows', coalesce((select json_agg(x order by x.code) from (
+      select a.id, a.code, a.name, a.type, a.subtype,
+             coalesce(private.normal_balance(a.type, sum(l.debit), sum(l.credit)), 0)
+               + case when a.system_key = 'retained_earnings' then prior else 0 end as amount
+      from public.accounts a
+      left join public.journal_lines l on l.account_id = a.id
+      left join public.journals j on j.id = l.journal_id
+      where a.type in ('asset', 'liability', 'equity') and (j.id is null or j.entry_date <= t)
+      group by a.id
+      having coalesce(sum(l.debit), 0) <> coalesce(sum(l.credit), 0) or (a.system_key = 'retained_earnings' and prior <> 0)) x), '[]'));
+end $$;
+
+-- Finance home page: bank and cash, receivables, VAT, this month's and this year's results, recent entries.
+create or replace function public.finance_overview() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  t  date := private.today();
+  m  date := date_trunc('month', t)::date;
+  fy date := private.fy_start(t);
+  q  date := date_trunc('quarter', t)::date;
+begin
+  return json_build_object(
+    'today', t, 'month_start', m, 'fy_start', fy, 'quarter_start', q,
+    'books_locked_until', (select books_locked_until from public.company_settings where id = 1),
+    'cash', public.cash_accounts(),
+    'receivables', (select coalesce(sum(l.debit - l.credit), 0) from public.journal_lines l where l.account_id = private.acct('ar')),
+    'advances', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('customer_advances')),
+    'vat_output_quarter', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l join public.journals j on j.id = l.journal_id
+                           where l.account_id = private.acct('vat_output') and j.entry_date between q and t),
+    'month', (select json_build_object(
+                'income', coalesce(sum(l.credit - l.debit) filter (where a.type = 'income'), 0),
+                'expenses', coalesce(sum(l.debit - l.credit) filter (where a.type = 'expense'), 0))
+              from public.journal_lines l join public.journals j on j.id = l.journal_id join public.accounts a on a.id = l.account_id
+              where j.entry_date between m and t),
+    'year', (select json_build_object(
+                'income', coalesce(sum(l.credit - l.debit) filter (where a.type = 'income'), 0),
+                'expenses', coalesce(sum(l.debit - l.credit) filter (where a.type = 'expense'), 0))
+              from public.journal_lines l join public.journals j on j.id = l.journal_id join public.accounts a on a.id = l.account_id
+              where j.entry_date between fy and t),
+    'recent', coalesce((select json_agg(x order by x.entry_date desc, x.id desc) from (
+      select j.id, j.number, j.entry_date, j.kind, j.memo, (select sum(debit) from public.journal_lines where journal_id = j.id) as amount
+      from public.journals j order by j.entry_date desc, j.id desc limit 8) x), '[]'));
+end $$;
+
+-- Income account for a type of work (used when its tasks' invoices are posted).
+create or replace function public.set_work_type_account(p_id bigint, p_account_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  if p_account_id is not null and not exists (select 1 from public.accounts where id = p_account_id and type = 'income' and active) then
+    raise exception 'Pick an income account' using errcode = '22023';
+  end if;
+  update public.work_types set revenue_account_id = p_account_id where id = p_id;
+  if not found then
+    raise exception 'Type of work not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Revenue account for the standard types of work (where not chosen yet).
+update public.work_types w set revenue_account_id = a.id
+from public.accounts a
+where w.revenue_account_id is null and a.code = case lower(w.name)
+  when 'sea freight' then '4100' when 'air freight' then '4110' when 'land transport' then '4120'
+  when 'customs clearance' then '4130' when 'documentation' then '4140' else null end;
+
+-- Post invoices and payments recorded before the finance module existed (runs once; safe to re-run).
+do $$
+declare
+  r record;
+begin
+  for r in select i.id from public.invoices i
+           where i.kind = 'tax' and i.status in ('sent', 'paid')
+             and not exists (select 1 from public.journals j where j.source_type = 'invoice' and j.source_id = i.id)
+           order by i.issue_date, i.id loop
+    perform private.post_invoice(r.id);
+  end loop;
+  for r in select p.id from public.payments p where p.posted_side is null order by p.paid_on, p.id loop
+    perform private.post_payment(r.id, null);
+  end loop;
+end $$;
+
+-- -------------------------------------------------------------------------------------
 -- Who may call what: signed-in users only. Helpers are not callable from the API at all.
 -- -------------------------------------------------------------------------------------
 
@@ -3051,7 +3989,23 @@ begin
     'public.save_payslip(bigint, jsonb)',
     'public.generate_payslips(date)',
     'public.set_payslip_published(bigint, boolean)',
-    'public.delete_payslip(bigint)'
+    'public.delete_payslip(bigint)',
+    'public.list_accounts(boolean)',
+    'public.save_account(bigint, jsonb)',
+    'public.get_finance_settings()',
+    'public.set_books_locked_until(date)',
+    'public.post_manual_journal(jsonb)',
+    'public.reverse_entry(bigint, date, text)',
+    'public.bank_transaction(jsonb)',
+    'public.cash_accounts()',
+    'public.list_journals(text, text, date, date, int)',
+    'public.get_journal(bigint)',
+    'public.account_ledger(bigint, date, date, bigint)',
+    'public.trial_balance(date, date)',
+    'public.profit_loss(date, date)',
+    'public.balance_sheet(date)',
+    'public.finance_overview()',
+    'public.set_work_type_account(bigint, bigint)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);
