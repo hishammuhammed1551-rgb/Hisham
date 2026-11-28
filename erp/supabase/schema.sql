@@ -192,6 +192,60 @@ create table if not exists public.invoice_lines (
 );
 create index if not exists invoice_lines_invoice_idx on public.invoice_lines (invoice_id);
 
+-- Kinds of recurring service (VAT return every 3 months, trade license every year, ...).
+create table if not exists public.renewal_types (
+  id              bigint generated always as identity primary key,
+  name            text not null check (char_length(btrim(name)) between 1 and 100),
+  interval_months int  not null default 12 check (interval_months between 1 and 120),
+  remind_days     int  not null default 30 check (remind_days between 0 and 365),
+  active          boolean not null default true,
+  created_at      timestamptz not null default now()
+);
+create unique index if not exists renewal_types_name_key on public.renewal_types (lower(name));
+
+insert into public.renewal_types (name, interval_months, remind_days)
+select x.name, x.months, x.days
+from (values ('VAT return filing', 3, 15), ('Trade license renewal', 12, 30), ('Residence visa renewal', 24, 30),
+             ('Emirates ID renewal', 24, 30), ('Corporate tax return', 12, 30), ('Other', 12, 30)) as x(name, months, days)
+where not exists (select 1 from public.renewal_types);
+
+-- A customer's recurring service, e.g. "Trade license renewal" for "License no. 12345", next due 2027-01-15.
+create table if not exists public.renewals (
+  id               bigint generated always as identity primary key,
+  customer_id      bigint not null references public.customers (id) on delete cascade,
+  type_id          bigint references public.renewal_types (id) on delete set null,
+  reference        text check (char_length(reference) <= 200),
+  interval_months  int  not null check (interval_months between 1 and 120),
+  due_date         date not null,
+  remind_days      int  not null check (remind_days between 0 and 365),
+  assigned_to      uuid references public.profiles (id) on delete set null,
+  notes            text check (char_length(notes) <= 2000),
+  active           boolean not null default true,
+  last_reminded_at timestamptz,
+  last_reminded_to text,
+  created_by       uuid references public.profiles (id) on delete set null,
+  created_at       timestamptz not null default now(),
+  updated_at       timestamptz not null default now()
+);
+create index if not exists renewals_customer_idx on public.renewals (customer_id);
+create index if not exists renewals_due_idx      on public.renewals (due_date) where active;
+
+-- History of a renewal: created, reminded, renewed (with old and new due dates), task created.
+create table if not exists public.renewal_events (
+  id         bigint generated always as identity primary key,
+  renewal_id bigint not null references public.renewals (id) on delete cascade,
+  user_id    uuid references public.profiles (id) on delete set null,
+  kind       text not null check (kind in ('created', 'reminded', 'renewed', 'task', 'stopped', 'restarted')),
+  body       text check (char_length(body) <= 2000),
+  old_due    date,
+  new_due    date,
+  created_at timestamptz not null default now()
+);
+create index if not exists renewal_events_renewal_idx on public.renewal_events (renewal_id);
+
+-- Tasks can be started from a renewal.
+alter table public.tasks add column if not exists renewal_id bigint references public.renewals (id) on delete set null;
+
 -- Databases set up before managers existed: allow the new role.
 alter table public.profiles drop constraint if exists profiles_role_check;
 alter table public.profiles add constraint profiles_role_check check (role in ('admin', 'manager', 'staff'));
@@ -213,9 +267,13 @@ alter table public.company_settings enable row level security;
 alter table public.invoice_counters enable row level security;
 alter table public.invoices         enable row level security;
 alter table public.invoice_lines    enable row level security;
+alter table public.renewal_types    enable row level security;
+alter table public.renewals         enable row level security;
+alter table public.renewal_events   enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
-              public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines
+              public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
+              public.renewal_types, public.renewals, public.renewal_events
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -509,7 +567,20 @@ begin
                           where i.task_id = t2.id and i.kind = 'tax' and i.status <> 'cancelled')
         order by t2.completed_at desc nulls last, t2.id desc limit 10) x), '[]'),
     'unpaid', (select json_build_object('count', count(*), 'total', coalesce(sum(total), 0))
-               from public.invoices where kind = 'tax' and status = 'sent')
+               from public.invoices where kind = 'tax' and status = 'sent'),
+    -- Active renewals inside their reminder window (or overdue), soonest first.
+    'renewalsDue', coalesce((
+      select json_agg(x order by x.due_date, x.id) from (
+        select r.id, r.reference, r.due_date, r.last_reminded_at, r.customer_id, c.name as customer_name,
+               rt.name as type_name, u.name as assignee_name
+        from public.renewals r
+        join public.customers c on c.id = r.customer_id
+        left join public.renewal_types rt on rt.id = r.type_id
+        left join public.profiles u on u.id = r.assigned_to
+        where r.active and r.due_date - r.remind_days <= t
+        order by r.due_date, r.id limit 15) x), '[]'),
+    'renewalsDueCount', (select count(*) from public.renewals r where r.active and r.due_date - r.remind_days <= t),
+    'renewalsOverdue', (select count(*) from public.renewals r where r.active and r.due_date < t)
   );
 end $$;
 
@@ -597,7 +668,14 @@ begin
             'id', i.id, 'kind', i.kind, 'number', i.number, 'status', i.status,
             'issue_date', i.issue_date, 'total', i.total)
           order by i.issue_date desc, i.id desc)
-        from public.invoices i where i.customer_id = c.id), '[]')))
+        from public.invoices i where i.customer_id = c.id), '[]'),
+      'renewals', coalesce((
+        select jsonb_agg(jsonb_build_object(
+            'id', r.id, 'reference', r.reference, 'due_date', r.due_date, 'active', r.active,
+            'remind_days', r.remind_days, 'type_name', rt.name, 'interval_months', r.interval_months)
+          order by not r.active, r.due_date, r.id)
+        from public.renewals r left join public.renewal_types rt on rt.id = r.type_id
+        where r.customer_id = c.id), '[]')))
   into result
   from public.customers c
   left join public.profiles o  on o.id = c.owner_id
@@ -1465,6 +1543,323 @@ begin
 end $$;
 
 -- -------------------------------------------------------------------------------------
+-- API: renewals (recurring services per customer)
+-- -------------------------------------------------------------------------------------
+
+create or replace function public.list_renewal_types() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  return coalesce((select json_agg(json_build_object(
+      'id', rt.id, 'name', rt.name, 'interval_months', rt.interval_months, 'remind_days', rt.remind_days, 'active', rt.active,
+      'renewals', (select count(*) from public.renewals r where r.type_id = rt.id and r.active))
+    order by not rt.active, lower(rt.name)) from public.renewal_types rt), '[]');
+end $$;
+
+-- Add (p_id null) or edit a renewal type. Managers and admins only.
+create or replace function public.save_renewal_type(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  d    jsonb := private.clean(p_data, '{
+    "name":            {"type": "text", "required": true, "max": 100},
+    "interval_months": {"type": "int", "required": true},
+    "remind_days":     {"type": "int", "required": true},
+    "active":          {"type": "bool"}
+  }');
+  errs jsonb := '{}';
+  v_id bigint;
+begin
+  if (d ->> 'interval_months')::int not between 1 and 120 then errs := errs || '{"interval_months": "Use 1 to 120 months"}'; end if;
+  if (d ->> 'remind_days')::int > 365 then errs := errs || '{"remind_days": "Use 0 to 365 days"}'; end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  begin
+    if p_id is null then
+      insert into public.renewal_types (name, interval_months, remind_days, active)
+      values (d ->> 'name', (d ->> 'interval_months')::int, (d ->> 'remind_days')::int, coalesce((p_data ->> 'active')::boolean, true))
+      returning id into v_id;
+      return v_id;
+    end if;
+    update public.renewal_types set name = d ->> 'name', interval_months = (d ->> 'interval_months')::int,
+      remind_days = (d ->> 'remind_days')::int, active = (d ->> 'active')::boolean
+    where id = p_id;
+    if not found then
+      raise exception 'Renewal type not found' using errcode = 'P0002';
+    end if;
+    return p_id;
+  exception when unique_violation then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = '{"name": "This renewal type already exists"}';
+  end;
+end $$;
+
+-- window: 'due' (inside the reminder window or overdue, the default), 'overdue', '30', '90' (due within N days),
+--         'all' (all active), 'stopped'. assignee: '' | 'me' | 'none' | user id.
+create or replace function public.list_renewals(
+  p_q text default null, p_window text default 'due', p_type bigint default null,
+  p_assignee text default null, p_page int default 1
+) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me         public.profiles := private.current_member();
+  t          date := private.today();
+  page_size  constant int := 25;
+  pg         int := greatest(coalesce(p_page, 1), 1);
+  win        text := coalesce(nullif(p_window, ''), 'due');
+  pat        text;
+  v_assignee uuid;
+  total      bigint;
+  v_rows     json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  if p_assignee ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    v_assignee := p_assignee::uuid;
+  elsif p_assignee = 'me' then
+    v_assignee := me.id;
+  end if;
+
+  with f as (
+    select r.*, c.name as customer_name, rt.name as type_name, u.name as assignee_name
+    from public.renewals r
+    join public.customers c on c.id = r.customer_id
+    left join public.renewal_types rt on rt.id = r.type_id
+    left join public.profiles u on u.id = r.assigned_to
+    where (pat is null or c.name ilike pat or r.reference ilike pat or rt.name ilike pat)
+      and (case win
+             when 'stopped' then not r.active
+             when 'all' then r.active
+             when 'overdue' then r.active and r.due_date < t
+             when '30' then r.active and r.due_date <= t + 30
+             when '90' then r.active and r.due_date <= t + 90
+             else r.active and r.due_date - r.remind_days <= t
+           end)
+      and (p_type is null or r.type_id = p_type)
+      and (case
+             when v_assignee is not null then r.assigned_to = v_assignee
+             when p_assignee = 'none' then r.assigned_to is null
+             else true
+           end)
+  )
+  select (select count(*) from f),
+         coalesce((select json_agg(x order by x.due_date, x.id) from (
+           select f.id, f.customer_id, f.customer_name, f.type_id, f.type_name, f.reference, f.due_date, f.remind_days,
+                  f.interval_months, f.active, f.assigned_to, f.assignee_name, f.last_reminded_at
+           from f order by f.due_date, f.id
+           limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, v_rows;
+
+  return json_build_object('renewals', v_rows, 'total', total, 'page', pg, 'pageSize', page_size, 'today', t);
+end $$;
+
+create or replace function public.get_renewal(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_member();
+  result json;
+begin
+  select json_build_object(
+    'today', private.today(),
+    'renewal', to_jsonb(r) || jsonb_build_object(
+      'customer_name', c.name,
+      'type_name', rt.name,
+      'assignee_name', u.name,
+      'created_by_name', cb.name,
+      'events', coalesce((
+        select jsonb_agg(to_jsonb(e) || jsonb_build_object('user_name', eu.name) order by e.created_at desc, e.id desc)
+        from public.renewal_events e left join public.profiles eu on eu.id = e.user_id
+        where e.renewal_id = r.id), '[]'),
+      'tasks', coalesce((
+        select jsonb_agg(jsonb_build_object('id', tk.id, 'title', tk.title, 'status', tk.status, 'due_date', tk.due_date)
+          order by tk.created_at desc)
+        from public.tasks tk where tk.renewal_id = r.id), '[]'),
+      'recipients', coalesce((
+        select jsonb_agg(e.email order by e.rank, e.email) from (
+          select lower(x.email) as email, min(x.rank) as rank from (
+            select c.email, 0 as rank where c.email is not null
+            union all
+            select k.email, case when k.is_primary then 1 else 2 end from public.contacts k
+            where k.customer_id = c.id and k.email is not null) x
+          group by lower(x.email)) e), '[]')))
+  into result
+  from public.renewals r
+  join public.customers c on c.id = r.customer_id
+  left join public.renewal_types rt on rt.id = r.type_id
+  left join public.profiles u on u.id = r.assigned_to
+  left join public.profiles cb on cb.id = r.created_by
+  where r.id = p_id;
+  if result is null then
+    raise exception 'Renewal not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+-- Add (p_id null) or edit a renewal. Anyone with access can (like customers).
+-- Repeat period and reminder days default to the renewal type's when left empty.
+create or replace function public.save_renewal(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_member();
+  d     jsonb := private.clean(p_data, '{
+    "customer_id":     {"type": "int", "required": true},
+    "type_id":         {"type": "int", "required": true},
+    "reference":       {"type": "text", "max": 200},
+    "due_date":        {"type": "date", "required": true},
+    "interval_months": {"type": "int"},
+    "remind_days":     {"type": "int"},
+    "assigned_to":     {"type": "uuid"},
+    "notes":           {"type": "text", "max": 2000}
+  }');
+  rt    public.renewal_types;
+  v_old public.renewals;
+  errs  jsonb := '{}';
+  v_id  bigint;
+  months int;
+  days   int;
+begin
+  if p_id is not null then
+    select * into v_old from public.renewals where id = p_id;
+    if v_old.id is null then
+      raise exception 'Renewal not found' using errcode = 'P0002';
+    end if;
+  end if;
+  select * into rt from public.renewal_types where id = (d ->> 'type_id')::bigint;
+  if rt.id is null or (not rt.active and rt.id is distinct from v_old.type_id) then
+    errs := errs || '{"type_id": "Pick a renewal type from the list"}';
+  end if;
+  if not exists (select 1 from public.customers where id = (d ->> 'customer_id')::bigint) then
+    errs := errs || '{"customer_id": "Pick a customer from the list"}';
+  end if;
+  if d ->> 'assigned_to' is not null and (d ->> 'assigned_to')::uuid is distinct from v_old.assigned_to
+     and not exists (select 1 from public.profiles where id = (d ->> 'assigned_to')::uuid and active) then
+    errs := errs || '{"assigned_to": "Pick a team member who has access"}';
+  end if;
+  months := coalesce((d ->> 'interval_months')::int, rt.interval_months);
+  days := coalesce((d ->> 'remind_days')::int, rt.remind_days);
+  if months not between 1 and 120 then errs := errs || '{"interval_months": "Use 1 to 120 months"}'; end if;
+  if days > 365 then errs := errs || '{"remind_days": "Use 0 to 365 days"}'; end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  if p_id is null then
+    insert into public.renewals (customer_id, type_id, reference, interval_months, due_date, remind_days, assigned_to, notes, created_by)
+    values ((d ->> 'customer_id')::bigint, rt.id, d ->> 'reference', months, (d ->> 'due_date')::date, days,
+            (d ->> 'assigned_to')::uuid, d ->> 'notes', me.id)
+    returning id into v_id;
+    insert into public.renewal_events (renewal_id, user_id, kind, new_due)
+    values (v_id, me.id, 'created', (d ->> 'due_date')::date);
+    return v_id;
+  end if;
+
+  update public.renewals set customer_id = (d ->> 'customer_id')::bigint, type_id = rt.id, reference = d ->> 'reference',
+    interval_months = months, due_date = (d ->> 'due_date')::date, remind_days = days,
+    assigned_to = (d ->> 'assigned_to')::uuid, notes = d ->> 'notes', updated_at = now()
+  where id = p_id;
+  return p_id;
+end $$;
+
+-- The service was renewed: move the due date on (by default one repeat period after the current due date).
+create or replace function public.mark_renewed(p_id bigint, p_new_due date default null, p_note text default null) returns date
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_member();
+  r     public.renewals;
+  v_new date;
+begin
+  select * into r from public.renewals where id = p_id;
+  if r.id is null then
+    raise exception 'Renewal not found' using errcode = 'P0002';
+  end if;
+  v_new := coalesce(p_new_due, (r.due_date + make_interval(months => r.interval_months))::date);
+  if v_new <= r.due_date then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023',
+      detail = '{"new_due": "The next due date must be after the current one"}';
+  end if;
+  if char_length(p_note) > 2000 then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = '{"note": "Too long"}';
+  end if;
+  update public.renewals set due_date = v_new, active = true, last_reminded_at = null, last_reminded_to = null, updated_at = now()
+  where id = p_id;
+  insert into public.renewal_events (renewal_id, user_id, kind, body, old_due, new_due)
+  values (p_id, me.id, 'renewed', nullif(btrim(p_note), ''), r.due_date, v_new);
+  return v_new;
+end $$;
+
+-- Record that the customer was reminded (after it was emailed from the user's own mailbox).
+create or replace function public.mark_renewal_reminded(p_id bigint, p_to text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+begin
+  update public.renewals set last_reminded_at = now(), last_reminded_to = left(nullif(btrim(p_to), ''), 500), updated_at = now()
+  where id = p_id;
+  if not found then
+    raise exception 'Renewal not found' using errcode = 'P0002';
+  end if;
+  insert into public.renewal_events (renewal_id, user_id, kind, body)
+  values (p_id, me.id, 'reminded', 'Reminded ' || coalesce(nullif(btrim(p_to), ''), 'the customer'));
+end $$;
+
+-- Stop a service the customer no longer takes from Lowcaps (or start it again).
+create or replace function public.set_renewal_active(p_id bigint, p_active boolean) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_member();
+  r  public.renewals;
+begin
+  select * into r from public.renewals where id = p_id;
+  if r.id is null then
+    raise exception 'Renewal not found' using errcode = 'P0002';
+  end if;
+  if r.active = coalesce(p_active, false) then
+    return;
+  end if;
+  update public.renewals set active = coalesce(p_active, false), updated_at = now() where id = p_id;
+  insert into public.renewal_events (renewal_id, user_id, kind)
+  values (p_id, me.id, case when p_active then 'restarted' else 'stopped' end);
+end $$;
+
+-- Start the work for a renewal as a task (managers create tasks). Returns the task id.
+create or replace function public.create_renewal_task(p_id bigint) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  r     public.renewals;
+  title text;
+  v_id  bigint;
+begin
+  select * into r from public.renewals where id = p_id;
+  if r.id is null then
+    raise exception 'Renewal not found' using errcode = 'P0002';
+  end if;
+  select left(concat_ws(': ', rt.name, nullif(r.reference, '')), 200) into title
+  from public.renewal_types rt where rt.id = r.type_id;
+  insert into public.tasks (title, description, customer_id, assigned_to, due_date, created_by, renewal_id)
+  values (coalesce(title, 'Renewal'), format('Renewal due on %s.', to_char(r.due_date, 'DD Mon YYYY')), r.customer_id,
+          (select id from public.profiles where id = r.assigned_to and active), r.due_date, me.id, r.id)
+  returning id into v_id;
+  insert into public.task_updates (task_id, user_id, kind, body) values (v_id, me.id, 'created', 'Created the task from a renewal');
+  insert into public.renewal_events (renewal_id, user_id, kind, body) values (p_id, me.id, 'task', 'Created a task: ' || coalesce(title, 'Renewal'));
+  return v_id;
+end $$;
+
+create or replace function public.delete_renewal(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  delete from public.renewals where id = p_id;
+  if not found then
+    raise exception 'Renewal not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- -------------------------------------------------------------------------------------
 -- Who may call what: signed-in users only. Helpers are not callable from the API at all.
 -- -------------------------------------------------------------------------------------
 
@@ -1506,7 +1901,17 @@ begin
     'public.list_invoices(text, text, text, int)',
     'public.mark_invoice_sent(bigint, text)',
     'public.set_invoice_paid(bigint, boolean)',
-    'public.cancel_invoice(bigint)'
+    'public.cancel_invoice(bigint)',
+    'public.list_renewal_types()',
+    'public.save_renewal_type(bigint, jsonb)',
+    'public.list_renewals(text, text, bigint, text, int)',
+    'public.get_renewal(bigint)',
+    'public.save_renewal(bigint, jsonb)',
+    'public.mark_renewed(bigint, date, text)',
+    'public.mark_renewal_reminded(bigint, text)',
+    'public.set_renewal_active(bigint, boolean)',
+    'public.create_renewal_task(bigint)',
+    'public.delete_renewal(bigint)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);

@@ -201,7 +201,7 @@ test('tasks: a manager assigns work, the team member updates it', { skip: !playw
   await signIn(staff, 'sami@lowcaps.test');
 
   // Team members don't see the manager-only menu or buttons
-  assert.equal(await staff.isVisible('a:text("Types of work")'), false);
+  assert.equal(await staff.isVisible('a[href="#/work-types"]'), false);
   await staff.goto(base + '#/tasks');
   await staff.waitForSelector('h1:text("Tasks")');
   assert.equal(await staff.isVisible('text=+ New task'), false);
@@ -209,7 +209,7 @@ test('tasks: a manager assigns work, the team member updates it', { skip: !playw
   // Manager-only: add a type of work
   await admin.goto(base + '#/work-types');
   await admin.fill('[name=name]', 'Warehousing');
-  await admin.click('button:text("Add")');
+  await admin.click('button:text("Add type of work")');
   await admin.waitForSelector('a.row-link:text("Warehousing")');
 
   // Create a task from the customer page, assigned to Sami
@@ -260,7 +260,7 @@ test('tasks: a manager assigns work, the team member updates it', { skip: !playw
   await admin.waitForSelector('td:text("Manager")');
   await staff.goto(base + '#/');
   await staff.reload();
-  await staff.waitForSelector('a:text("Types of work")');
+  await staff.waitForSelector('a[href="#/work-types"]');
   if (SHOTS) {
     await admin.goto(base + '#/');
     await admin.waitForSelector('h2:text("My tasks")');
@@ -365,5 +365,84 @@ test('invoices: proforma when the task is created, tax invoice when it is done',
   await admin.goto(base + '#/');
   await admin.waitForSelector('h2:text("Ready to invoice")');
   assert.ok(await admin.isVisible('text=Every finished task has a tax invoice.'));
+  assert.deepEqual(errors, []);
+});
+
+test('renewals: add for a customer, see it due, remind, renew, turn into a task', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await admin.context().route('https://mail.google.com/**', route => route.fulfill({ contentType: 'text/html', body: 'gmail' }));
+  await signIn(admin, 'admin@lowcaps.test');
+  const today = await admin.evaluate(() => new Date().toLocaleDateString('en-CA'));
+  const inDays = n => new Date(Date.parse(today + 'T00:00:00Z') + n * 86400000).toISOString().slice(0, 10);
+
+  // Add a trade license renewal from the customer's page; the type fills in its usual period and reminder
+  await admin.goto(base + '#/customers');
+  await admin.click('a.row-link:text("Gulf Traders LLC")');
+  await admin.click('a:text("+ Add renewal")');
+  await admin.waitForSelector('h1:text("Add renewal")');
+  assert.equal(await admin.$eval('[name=customer_id]', el => el.selectedOptions[0].textContent), 'Gulf Traders LLC');
+  await admin.selectOption('[name=type_id]', { label: 'Trade license renewal' });
+  assert.equal(await admin.inputValue('[name=interval_months]'), '12');
+  assert.equal(await admin.inputValue('[name=remind_days]'), '30');
+  await admin.fill('[name=reference]', 'License no. 12345');
+  await admin.fill('[name=due_date]', inDays(20));
+  await admin.click('button:text("Add renewal")');
+  await admin.waitForSelector('h1:text("Trade license renewal")');
+  assert.ok(await admin.isVisible('.badge:text("Due in 20 days")'));
+
+  // A VAT return that is already overdue
+  await admin.goto(base + '#/renewals/new');
+  await admin.selectOption('[name=customer_id]', { label: 'Gulf Traders LLC' });
+  await admin.selectOption('[name=type_id]', { label: 'VAT return filing' });
+  assert.equal(await admin.inputValue('[name=interval_months]'), '3');
+  await admin.fill('[name=reference]', 'Q3 return');
+  await admin.fill('[name=due_date]', inDays(-2));
+  await admin.click('button:text("Add renewal")');
+  await admin.waitForSelector('.badge:text("Overdue by 2 days")');
+
+  // Both show on the dashboard, overdue first
+  await admin.goto(base + '#/');
+  await admin.waitForSelector('h2:text("Renewals due")');
+  const due = await admin.locator('section:has(h2:text("Renewals due")) a.row-link').allTextContents();
+  assert.deepEqual(due, ['VAT return filing · Q3 return', 'Trade license renewal · License no. 12345']);
+  assert.ok(await admin.isVisible('.badge:text("1 overdue")'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/dashboard-renewals.png` });
+
+  // Remind the customer by email, then renew: the due date moves on 3 months
+  await admin.click('a.row-link:text("VAT return filing · Q3 return")');
+  await admin.click('button:text("Remind customer")');
+  assert.equal(await admin.inputValue('dialog [name=to]'), 'ops@gulftraders.ae');
+  assert.match(await admin.inputValue('dialog [name=subject]'), /^Reminder: VAT return filing \(Q3 return\) due /);
+  assert.match(await admin.inputValue('dialog [name=body]'), /friendly reminder that the vat return filing for Q3 return is due on/);
+  const [gmail] = await Promise.all([admin.context().waitForEvent('page'), admin.click('dialog button:text("Open in Gmail")')]);
+  await gmail.close();
+  await admin.click('dialog button:text("I\'ve sent it")');
+  await admin.waitForSelector('strong:text("Reminded ops@gulftraders.ae")');
+
+  await admin.click('button:text("✓ Mark as renewed")');
+  const suggested = await admin.inputValue('dialog [name=new_due]');
+  const expected = await admin.evaluate(([d]) => addMonths(d, 3), [inDays(-2)]);
+  assert.equal(suggested, expected, 'next due date suggested 3 months on');
+  await admin.fill('dialog [name=note]', 'Filed on the FTA portal');
+  await admin.click('dialog button:text("Save")');
+  await admin.waitForSelector('strong:text("Renewed:")');
+  assert.ok(await admin.isVisible('text=Filed on the FTA portal'));
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/renewal.png`, fullPage: true });
+
+  // Turn the license renewal into a task for the team
+  await admin.goto(base + '#/renewals');
+  await admin.waitForSelector('a.row-link:text("Trade license renewal")');
+  assert.equal(await admin.locator('tbody tr').count(), 1, 'the renewed VAT return is no longer due');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/renewals.png` });
+  await admin.click('a.row-link:text("Trade license renewal")');
+  await admin.click('button:text("Create task")');
+  await admin.waitForSelector('h1:text("Trade license renewal: License no. 12345")');
+  assert.ok(await admin.isVisible('a:text("Gulf Traders LLC")'));
+
+  // Managers see renewal types on the Types page
+  await admin.goto(base + '#/work-types');
+  await admin.waitForSelector('h2:text("Renewal types")');
+  assert.ok(await admin.isVisible('td:text("Every 2 years")'));
   assert.deepEqual(errors, []);
 });

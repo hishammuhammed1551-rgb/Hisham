@@ -6,7 +6,10 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Return SQL dates as plain 'YYYY-MM-DD' text, the way Supabase's API (PostgREST) does.
+types.setTypeParser(1082, value => value);
 
 const PG_BIN = process.env.PG_BIN || '/usr/lib/postgresql/16/bin';
 const SCHEMA = path.join(__dirname, '..', 'supabase', 'schema.sql');
