@@ -328,7 +328,7 @@ test('invoices: proforma when the task is created, tax invoice when it is done',
   await gmail.close();
   await admin.click('dialog button:text("I\'ve sent it")');
   await admin.waitForSelector('.crumbs .badge:text("Sent")');
-  assert.equal(await admin.isVisible('a:text("Edit")'), false, 'sent invoices cannot be edited');
+  assert.equal(await admin.isVisible('a.btn:text-is("Edit")'), false, 'sent invoices cannot be edited');
   if (SHOTS) await admin.screenshot({ path: `${SHOTS}/proforma.png`, fullPage: true });
 
   // Finish the task -> create the tax invoice from the proforma
@@ -849,5 +849,124 @@ test('payables and VAT: supplier, bill with reverse charge, duplicate check, pay
 
   await admin.goto(base + '#/finance');
   await admin.waitForSelector('.stat:has-text("Payables")');
+  assert.deepEqual(errors, []);
+});
+
+test('receivables: credit note, receipt voucher with an advance, statement, ageing, recurring invoice, bank reconciliation, petty cash', { skip: !playwright }, async () => {
+  const errors = [];
+  const admin = await newPage(errors);
+  await admin.context().route('https://mail.google.com/**', route => route.fulfill({ contentType: 'text/html', body: 'gmail' }));
+  await signIn(admin, 'admin@lowcaps.test');
+  const today = await admin.evaluate(() => new Date().toLocaleDateString('en-CA'));
+
+  // A tax invoice, then a credit note against it
+  await admin.goto(base + '#/invoices/new?kind=tax');
+  await admin.selectOption('[name=customer_id]', { label: 'Gulf Traders LLC' });
+  await admin.fill('.l-desc', 'Customs clearance, BL 4455');
+  await admin.fill('.l-price', '2000');
+  await admin.click('button:text("Create tax invoice")');
+  await admin.waitForSelector('.inv-title:text("TAX INVOICE")');
+  const invNumber = (await admin.textContent('h1')).trim();
+  await admin.click('button:text("Email to customer")');
+  await admin.click('dialog button:text("I\'ve sent it")');
+  await admin.waitForSelector(`text=${invNumber} marked as sent`);
+  await admin.click('a.btn:text-is("Credit note")');
+  await admin.waitForSelector(`h1:text("Credit note for ${invNumber}")`);
+  await admin.fill('[name=reason]', 'Clearance fee discount agreed');
+  await admin.fill('.l-price', '100');
+  await admin.waitForSelector('.inv-form-totals dd.grand:text("AED 105.00")');
+  await admin.click('button:text("Save as draft")');
+  await admin.waitForSelector('text=Draft: not in the books yet');
+  await admin.click('button:text-is("Issue")');
+  await admin.waitForSelector('text=Credit note issued');
+  await admin.waitForSelector('.inv-title:text("TAX CREDIT NOTE")');
+  assert.ok(await admin.isVisible(`.inv-meta dd:text("${invNumber}")`));
+  const [cnPdf] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text-is("PDF")')]);
+  assert.equal(fs.readFileSync(await cnPdf.path()).subarray(0, 5).toString(), '%PDF-');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ar-credit-note.png`, fullPage: true });
+  await admin.click(`a:text("← ${invNumber}")`);
+  await admin.waitForSelector('.pay-summary dt:text("Paid / credited")');
+  assert.ok(await admin.isVisible('.pay-summary dd:text("AED 1,995.00")'));
+
+  // A receipt voucher for that invoice, with AED 15 kept as an advance
+  await admin.goto(base + '#/finance/receipts/new');
+  await admin.waitForSelector('h1:text("Record a receipt")');
+  await admin.selectOption('[name=customer_id]', await admin.$eval('[name=customer_id]', el => [...el.options].find(o => o.text.startsWith('Gulf Traders LLC')).value));
+  await admin.waitForSelector(`[aria-label="Towards ${invNumber}"]`);
+  await admin.fill('[name=amount]', '2010');
+  await admin.fill(`[aria-label="Towards ${invNumber}"]`, '1995');
+  await admin.fill('[name=reference]', 'FT-55001');
+  await admin.waitForSelector('text=AED 15.00 kept as an advance');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ar-receipt-form.png`, fullPage: true });
+  await admin.click('button:text("Save receipt")');
+  await admin.waitForSelector('h1:has-text("Receipt RV-")');
+  await admin.waitForSelector('text=AED 15.00 is held as an advance from the customer.');
+  const [rvPdf] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text-is("PDF")')]);
+  assert.equal(fs.readFileSync(await rvPdf.path()).subarray(0, 5).toString(), '%PDF-');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ar-receipt.png`, fullPage: true });
+
+  // Statement of account and receivables ageing
+  await admin.click('a:text("← Gulf Traders LLC")');
+  await admin.click('a.btn:text-is("Statement")');
+  await admin.waitForSelector('h1:text("Statement of account")');
+  await admin.waitForSelector('td a:text("CN-")');
+  const [stPdf] = await Promise.all([admin.waitForEvent('download'), admin.click('button:text("Statement PDF")')]);
+  assert.equal(fs.readFileSync(await stPdf.path()).subarray(0, 5).toString(), '%PDF-');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/ar-statement.png`, fullPage: true });
+  await admin.goto(base + '#/finance/reports?report=ar');
+  await admin.waitForSelector('h2:text("Receivables ageing")');
+  assert.ok(await admin.isVisible('a.row-link:text("Gulf Traders LLC")'));
+
+  // Recurring invoice: created as a draft when due
+  await admin.goto(base + '#/finance/recurring/new');
+  await admin.selectOption('[name=customer_id]', { label: 'Gulf Traders LLC' });
+  await admin.fill('[name=title]', 'Monthly storage');
+  await admin.fill('.l-desc', 'Storage for {period}');
+  await admin.fill('.l-price', '800');
+  await admin.click('button:text("Save")');
+  await admin.waitForSelector('h1:text("Monthly storage")');
+  await admin.click('button:text("Create due invoice now")');
+  await admin.waitForSelector('text=Created 1 draft invoice');
+  await admin.click('.list a.row-link:has-text("INV-")');
+  await admin.waitForSelector('.inv-title:text("TAX INVOICE")');
+  const month = new Date(today + 'T00:00:00Z').toLocaleString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' });
+  assert.ok(await admin.isVisible(`td:text("Storage for ${month}")`));
+
+  // Bank reconciliation: import a CSV, match automatically, record the bank charge
+  const dmy = today.split('-').reverse().join('/');
+  const csv = `Date,Description,Debit,Credit,Balance\r\n${dmy},"TRANSFER FROM GULF TRADERS FT-55001",,"2,010.00","10,000.00"\r\n${dmy},MONTHLY ACCOUNT FEE,26.25,,"9,973.75"\r\n`;
+  await admin.goto(base + '#/finance/reconcile');
+  await admin.click('button:text("Import statement")');
+  await admin.setInputFiles('dialog input[type=file]', { name: 'statement.csv', mimeType: 'text/csv', buffer: Buffer.from(csv) });
+  await admin.waitForSelector('dialog >> text=2 transactions');
+  assert.ok(await admin.isVisible('dialog td:text("-26.25")'));
+  await admin.click('dialog button:text-is("Import")');
+  await admin.waitForSelector('text=Imported 2 lines');
+  await admin.click('button:text("Match automatically")');
+  await admin.waitForSelector('text=Matched 1 line');
+  await admin.click('tr.stmt-line:has-text("MONTHLY ACCOUNT FEE") button:text("Record")');
+  assert.equal(await admin.$eval('dialog [name=other_account_id]', el => el.selectedOptions[0].textContent), '6400 · Bank charges');
+  await admin.click('dialog button:text("Save and match")');
+  await admin.waitForSelector('text=Every imported line is matched.');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/bank-reconciliation.png`, fullPage: true });
+
+  // Petty cash: top up and spend, with recoverable VAT
+  await admin.goto(base + '#/finance/petty-cash');
+  await admin.click('button:text("Top up")');
+  await admin.fill('dialog [name=amount]', '300');
+  await admin.click('dialog button:text("Top up")');
+  await admin.waitForSelector('text=Topped up');
+  await admin.click('button:text("+ Expense")');
+  await admin.fill('dialog [name=payee]', 'Stationery World');
+  await admin.fill('dialog [name=description]', 'Printer paper and toner');
+  await admin.fill('dialog [name=total]', '52.50');
+  await admin.waitForSelector('dialog >> text=Includes VAT of AED 2.50, claimed back in the VAT return.');
+  await admin.click('dialog button:text("Save")');
+  await admin.waitForSelector('text=Expense saved');
+  await admin.waitForSelector('.pay-summary .is-paid dd:text("AED 247.50")');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/petty-cash.png`, fullPage: true });
+
+  await admin.goto(base + '#/finance');
+  await admin.waitForSelector('h2:text("Recent entries")');
   assert.deepEqual(errors, []);
 });
