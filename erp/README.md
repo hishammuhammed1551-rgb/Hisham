@@ -1,6 +1,6 @@
 # Lowcaps ERP
 
-Internal system for the Lowcaps team. **Version 0.7 has Customers (CRM), Tasks, Invoices, Payments, Renewals and HR**; expenses and reports are planned next and already appear in the menu as "Soon".
+Internal system for the Lowcaps team. **Version 0.8 has Customers (CRM), Tasks, Invoices, Payments, Renewals, HR and Finance (phase 1: general ledger)**; expenses and reports are planned next and already appear in the menu as "Soon".
 
 It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages), both free. There is no server to run or maintain.
 
@@ -31,6 +31,15 @@ It runs on **Supabase** (database and sign-in) and **GitHub Pages** (the pages),
   - **Mark as renewed** moves the due date on by the repeat period (or to a date you choose) and keeps a history.
   - Managers can **Create task** from a renewal to hand the work to a team member; from there the usual task → proforma → tax invoice flow applies.
   - Renewal types and their default period and reminder are edited by managers under **Types**. Anyone with access can add renewals; managers can delete them (others can **Stop** one instead).
+- **Finance (phase 1).** Double-entry accounting for managers and admins; financial year January–December.
+  - **Chart of accounts:** a standard UAE chart for a logistics/clearing company (bank, cash, cheques in hand, receivables, disbursements recoverable, VAT input/output, customer advances, payables, capital, revenue by service, cost of sales, expenses). Admins add, rename or switch off accounts; the accounts automatic postings use are protected.
+  - **Every entry must balance** (debits = credits), enforced by the database when the entry is saved.
+  - **Automatic postings:** a tax invoice when sent (Dr receivables / Cr revenue by type of work / Cr VAT output; out-of-scope disbursement lines credit "Customs duty & disbursements recoverable"); a payment when recorded (Dr the bank or cash account it was received into / Cr receivables); cheques via "Cheques in hand" until cleared, back to receivables if bounced; proforma advances in "Customer advances" until the tax invoice is issued. Cancelling an invoice or deleting a payment reverses its postings. Invoices and payments from before the finance module are posted once when `schema.sql` runs.
+  - **Journal entries:** general, adjustments, accruals and prepayments (optionally reversed automatically on a date), opening balances (difference to opening balance equity in one click), reversal of any manual entry. Customer can be set on receivable lines.
+  - **Bank & cash:** balances per bank account, cash box and cheques in hand; money in, money out (e.g. expenses, or customs duty paid for a customer to 1300), transfers between accounts.
+  - **Reports:** trial balance (opening, movements, closing), profit and loss, balance sheet (checks assets = liabilities + equity), account ledger with running balance and drill-down to each entry and its invoice; Excel (CSV) and PDF export.
+  - **Closing the books:** admins set a date up to which nothing can be posted.
+  - Coming in later phases: payables and input VAT with reverse charge and the VAT return summary; credit notes, recurring invoices, statements and ageing; bank statement import and reconciliation; cash flow and profitability reports; recurring journals.
 - **HR.**
   - **Employee records:** job (employee no., designation, department, joining date), contact, personal and emergency details, documents (Emirates ID, passport, visa with expiry warnings), bank and monthly salary package, leave entitlement. Managers and admins see and edit everyone's full record; everyone else sees their own in full and only name, designation, department, email and phone of colleagues.
   - **Attendance:** **Sign in** on arrival and **Sign out** when leaving. The location is recorded; away from the office (or with location off) a **remark is required** saying why. Managers see the whole team for any day (on time, late, on leave, not signed in, where they signed in from, remarks) and can correct mistakes.

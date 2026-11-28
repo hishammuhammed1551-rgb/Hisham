@@ -285,6 +285,12 @@ function layout(active, ...content) {
         link('#/renewals', 'renew', 'Renewals', 'renewals'),
         link('#/invoices', 'invoice', 'Invoices', 'invoices'),
         link('#/payments', 'cash', 'Payments', 'payments'),
+        isManager() && h('div', { class: 'nav-heading' }, 'Finance'),
+        isManager() && link('#/finance', 'chart', 'Overview', 'finance'),
+        isManager() && link('#/finance/journals', 'note', 'Journal entries', 'finance-journals'),
+        isManager() && link('#/finance/bank', 'cash', 'Bank & cash', 'finance-bank'),
+        isManager() && link('#/finance/reports', 'chart', 'Reports', 'finance-reports'),
+        isManager() && link('#/finance/accounts', 'tag', 'Chart of accounts', 'finance-accounts'),
         h('div', { class: 'nav-heading' }, 'HR'),
         link('#/hr', 'badge', 'My HR', 'hr'),
         link('#/hr/attendance', 'follow_up', 'Attendance', 'hr-attendance'),
@@ -1127,9 +1133,11 @@ async function viewTask(id) {
 
 // ---------- types of work (managers) ----------
 
-function workTypeDialog(w, refresh) {
+function workTypeDialog(w, refresh, accounts = []) {
   const dlg = openDialog(`Edit "${w.name}"`, handleForm(h('form', { class: 'form' },
     field('Name', input('name', w.name, { required: true, maxlength: 100 })),
+    accounts.length > 0 && field('Income account', accountSelect('revenue_account_id', w.revenue_account_id, accounts, {}, a => a.type === 'income'),
+      { hint: 'Tax invoices for tasks of this type are posted to this account (empty: "Other operating revenue").' }),
     h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: w.active }),
       'In use (switch off to hide it when creating new tasks)'),
     h('div', { class: 'btn-row' },
@@ -1137,6 +1145,7 @@ function workTypeDialog(w, refresh) {
       h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
   async data => {
     await rpc('save_work_type', { p_id: w.id, p_name: data.name, p_active: data.active });
+    if ('revenue_account_id' in data) await rpc('set_work_type_account', { p_id: w.id, p_account_id: data.revenue_account_id || null });
     dlg.close();
     toast('Saved');
     refresh();
@@ -1145,7 +1154,7 @@ function workTypeDialog(w, refresh) {
 
 async function viewWorkTypes() {
   if (!isManager()) return viewNotFound();
-  const [types, renewalTypes] = await Promise.all([rpc('list_work_types'), rpc('list_renewal_types')]);
+  const [types, renewalTypes, accounts] = await Promise.all([rpc('list_work_types'), rpc('list_renewal_types'), rpc('list_accounts', { p_include_inactive: false })]);
   const refresh = () => render();
   const addForm = handleForm(h('form', { class: 'form' },
     h('div', { class: 'inline-form' },
@@ -1166,7 +1175,7 @@ async function viewWorkTypes() {
         h('td', {}, h('a', { class: 'row-link', href: `#/tasks?type=${w.id}&status=all` }, w.name)),
         h('td', {}, w.open_tasks),
         h('td', {}, w.active ? h('span', { class: 'badge badge-active' }, 'In use') : h('span', { class: 'badge badge-inactive' }, 'Switched off')),
-        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => workTypeDialog(w, refresh) }, 'Edit')))))))));
+        h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => workTypeDialog(w, refresh, accounts) }, 'Edit')))))))));
 }
 
 // ---------- invoices ----------
@@ -2033,7 +2042,14 @@ const PAY_METHOD = { bank_transfer: 'Bank transfer', cash: 'Cash', cheque: 'Cheq
 const CHEQUE_STATUS = { pending: 'Not cleared yet', cleared: 'Cleared', bounced: 'Bounced' };
 const chequeBadge = st => h('span', { class: `badge cheque-${st}` }, CHEQUE_STATUS[st]);
 
-function recordPaymentDialog(inv, refresh) {
+async function recordPaymentDialog(inv, refresh) {
+  let banks = [];
+  try { banks = (await rpc('cash_accounts')).filter(a => a.active && a.subtype !== 'pdc'); } catch (err) { toast(err.message, true); return; }
+  const defaultFor = m => (banks.find(a => a.subtype === (m === 'cash' ? 'cash' : 'bank')) || banks[0] || {}).id;
+  let intoTouched = false;
+  const into = select('account_id', String(defaultFor('bank_transfer') || ''), banks.map(a => [String(a.id), `${a.code} · ${a.name}`]),
+    { onchange: () => { intoTouched = true; } });
+  const intoField = field('Received into', into, { hint: 'For a cheque: the bank it will be deposited in. Until cleared it sits in "Cheques in hand".' });
   const balance = round2(inv.total - inv.amount_paid);
   const refField = field('Transfer reference', input('reference', '', { maxlength: 100, placeholder: 'e.g. FT2611ABC' }));
   const chequeFields = h('div', { class: 'form-grid', hidden: true },
@@ -2045,6 +2061,7 @@ function recordPaymentDialog(inv, refresh) {
       refField.querySelector('label').textContent = REF_LABEL[e.target.value];
       refField.querySelector('input').required = e.target.value === 'cheque';
       chequeFields.hidden = e.target.value !== 'cheque';
+      if (!intoTouched) into.value = String(defaultFor(e.target.value) || '');
     },
   });
   const dlg = openDialog(`Record payment for ${inv.number}`, handleForm(h('form', { class: 'form' },
@@ -2054,7 +2071,8 @@ function recordPaymentDialog(inv, refresh) {
         { hint: 'Change it for a part payment.' }),
       field('Received on', input('paid_on', localToday(), { type: 'date', max: localToday(), required: true })),
       field('Paid by', method),
-      refField),
+      refField,
+      banks.length > 0 && intoField),
     chequeFields,
     field('Note (optional)', textarea('notes', '', { rows: 2, maxlength: 1000 })),
     h('div', { class: 'btn-row' },
@@ -2914,6 +2932,592 @@ function hrSettingsCard(s) {
   return h('section', { class: 'card' }, h('h2', {}, 'HR: office, working hours and leave'), form);
 }
 
+// ---------- finance ----------
+
+const ACC_TYPE = { asset: 'Assets', liability: 'Liabilities', equity: 'Equity', income: 'Income', expense: 'Expenses' };
+const ACC_SUBTYPE = {
+  cash: 'Cash', bank: 'Bank', pdc: 'Cheques in hand', receivable: 'Receivables', current_asset: 'Other current assets',
+  fixed_asset: 'Fixed assets', vat_input: 'VAT input', payable: 'Payables', vat_output: 'VAT output', customer_advance: 'Customer advances',
+  current_liability: 'Current liabilities', long_term_liability: 'Long-term liabilities', equity: 'Capital', retained_earnings: 'Retained earnings',
+  opening_equity: 'Opening balance equity', revenue: 'Revenue', other_income: 'Other income', cost_of_sales: 'Cost of sales', expense: 'Operating expenses',
+};
+const SUBTYPES_BY_TYPE = {
+  asset: ['bank', 'cash', 'pdc', 'receivable', 'current_asset', 'fixed_asset', 'vat_input'],
+  liability: ['payable', 'vat_output', 'customer_advance', 'current_liability', 'long_term_liability'],
+  equity: ['equity', 'retained_earnings', 'opening_equity'],
+  income: ['revenue', 'other_income'],
+  expense: ['cost_of_sales', 'expense'],
+};
+const JOURNAL_KIND = {
+  journal: 'Journal', adjustment: 'Adjustment', accrual: 'Accrual', prepayment: 'Prepayment', opening: 'Opening balances',
+  invoice: 'Invoice', payment: 'Payment', reversal: 'Reversal', bank_receipt: 'Money in', bank_payment: 'Money out', transfer: 'Transfer',
+};
+const dc = n => (Number(n) ? amount(Math.abs(n)) + (n > 0 ? ' Dr' : ' Cr') : '—');
+const amt0 = n => (Number(n) ? amount(n) : '');
+
+/** <select> of accounts grouped by type, showing "code · name". */
+function accountSelect(name, value, accounts, attrs = {}, filter = () => true) {
+  const s = h('select', { name, ...attrs }, h('option', { value: '' }, 'Pick an account…'),
+    Object.entries(ACC_TYPE).map(([type, label]) => {
+      const list = accounts.filter(a => a.type === type && (a.active || String(a.id) === String(value)) && filter(a));
+      return list.length > 0 && h('optgroup', { label }, list.map(a => h('option', { value: String(a.id) }, `${a.code} · ${a.name}`)));
+    }));
+  s.value = value ? String(value) : '';
+  return s;
+}
+
+function downloadCsv(filename, header, rows) {
+  const csv = [header, ...rows].map(r => r.map(csvCell).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }));
+  const a = h('a', { href: url, download: filename });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** A report table as a PDF; numCols are right-aligned. Rows may mark bold totals with {bold: true} cells. */
+function downloadTablePdf(filename, title, subtitle, header, rows, numCols = []) {
+  try {
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: 'mm', format: 'a4', orientation: header.length > 5 ? 'landscape' : 'portrait' });
+    const W = doc.internal.pageSize.getWidth();
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(14); doc.setTextColor(28, 42, 34);
+    doc.text(pdfText(title), 14, 16);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90, 107, 96);
+    doc.text(pdfText(subtitle), 14, 22);
+    window.autoTable(doc, {
+      startY: 27, margin: { left: 14, right: 14 },
+      head: [header.map(pdfText)],
+      body: rows.map(r => r.map(c => (c && typeof c === 'object' ? { content: pdfText(c.text), styles: { fontStyle: 'bold' } } : pdfText(c)))),
+      styles: { font: 'helvetica', fontSize: 8, cellPadding: 1.6, textColor: [28, 42, 34], lineColor: [219, 229, 222], lineWidth: 0.1 },
+      headStyles: { fillColor: [74, 122, 92], textColor: 255 },
+      columnStyles: Object.fromEntries(numCols.map(i => [i, { halign: 'right' }])),
+      didParseCell: cell => { if (cell.section === 'head' && numCols.includes(cell.column.index)) cell.cell.styles.halign = 'right'; },
+    });
+    const pages = doc.getNumberOfPages();
+    for (let p = 1; p <= pages; p++) {
+      doc.setPage(p);
+      doc.setFontSize(7.5); doc.setTextColor(90, 107, 96);
+      doc.text(`Lowcaps ERP · printed ${fmtDate(localToday())} · page ${p} of ${pages}`, W - 14, doc.internal.pageSize.getHeight() - 8, { align: 'right' });
+    }
+    doc.save(filename);
+  } catch (err) {
+    toast('Could not create the PDF: ' + err.message, true);
+  }
+}
+
+function exportButtons(name, title, subtitle, header, rows, numCols) {
+  const plain = rows.map(r => r.map(c => (c && typeof c === 'object' ? c.text : c)));
+  return [
+    h('button', { class: 'btn btn-secondary btn-sm', onclick: () => downloadCsv(`${name}.csv`, header, plain) }, icon('download'), 'Excel (CSV)'),
+    h('button', { class: 'btn btn-secondary btn-sm', onclick: () => downloadTablePdf(`${name}.pdf`, title, subtitle, header, rows, numCols) }, icon('download'), 'PDF'),
+  ];
+}
+
+const sourceLink = j => (j.source_type === 'invoice' || (j.source && j.source.invoice_id)
+  ? `#/invoices/${j.source ? j.source.invoice_id : j.source_id}` : null);
+
+async function viewFinance() {
+  const o = await rpc('finance_overview');
+  const cashTotal = o.cash.filter(a => a.subtype !== 'pdc').reduce((t, a) => t + Number(a.balance), 0);
+  const pdc = o.cash.filter(a => a.subtype === 'pdc').reduce((t, a) => t + Number(a.balance), 0);
+  const tile = (label, value, href, sub) => h('a', { class: 'card stat', href }, h('div', { class: 'label' }, label),
+    h('div', { class: 'value value-money' }, money(value)), sub && h('div', { class: 'meta' }, sub));
+  const result = (label, r) => h('section', { class: 'card' }, h('h2', {}, label),
+    h('dl', { class: 'pay-summary' },
+      h('div', {}, h('dt', {}, 'Income'), h('dd', {}, money(r.income))),
+      h('div', {}, h('dt', {}, 'Expenses'), h('dd', {}, money(r.expenses))),
+      h('div', { class: r.income - r.expenses < 0 ? 'is-overdue' : 'is-paid' }, h('dt', {}, r.income - r.expenses < 0 ? 'Loss' : 'Profit'),
+        h('dd', {}, money(Math.abs(r.income - r.expenses))))));
+  return layout('finance',
+    pageHead('Finance', o.books_locked_until ? `Books closed up to ${fmtDate(o.books_locked_until)}` : 'Accounts, ledgers and reports', [
+      h('a', { class: 'btn btn-secondary', href: '#/finance/journals/new' }, '+ Journal entry'),
+      h('a', { class: 'btn btn-primary', href: '#/finance/reports' }, 'Reports'),
+    ]),
+    h('div', { class: 'grid stats' },
+      tile('Bank & cash', cashTotal, '#/finance/bank', pdc ? `+ ${money(pdc)} in cheques not cleared` : null),
+      tile('Receivables', o.receivables, `#/finance/reports?report=tb`, 'Owed by customers'),
+      tile('Customer advances', o.advances, '#/finance/bank', 'Received, not yet invoiced'),
+      tile('VAT output this quarter', o.vat_output_quarter, '#/finance/reports?report=tb', `Since ${fmtDate(o.quarter_start)}`)),
+    h('div', { class: 'grid two-col' }, result(`This month (since ${fmtDate(o.month_start)})`, o.month), result(`This year (since ${fmtDate(o.fy_start)})`, o.year)),
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', {}, 'Recent entries'), h('a', { class: 'btn btn-secondary btn-sm', href: '#/finance/journals' }, 'See all')),
+      o.recent.length
+        ? h('ul', { class: 'list' }, o.recent.map(j => h('li', {},
+            h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/journals/${j.id}` }, `${j.number} · ${j.memo || JOURNAL_KIND[j.kind]}`),
+              h('div', { class: 'meta' }, `${fmtDate(j.entry_date)} · ${JOURNAL_KIND[j.kind]}`)),
+            h('strong', {}, money(j.amount)))))
+        : h('p', { class: 'empty' }, 'No entries yet. They appear as tax invoices are sent and payments recorded, or add a journal entry.')));
+}
+
+// ---------- chart of accounts ----------
+
+function accountDialog(a, refresh) {
+  const type = select('type', a.type || 'expense', Object.entries(ACC_TYPE).map(([k, v]) => [k, v.replace(/s$/, '')]));
+  const subtype = h('select', { name: 'subtype' });
+  const fillSub = () => {
+    subtype.replaceChildren(...SUBTYPES_BY_TYPE[type.value].map(k => h('option', { value: k }, ACC_SUBTYPE[k])));
+    if (SUBTYPES_BY_TYPE[type.value].includes(a.subtype)) subtype.value = a.subtype;
+  };
+  type.addEventListener('change', fillSub);
+  fillSub();
+  const dlg = openDialog(a.id ? `Edit ${a.code} · ${a.name}` : 'Add an account', handleForm(h('form', { class: 'form' },
+    a.system_key && h('p', { class: 'muted' }, 'Automatic postings use this account. You can rename it; its type and group stay as they are.'),
+    h('div', { class: 'form-grid' },
+      field('Code', input('code', a.code, { required: true, inputmode: 'numeric', maxlength: 6, placeholder: 'e.g. 6250' })),
+      field('Name', input('name', a.name, { required: true, maxlength: 100 })),
+      field('Type', type), field('Group', subtype, { hint: 'Decides where it shows in the reports.' }),
+      field('Bank name', input('bank_name', a.bank_name, { maxlength: 100 }), { hint: 'For bank accounts.' }),
+      field('Account no. / IBAN', input('account_number', a.account_number, { maxlength: 50 })),
+      field('Description', input('description', a.description, { maxlength: 300 }), { full: true })),
+    h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: a.active !== false }), 'In use'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('save_account', { p_id: a.id || null, p_data: data });
+    dlg.close();
+    toast('Account saved');
+    refresh();
+  }));
+}
+
+async function viewAccounts() {
+  const [accounts, settings] = await Promise.all([rpc('list_accounts', {}), rpc('get_finance_settings')]);
+  const refresh = () => render();
+  const admin = state.user.role === 'admin';
+  const lockForm = admin && handleForm(h('form', { class: 'form' },
+    h('div', { class: 'inline-form' },
+      field('Close the books up to', input('date', settings.books_locked_until, { type: 'date', max: settings.today }),
+        { hint: 'Nothing can be posted on or before this date (e.g. after a VAT return or the year-end). Leave empty to reopen.' }),
+      h('button', { class: 'btn btn-secondary', type: 'submit' }, 'Save'))),
+  async data => {
+    await rpc('set_books_locked_until', { p_date: data.date || null });
+    toast(data.date ? `Books closed up to ${fmtDate(data.date)}` : 'Books reopened');
+    refresh();
+  });
+  return layout('finance-accounts',
+    pageHead('Chart of accounts', `${accounts.length} accounts · balances for this financial year`,
+      admin && h('button', { class: 'btn btn-primary', onclick: () => accountDialog({}, refresh) }, '+ Add account')),
+    lockForm && h('section', { class: 'card' }, lockForm),
+    Object.entries(ACC_TYPE).map(([type, label]) => h('section', { class: 'card' },
+      h('h2', {}, label),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Code'), h('th', {}, 'Account'), h('th', { class: 'hide-sm' }, 'Group'),
+          h('th', { class: 'num' }, 'Balance'), admin && h('th', {}, ''))),
+        h('tbody', {}, accounts.filter(a => a.type === type).map(a => h('tr', { class: a.active ? '' : 'row-off' },
+          h('td', {}, a.code),
+          h('td', {}, h('a', { class: 'row-link', href: `#/finance/ledger/${a.id}` }, a.name),
+            !a.active && [' ', h('span', { class: 'badge badge-inactive' }, 'Switched off')],
+            a.account_number && h('div', { class: 'meta muted' }, [a.bank_name, a.account_number].filter(Boolean).join(' · '))),
+          h('td', { class: 'hide-sm' }, ACC_SUBTYPE[a.subtype]),
+          h('td', { class: 'num' }, Number(a.balance) ? money(a.balance) : h('span', { class: 'muted' }, '—')),
+          admin && h('td', {}, h('button', { class: 'btn btn-secondary btn-sm', onclick: () => accountDialog(a, refresh) }, 'Edit'))))))))));
+}
+
+// ---------- journals ----------
+
+async function viewJournals(params) {
+  const q = new URLSearchParams(params);
+  const data = await rpc('list_journals', {
+    p_q: q.get('q') || null, p_kind: q.get('kind') || null, p_from: q.get('from') || null, p_to: q.get('to') || null,
+    p_page: Number(q.get('page')) || 1,
+  });
+  const setParam = (key, value) => {
+    const n = new URLSearchParams(params);
+    if (value) n.set(key, value); else n.delete(key);
+    if (key !== 'page') n.delete('page');
+    location.hash = '#/finance/journals' + (n.toString() ? '?' + n : '');
+  };
+  let timer;
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  return layout('finance-journals',
+    pageHead('Journal entries', `${data.total} entr${data.total === 1 ? 'y' : 'ies'}`, [
+      h('a', { class: 'btn btn-secondary', href: '#/finance/journals/new?kind=opening' }, 'Opening balances'),
+      h('a', { class: 'btn btn-primary', href: '#/finance/journals/new' }, '+ Journal entry'),
+    ]),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' },
+        input('q', q.get('q'), { type: 'search', placeholder: 'Search number, description or reference…', 'aria-label': 'Search',
+          oninput: e => { clearTimeout(timer); timer = setTimeout(() => setParam('q', e.target.value.trim()), 350); } }),
+        select('kind', q.get('kind'), [['', 'All entries'], ['manual', 'Entered by hand'], ['automatic', 'From invoices & payments'],
+          ...Object.entries(JOURNAL_KIND)], { 'aria-label': 'Kind', onchange: e => setParam('kind', e.target.value) }),
+        input('from', q.get('from'), { type: 'date', 'aria-label': 'From', onchange: e => setParam('from', e.target.value) }),
+        input('to', q.get('to'), { type: 'date', 'aria-label': 'To', onchange: e => setParam('to', e.target.value) })),
+      data.journals.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Entry'), h('th', {}, 'Description'), h('th', { class: 'hide-sm' }, 'Kind'),
+              h('th', { class: 'num' }, 'Amount'))),
+            h('tbody', {}, data.journals.map(j => h('tr', { class: j.reversed_by_id ? 'row-off' : '' },
+              h('td', {}, fmtDate(j.entry_date)),
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/journals/${j.id}` }, j.number),
+                j.reversed_by_id && h('div', { class: 'meta muted' }, 'Reversed')),
+              h('td', {}, j.memo || '—', j.reference && h('div', { class: 'meta muted' }, j.reference)),
+              h('td', { class: 'hide-sm' }, JOURNAL_KIND[j.kind]),
+              h('td', { class: 'num' }, money(j.amount)))))))
+        : h('p', { class: 'empty' }, 'No entries match.'),
+      data.total > data.pageSize && h('div', { class: 'pager' },
+        h('span', { class: 'muted' }, `Page ${data.page} of ${pages}`),
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+          h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')))));
+}
+
+async function viewJournalNew(params) {
+  const opening = params.kind === 'opening';
+  const [accounts, customers] = await Promise.all([rpc('list_accounts', { p_include_inactive: false }), rpc('customer_options')]);
+  const tbody = h('tbody', {});
+  const totals = h('p', { class: 'journal-totals' });
+  const usable = opening ? a => ['asset', 'liability', 'equity'].includes(a.type) : () => true;
+  const recalc = () => {
+    let dr = 0; let cr = 0;
+    for (const row of tbody.rows) {
+      dr += Number(row.querySelector('.j-dr').value) || 0;
+      cr += Number(row.querySelector('.j-cr').value) || 0;
+    }
+    dr = round2(dr); cr = round2(cr);
+    const diff = round2(dr - cr);
+    totals.replaceChildren(`Debits ${money(dr)} · Credits ${money(cr)} · `,
+      diff === 0 && dr > 0 ? h('strong', { class: 'ok' }, 'Balanced ✓') : h('strong', { class: 'bad' }, `Difference ${money(Math.abs(diff))}`));
+    return diff;
+  };
+  const addLine = (l = {}) => {
+    const custCell = h('td', {});
+    const acct = accountSelect('', l.account_id, accounts, { class: 'j-acct', 'aria-label': 'Account', required: true }, usable);
+    const showCustomer = () => {
+      const a = accounts.find(x => String(x.id) === acct.value);
+      custCell.replaceChildren(a && ['receivable', 'customer_advance'].includes(a.subtype)
+        ? select('', l.customer_id ? String(l.customer_id) : '', [['', 'Customer (optional)'], ...customers.map(c => [String(c.id), c.name])],
+          { class: 'j-cust', 'aria-label': 'Customer' })
+        : '');
+    };
+    acct.addEventListener('change', showCustomer);
+    const dr = h('input', { class: 'j-dr', type: 'number', min: '0', step: '0.01', value: l.debit ?? '', 'aria-label': 'Debit', placeholder: '0.00', oninput: recalc });
+    const cr = h('input', { class: 'j-cr', type: 'number', min: '0', step: '0.01', value: l.credit ?? '', 'aria-label': 'Credit', placeholder: '0.00', oninput: recalc });
+    const row = h('tr', {},
+      h('td', {}, acct),
+      h('td', {}, h('input', { class: 'j-desc', value: l.description ?? '', maxlength: 300, 'aria-label': 'Line description', placeholder: 'Optional' })),
+      custCell, h('td', {}, dr), h('td', {}, cr),
+      h('td', {}, h('button', { class: 'btn btn-danger btn-sm', type: 'button', 'aria-label': 'Remove line',
+        onclick: () => { if (tbody.rows.length > 2) { row.remove(); recalc(); } } }, '×')));
+    tbody.append(row);
+    showCustomer();
+    recalc();
+    return row;
+  };
+  addLine(); addLine();
+  const openingEquity = accounts.find(a => a.system_key === 'opening_equity');
+  const balanceOpening = () => {
+    const diff = recalc();
+    if (!diff) return;
+    let row = [...tbody.rows].find(r => r.querySelector('.j-acct').value === String(openingEquity.id));
+    if (!row) row = addLine({ account_id: openingEquity.id, description: 'Balancing figure' });
+    const cur = (Number(row.querySelector('.j-dr').value) || 0) - (Number(row.querySelector('.j-cr').value) || 0);
+    const next = round2(cur - diff);
+    row.querySelector('.j-dr').value = next > 0 ? next.toFixed(2) : '';
+    row.querySelector('.j-cr').value = next < 0 ? (-next).toFixed(2) : '';
+    recalc();
+  };
+  const reverseField = field('Reverse automatically on (optional)', input('reverse_on', '', { type: 'date' }),
+    { hint: 'For accruals and prepayments: the entry is undone on this date, e.g. the 1st of next month.' });
+  const kind = select('kind', opening ? 'opening' : 'journal', [['journal', 'Journal'], ['adjustment', 'Adjustment'], ['accrual', 'Accrual'],
+    ['prepayment', 'Prepayment'], ['opening', 'Opening balances']], {
+    onchange: e => { reverseField.hidden = !['accrual', 'prepayment'].includes(e.target.value); },
+  });
+  reverseField.hidden = true;
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field(opening ? 'Balances as at' : 'Date', input('entry_date', opening ? `${localToday().slice(0, 4)}-01-01` : localToday(), { type: 'date', required: true }),
+        opening ? { hint: 'Usually the day you start using the ERP for accounts, e.g. 1 January.' } : {}),
+      field('Kind', kind),
+      field('Description', input('memo', opening ? 'Opening balances' : '', { required: true, maxlength: 500, placeholder: 'e.g. Office rent for December' }), { full: true }),
+      field('Reference (optional)', input('reference', '', { maxlength: 100, placeholder: 'e.g. invoice or contract number' })),
+      reverseField),
+    h('div', { class: 'field', 'data-field': 'lines' },
+      h('label', {}, 'Lines'),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'inv-edit journal-edit' },
+        h('thead', {}, h('tr', {}, h('th', {}, 'Account'), h('th', {}, 'Line description'), h('th', {}, 'Customer'),
+          h('th', {}, 'Debit (AED)'), h('th', {}, 'Credit (AED)'), h('th', {}, ''))),
+        tbody)),
+      h('div', { class: 'inv-edit-foot' },
+        h('div', { class: 'btn-row' },
+          h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => addLine() }, '+ Add line'),
+          opening && h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: balanceOpening }, 'Balance with Opening balance equity')),
+        totals),
+      h('div', { class: 'hint' }, opening
+        ? 'Enter what each bank, cash, receivable, payable, VAT and capital account stood at. Put customer balances on Accounts receivable with the customer chosen. The difference goes to Opening balance equity.'
+        : 'Debits must equal credits before the entry can be saved.')),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Post entry'),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/journals' }, 'Cancel'))),
+  async data => {
+    data.lines = [...tbody.rows].map(r => ({
+      account_id: r.querySelector('.j-acct').value, description: r.querySelector('.j-desc').value,
+      debit: r.querySelector('.j-dr').value, credit: r.querySelector('.j-cr').value,
+      customer_id: r.querySelector('.j-cust') ? r.querySelector('.j-cust').value : null,
+    }));
+    const id = await rpc('post_manual_journal', { p_data: data });
+    toast('Entry posted');
+    location.hash = `#/finance/journals/${id}`;
+  });
+  return layout('finance-journals',
+    pageHead(opening ? 'Opening balances' : 'New journal entry', null, null, h('a', { href: '#/finance/journals' }, '← Journal entries')),
+    h('section', { class: 'card' }, form));
+}
+
+function reverseDialog(j, refresh) {
+  const dlg = openDialog(`Reverse ${j.number}`, handleForm(h('form', { class: 'form' },
+    h('p', { class: 'muted' }, 'A new entry with the same lines, debits and credits swapped, cancels this one out. Both stay on record.'),
+    field('Date of the reversal', input('date', localToday() < j.entry_date ? j.entry_date : localToday(), { type: 'date', required: true, min: j.entry_date })),
+    field('Reason (optional)', input('memo', '', { maxlength: 500 })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-danger', type: 'submit' }, 'Reverse'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    const id = await rpc('reverse_entry', { p_id: j.id, p_date: data.date, p_memo: data.memo || null });
+    dlg.close();
+    toast('Entry reversed');
+    location.hash = `#/finance/journals/${id}`;
+  }));
+}
+
+async function viewJournal(id) {
+  const { journal: j } = await rpc('get_journal', { p_id: id });
+  const dr = j.lines.reduce((t, l) => t + Number(l.debit), 0);
+  const cr = j.lines.reduce((t, l) => t + Number(l.credit), 0);
+  const src = sourceLink(j);
+  return layout('finance-journals',
+    pageHead(j.number, `${fmtDate(j.entry_date)} · ${JOURNAL_KIND[j.kind]}${j.created_by_name ? ' · by ' + j.created_by_name : ''}`, [
+      !j.source_type && !j.reversed_by_id && !j.reverses_id && h('button', { class: 'btn btn-danger', onclick: () => reverseDialog(j, () => render()) }, 'Reverse'),
+    ], [h('a', { href: '#/finance/journals' }, '← Journal entries')]),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [
+        ['Description', j.memo], ['Reference', j.reference],
+        j.source && ['From', src ? h('a', { href: src }, j.source.label) : j.source.label],
+        j.reverses_id && ['Reverses', h('a', { href: `#/finance/journals/${j.reverses_id}` }, j.reverses_number)],
+        j.reversed_by_id && ['Reversed by', h('a', { href: `#/finance/journals/${j.reversed_by_id}` }, j.reversed_by_number)],
+      ].filter(r => r && r[1]).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Account'), h('th', {}, 'Description'), h('th', { class: 'num' }, 'Debit'), h('th', { class: 'num' }, 'Credit'))),
+        h('tbody', {}, j.lines.map(l => h('tr', {},
+          h('td', {}, h('a', { class: 'row-link', href: `#/finance/ledger/${l.account_id}` }, `${l.code} · ${l.account}`),
+            l.customer_name && h('div', { class: 'meta muted' }, l.customer_name)),
+          h('td', {}, l.description || ''),
+          h('td', { class: 'num' }, amt0(l.debit)), h('td', { class: 'num' }, amt0(l.credit)))),
+          h('tr', { class: 'total-row' }, h('td', {}, 'Total'), h('td', {}), h('td', { class: 'num' }, amount(dr)), h('td', { class: 'num' }, amount(cr))))))));
+}
+
+// ---------- ledger ----------
+
+async function viewLedger(accountId, params) {
+  const fy = `${localToday().slice(0, 4)}-01-01`;
+  const l = await rpc('account_ledger', { p_account: accountId, p_from: params.from || fy, p_to: params.to || localToday(),
+    p_customer: Number(params.customer) || null });
+  const a = l.account;
+  const go = (k, v) => { const n = new URLSearchParams(params); if (v) n.set(k, v); else n.delete(k); location.hash = `#/finance/ledger/${accountId}?` + n; };
+  const header = ['Date', 'Entry', 'Description', 'Debit', 'Credit', 'Balance'];
+  const rows = [
+    [fmtDate(l.from), '', { text: 'Opening balance' }, '', '', { text: amount(l.opening) }],
+    ...l.lines.map(x => [fmtDate(x.entry_date), x.number, [x.memo, x.description, x.customer_name].filter(Boolean).join(' · '),
+      amt0(x.debit), amt0(x.credit), amount(x.balance)]),
+    [fmtDate(l.to), '', { text: 'Closing balance' }, '', '', { text: amount(l.closing) }],
+  ];
+  const subtitle = `${fmtDate(l.from)} – ${fmtDate(l.to)}${l.customer ? ' · ' + l.customer : ''} · balances shown as ${['asset', 'expense'].includes(a.type) ? 'debit' : 'credit'}`;
+  return layout('finance-accounts',
+    pageHead(`${a.code} · ${a.name}`, subtitle, [
+      input('from', l.from, { type: 'date', 'aria-label': 'From', onchange: e => go('from', e.target.value) }),
+      input('to', l.to, { type: 'date', 'aria-label': 'To', onchange: e => go('to', e.target.value) }),
+      ...exportButtons(`Ledger-${a.code}-${l.from}-${l.to}`, `Ledger: ${a.code} ${a.name}`, subtitle, header, rows, [3, 4, 5]),
+    ], [h('a', { href: '#/finance/accounts' }, '← Chart of accounts'), l.customer && [' · ', h('a', { href: `#/finance/ledger/${accountId}` }, 'All customers')]]),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, header.map((t, i) => h('th', { class: i >= 3 ? 'num' : '' }, t)))),
+      h('tbody', {},
+        h('tr', { class: 'total-row' }, h('td', {}, fmtDate(l.from)), h('td', {}), h('td', {}, 'Opening balance'), h('td', {}), h('td', {}), h('td', { class: 'num' }, amount(l.opening))),
+        l.lines.map(x => h('tr', {},
+          h('td', {}, fmtDate(x.entry_date)),
+          h('td', {}, h('a', { class: 'row-link', href: `#/finance/journals/${x.journal_id}` }, x.number)),
+          h('td', {}, x.memo || JOURNAL_KIND[x.kind], x.description && h('div', { class: 'meta muted' }, x.description),
+            x.customer_name && h('div', { class: 'meta' }, h('a', { href: `#/finance/ledger/${accountId}?customer=${x.customer_id}` }, x.customer_name))),
+          h('td', { class: 'num' }, amt0(x.debit)), h('td', { class: 'num' }, amt0(x.credit)), h('td', { class: 'num' }, amount(x.balance)))),
+        h('tr', { class: 'total-row' }, h('td', {}, fmtDate(l.to)), h('td', {}), h('td', {}, 'Closing balance'), h('td', {}), h('td', {}), h('td', { class: 'num' }, amount(l.closing))))))));
+}
+
+// ---------- bank & cash ----------
+
+function bankDialog(kind, accounts, cashAccounts, refresh) {
+  const titles = { in: 'Money in', out: 'Money out', transfer: 'Transfer between accounts' };
+  const banks = cashAccounts.filter(a => a.subtype !== 'pdc' && a.active);
+  const dlg = openDialog(titles[kind], handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field(kind === 'in' ? 'Into' : 'From', select('account_id', banks[0] ? String(banks[0].id) : '', banks.map(a => [String(a.id), `${a.code} · ${a.name}`]), { required: true })),
+      kind === 'transfer'
+        ? field('To', select('other_account_id', banks[1] ? String(banks[1].id) : '', banks.map(a => [String(a.id), `${a.code} · ${a.name}`]), { required: true }))
+        : field(kind === 'in' ? 'What it is for (income or other account)' : 'What it was for (expense or other account)',
+          accountSelect('other_account_id', '', accounts, { required: true }, a => !['bank', 'cash', 'pdc'].includes(a.subtype))),
+      field('Amount (AED)', input('amount', '', { type: 'number', min: '0.01', step: '0.01', required: true })),
+      field('Date', input('entry_date', localToday(), { type: 'date', required: true })),
+      field('Description', input('memo', '', { required: true, maxlength: 500, placeholder: kind === 'out' ? 'e.g. Electricity bill, November' : kind === 'in' ? 'e.g. Refund of deposit' : 'e.g. Top up petty cash' }), { full: true }),
+      field('Reference (optional)', input('reference', '', { maxlength: 100 }))),
+    kind !== 'transfer' && h('p', { class: 'hint' }, 'Customer payments for invoices are recorded on the invoice instead (Record payment). Supplier bills with VAT come in phase 2.'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('bank_transaction', { p_data: { ...data, kind } });
+    dlg.close();
+    toast('Saved');
+    refresh();
+  }));
+}
+
+async function viewBank() {
+  const [cashAccounts, accounts] = await Promise.all([rpc('cash_accounts'), rpc('list_accounts', { p_include_inactive: false })]);
+  const refresh = () => render();
+  return layout('finance-bank',
+    pageHead('Bank & cash', 'Balances of each bank account, cash box and cheques not yet cleared.', [
+      h('button', { class: 'btn btn-secondary', onclick: () => bankDialog('in', accounts, cashAccounts, refresh) }, '+ Money in'),
+      h('button', { class: 'btn btn-secondary', onclick: () => bankDialog('out', accounts, cashAccounts, refresh) }, '− Money out'),
+      h('button', { class: 'btn btn-secondary', onclick: () => bankDialog('transfer', accounts, cashAccounts, refresh) }, '⇄ Transfer'),
+    ]),
+    h('div', { class: 'grid stats' }, cashAccounts.filter(a => a.active || Number(a.balance)).map(a => h('a', { class: 'card stat', href: `#/finance/ledger/${a.id}` },
+      h('div', { class: 'label' }, `${a.code} · ${a.name}`),
+      h('div', { class: 'value value-money' }, money(a.balance)),
+      h('div', { class: 'meta' }, a.subtype === 'pdc' ? 'Cheques received, not cleared yet' : [ACC_SUBTYPE[a.subtype], a.bank_name, a.account_number].filter(Boolean).join(' · '))))),
+    state.user.role === 'admin' && h('p', { class: 'muted' }, 'Add more bank accounts or a petty cash box in the ', h('a', { href: '#/finance/accounts' }, 'chart of accounts'),
+      ' (type Asset, group Bank or Cash).'));
+}
+
+// ---------- reports ----------
+
+function periodPresets(from, to, onPick) {
+  const t = localToday();
+  const y = t.slice(0, 4);
+  const m = t.slice(0, 7);
+  const qm = String(Math.floor((Number(t.slice(5, 7)) - 1) / 3) * 3 + 1).padStart(2, '0');
+  const presets = [['This month', `${m}-01`, t], ['This quarter', `${y}-${qm}-01`, t], ['This year', `${y}-01-01`, t],
+    ['Last year', `${Number(y) - 1}-01-01`, `${Number(y) - 1}-12-31`]];
+  return h('div', { class: 'btn-row' }, presets.map(([label, f, to2]) =>
+    h('button', { class: `btn btn-sm ${f === from && to2 === to ? 'btn-primary' : 'btn-secondary'}`, type: 'button', onclick: () => onPick(f, to2) }, label)));
+}
+
+async function viewReports(params) {
+  const report = params.report || 'pl';
+  const t = localToday();
+  const from = params.from || `${t.slice(0, 4)}-01-01`;
+  const to = params.to || t;
+  const go = changes => {
+    const n = new URLSearchParams({ report, from, to, ...changes });
+    location.hash = '#/finance/reports?' + n;
+  };
+  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['tb', 'Trial balance']].map(([k, label]) =>
+    h('button', { type: 'button', 'aria-pressed': String(report === k), onclick: () => go({ report: k }) }, label)));
+  const dates = h('div', { class: 'filters report-dates' },
+    report !== 'bs' && input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go({ from: e.target.value }) }),
+    input('to', to, { type: 'date', 'aria-label': report === 'bs' ? 'As at' : 'To', onchange: e => go({ to: e.target.value }) }),
+    report !== 'bs' && periodPresets(from, to, (f, t2) => go({ from: f, to: t2 })));
+  const ledgerLink = (r, text) => h('a', { class: 'row-link', href: `#/finance/ledger/${r.id}?from=${report === 'bs' ? `${to.slice(0, 4)}-01-01` : from}&to=${to}` }, text);
+
+  let body;
+  let exportRows = [];
+  let header = [];
+  let numCols = [];
+  let title = '';
+  let subtitle = '';
+
+  if (report === 'tb') {
+    const tb = await rpc('trial_balance', { p_from: from, p_to: to });
+    title = 'Trial balance';
+    subtitle = `${fmtDate(tb.from)} – ${fmtDate(tb.to)}`;
+    header = ['Code', 'Account', 'Opening', 'Debit', 'Credit', 'Closing debit', 'Closing credit'];
+    numCols = [2, 3, 4, 5, 6];
+    const tot = { dr: 0, cr: 0, cdr: 0, ccr: 0 };
+    const rows = tb.rows.map(r => {
+      const closing = round2(Number(r.opening) + Number(r.debit) - Number(r.credit));
+      tot.dr += Number(r.debit); tot.cr += Number(r.credit);
+      if (closing > 0) tot.cdr += closing; else tot.ccr -= closing;
+      return { r, closing };
+    });
+    exportRows = [...rows.map(({ r, closing }) => [r.code, r.name, dc(r.opening), amt0(r.debit), amt0(r.credit), closing > 0 ? amount(closing) : '', closing < 0 ? amount(-closing) : '']),
+      [{ text: 'Total' }, '', '', { text: amount(tot.dr) }, { text: amount(tot.cr) }, { text: amount(tot.cdr) }, { text: amount(tot.ccr) }]];
+    const balanced = round2(tot.cdr) === round2(tot.ccr);
+    body = [
+      h('p', { class: balanced ? 'muted' : 'form-error' }, balanced ? 'Debits equal credits ✓' : `Out of balance by ${money(Math.abs(tot.cdr - tot.ccr))}`),
+      h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+        h('thead', {}, h('tr', {}, header.map((x, i) => h('th', { class: numCols.includes(i) ? 'num' : '' }, x)))),
+        h('tbody', {}, rows.map(({ r, closing }) => h('tr', {},
+          h('td', {}, r.code), h('td', {}, ledgerLink(r, r.name)), h('td', { class: 'num' }, dc(r.opening)),
+          h('td', { class: 'num' }, amt0(r.debit)), h('td', { class: 'num' }, amt0(r.credit)),
+          h('td', { class: 'num' }, closing > 0 ? amount(closing) : ''), h('td', { class: 'num' }, closing < 0 ? amount(-closing) : ''))),
+          h('tr', { class: 'total-row' }, h('td', {}, 'Total'), h('td', {}), h('td', {}), h('td', { class: 'num' }, amount(tot.dr)), h('td', { class: 'num' }, amount(tot.cr)),
+            h('td', { class: 'num' }, amount(tot.cdr)), h('td', { class: 'num' }, amount(tot.ccr))))))];
+  } else if (report === 'pl') {
+    const pl = await rpc('profit_loss', { p_from: from, p_to: to });
+    title = 'Profit and loss';
+    subtitle = `${fmtDate(pl.from)} – ${fmtDate(pl.to)}`;
+    header = ['Account', 'AED'];
+    numCols = [1];
+    const sum = st => pl.rows.filter(r => st.includes(r.subtype)).reduce((t, r) => t + Number(r.amount), 0);
+    const revenue = sum(['revenue']); const cos = sum(['cost_of_sales']); const opex = sum(['expense']); const other = sum(['other_income']);
+    const gross = revenue - cos; const net = gross - opex + other;
+    const section = (label, st) => {
+      const rows = pl.rows.filter(r => st.includes(r.subtype));
+      exportRows.push([{ text: label }, ''], ...rows.map(r => [`${r.code} ${r.name}`, amount(r.amount)]), [{ text: `Total ${label.toLowerCase()}` }, { text: amount(sum(st)) }]);
+      return [h('tr', { class: 'section-row' }, h('td', { colspan: 2 }, label)),
+        rows.length ? rows.map(r => h('tr', {}, h('td', {}, ledgerLink(r, `${r.code} · ${r.name}`)), h('td', { class: 'num' }, amount(r.amount))))
+          : h('tr', {}, h('td', { class: 'muted' }, 'None'), h('td', {})),
+        h('tr', { class: 'total-row' }, h('td', {}, `Total ${label.toLowerCase()}`), h('td', { class: 'num' }, amount(sum(st))))];
+    };
+    const line = (label, v, cls = 'total-row') => { exportRows.push([{ text: label }, { text: amount(v) }]); return h('tr', { class: cls }, h('td', {}, label), h('td', { class: 'num' }, amount(v))); };
+    body = h('div', { class: 'table-wrap' }, h('table', { class: 'report report-narrow' }, h('tbody', {},
+      section('Revenue', ['revenue']), section('Cost of sales', ['cost_of_sales']), line('Gross profit', gross, 'grand-row'),
+      section('Operating expenses', ['expense']), section('Other income', ['other_income']),
+      line(net >= 0 ? 'Net profit' : 'Net loss', net, 'grand-row'))));
+  } else {
+    const bs = await rpc('balance_sheet', { p_as_of: to });
+    title = 'Balance sheet';
+    subtitle = `As at ${fmtDate(bs.as_of)}`;
+    header = ['Account', 'AED'];
+    numCols = [1];
+    const groupRows = type => {
+      const rows = bs.rows.filter(r => r.type === type);
+      const out = [];
+      for (const st of SUBTYPES_BY_TYPE[type]) {
+        const g = rows.filter(r => r.subtype === st);
+        if (!g.length) continue;
+        out.push(h('tr', { class: 'sub-row' }, h('td', { colspan: 2 }, ACC_SUBTYPE[st])));
+        exportRows.push([ACC_SUBTYPE[st], '']);
+        g.forEach(r => { out.push(h('tr', {}, h('td', {}, ledgerLink(r, `${r.code} · ${r.name}`)), h('td', { class: 'num' }, amount(r.amount)))); exportRows.push([`${r.code} ${r.name}`, amount(r.amount)]); });
+      }
+      return out;
+    };
+    const total = type => bs.rows.filter(r => r.type === type).reduce((t, r) => t + Number(r.amount), 0);
+    const assets = total('asset'); const liabilities = total('liability'); const equity = total('equity') + Number(bs.current_year_profit);
+    const block = (label, type, extra, tot) => {
+      exportRows.push([{ text: label }, '']);
+      const rows = groupRows(type);
+      if (extra) exportRows.push([extra[0], amount(extra[1])]);
+      exportRows.push([{ text: `Total ${label.toLowerCase()}` }, { text: amount(tot) }]);
+      return [h('tr', { class: 'section-row' }, h('td', { colspan: 2 }, label)), rows,
+        extra && h('tr', {}, h('td', {}, extra[0]), h('td', { class: 'num' }, amount(extra[1]))),
+        h('tr', { class: 'total-row' }, h('td', {}, `Total ${label.toLowerCase()}`), h('td', { class: 'num' }, amount(tot)))];
+    };
+    const ok = round2(assets) === round2(liabilities + equity);
+    exportRows.push([{ text: 'Total liabilities and equity' }, { text: amount(liabilities + equity) }]);
+    body = [
+      h('div', { class: 'table-wrap' }, h('table', { class: 'report report-narrow' }, h('tbody', {},
+        block('Assets', 'asset', null, assets),
+        block('Liabilities', 'liability', null, liabilities),
+        block('Equity', 'equity', [`Profit for the year to date (since ${fmtDate(bs.fy_start)})`, bs.current_year_profit], equity),
+        h('tr', { class: 'grand-row' }, h('td', {}, 'Total liabilities and equity'), h('td', { class: 'num' }, amount(liabilities + equity)))))),
+      h('p', { class: ok ? 'muted' : 'form-error' }, ok ? 'Assets equal liabilities plus equity ✓' : `Difference of ${money(Math.abs(assets - liabilities - equity))}`)];
+  }
+  return layout('finance-reports',
+    pageHead('Reports', null, exportButtons(`${title.replace(/ /g, '-')}-${report === 'bs' ? to : from + '-to-' + to}`, title, subtitle, header, exportRows, numCols)),
+    tabs, dates,
+    h('section', { class: 'card' }, h('h2', {}, title), h('p', { class: 'muted' }, subtitle), body));
+}
+
 // ---------- users (admin) ----------
 
 function userDialog(u, refresh) {
@@ -3067,6 +3671,15 @@ async function render() {
       else if ((m = path.match(/^\/invoices\/(\d+)\/edit$/))) view = await viewInvoiceEdit(Number(m[1]));
       else if (path === '/settings') view = await viewCompanySettings();
       else if (path === '/payments') view = await viewPayments(params);
+      else if (path.startsWith('/finance') && !isManager()) view = viewNotFound();
+      else if (path === '/finance') view = await viewFinance();
+      else if (path === '/finance/accounts') view = await viewAccounts();
+      else if (path === '/finance/journals') view = await viewJournals(params);
+      else if (path === '/finance/journals/new') view = await viewJournalNew(params);
+      else if ((m = path.match(/^\/finance\/journals\/(\d+)$/))) view = await viewJournal(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/ledger\/(\d+)$/))) view = await viewLedger(Number(m[1]), params);
+      else if (path === '/finance/bank') view = await viewBank();
+      else if (path === '/finance/reports') view = await viewReports(params);
       else if (path === '/renewals') view = await viewRenewals(params);
       else if (path === '/renewals/new') view = await viewRenewalNew(params);
       else if ((m = path.match(/^\/renewals\/(\d+)$/))) view = await viewRenewal(Number(m[1]));
