@@ -72,7 +72,7 @@ const ROLE_OPTIONS = [['employee', 'Employee (HR only)'], ['staff', 'Team member
 const isEmployee = () => state.user?.role === 'employee';
 const TASK_STATUS = { new: 'New', in_progress: 'In progress', waiting: 'Waiting', done: 'Done', cancelled: 'Cancelled' };
 const PRIORITY = { low: 'Low', normal: 'Normal', high: 'High', urgent: 'Urgent' };
-const INVOICE_KIND = { proforma: 'Proforma invoice', tax: 'Tax invoice' };
+const INVOICE_KIND = { proforma: 'Proforma invoice', tax: 'Tax invoice', credit_note: 'Tax credit note' };
 const INVOICE_STATUS = { draft: 'Draft', sent: 'Sent', paid: 'Paid', cancelled: 'Cancelled' };
 const VAT_CODES = { standard: '5% VAT', zero: '0% (zero-rated)', exempt: 'Exempt', out_of_scope: 'No VAT (disbursement)' };
 const invoiceBadge = st => h('span', { class: `badge inv-${st}` }, INVOICE_STATUS[st] || st);
@@ -287,11 +287,16 @@ function layout(active, ...content) {
         link('#/payments', 'cash', 'Payments', 'payments'),
         isManager() && h('div', { class: 'nav-heading' }, 'Finance'),
         isManager() && link('#/finance', 'chart', 'Overview', 'finance'),
-        isManager() && link('#/finance/journals', 'note', 'Journal entries', 'finance-journals'),
+        isManager() && link('#/finance/receipts', 'cash', 'Receipts', 'finance-receipts'),
+        isManager() && link('#/finance/credit-notes', 'invoice', 'Credit notes', 'finance-credit-notes'),
+        isManager() && link('#/finance/recurring', 'renew', 'Recurring invoices', 'finance-recurring'),
         isManager() && link('#/finance/suppliers', 'users', 'Suppliers', 'finance-suppliers'),
         isManager() && link('#/finance/bills', 'invoice', 'Bills', 'finance-bills'),
         isManager() && link('#/finance/bank', 'cash', 'Bank & cash', 'finance-bank'),
+        isManager() && link('#/finance/reconcile', 'task', 'Bank reconciliation', 'finance-reconcile'),
+        isManager() && link('#/finance/petty-cash', 'cash', 'Petty cash', 'finance-petty'),
         isManager() && link('#/finance/vat', 'tag', 'VAT return', 'finance-vat'),
+        isManager() && link('#/finance/journals', 'note', 'Journal entries', 'finance-journals'),
         isManager() && link('#/finance/reports', 'chart', 'Reports', 'finance-reports'),
         isManager() && link('#/finance/accounts', 'tag', 'Chart of accounts', 'finance-accounts'),
         h('div', { class: 'nav-heading' }, 'HR'),
@@ -853,6 +858,8 @@ async function viewCustomer(id) {
 
   return layout('customers',
     pageHead(c.name, null, [
+      isManager() && h('a', { class: 'btn btn-secondary', href: `#/finance/customers/${id}/statement` }, 'Statement'),
+      isManager() && h('a', { class: 'btn btn-secondary', href: `#/finance/receipts/new?customer=${id}` }, '+ Receipt'),
       h('a', { class: 'btn btn-secondary', href: `#/customers/${id}/edit` }, 'Edit'),
       isManager() && h('button', {
         class: 'btn btn-danger',
@@ -1240,7 +1247,8 @@ async function viewInvoices(params) {
 }
 
 /** The form for a draft invoice: customer, dates, charge lines with live VAT totals. */
-function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
+/** Editable table of sales lines (description, qty, price, VAT) with live totals. read() returns the lines. */
+function salesLinesEditor(initial, { label = 'Charges (AED)', hint, placeholder = 'e.g. Customs clearance fee', totalLabel = 'Total' } = {}) {
   const tbody = h('tbody', {});
   const totals = h('dl', { class: 'inv-form-totals' });
 
@@ -1257,13 +1265,13 @@ function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
     totals.replaceChildren(
       h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(net)),
       h('dt', {}, 'VAT 5%'), h('dd', {}, money(vat)),
-      h('dt', { class: 'grand' }, 'Total'), h('dd', { class: 'grand' }, money(round2(net + vat))));
+      h('dt', { class: 'grand' }, totalLabel), h('dd', { class: 'grand' }, money(round2(net + vat))));
   };
 
   const addLine = (l = {}) => {
     const row = h('tr', {},
       h('td', {}, h('input', { class: 'l-desc', value: l.description ?? '', required: true, maxlength: 500,
-        'aria-label': 'Description', placeholder: 'e.g. Customs clearance fee' })),
+        'aria-label': 'Description', placeholder })),
       h('td', {}, h('input', { class: 'l-qty', type: 'number', min: '0.001', step: '0.001', value: l.quantity ?? 1,
         required: true, 'aria-label': 'Quantity', oninput: recalc })),
       h('td', {}, h('input', { class: 'l-price', type: 'number', min: '0', step: '0.01', value: l.unit_price ?? '',
@@ -1277,7 +1285,32 @@ function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
     tbody.append(row);
     recalc();
   };
-  (inv.lines && inv.lines.length ? inv.lines : [{}]).forEach(addLine);
+  (initial && initial.length ? initial : [{}]).forEach(addLine);
+
+  const el = h('div', { class: 'field', 'data-field': 'lines' },
+    h('label', {}, label),
+    h('div', { class: 'table-wrap' }, h('table', { class: 'inv-edit' },
+      h('thead', {}, h('tr', {},
+        h('th', {}, 'Description'), h('th', {}, 'Qty'), h('th', {}, 'Unit price'), h('th', {}, 'VAT'),
+        h('th', { class: 'num' }, 'Amount'), h('th', {}, ''))),
+      tbody)),
+    h('div', { class: 'inv-edit-foot' },
+      h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => addLine() }, '+ Add line'),
+      totals),
+    hint && h('div', { class: 'hint' }, hint));
+  const read = () => [...tbody.rows].map(row => ({
+    description: row.querySelector('.l-desc').value,
+    quantity: row.querySelector('.l-qty').value,
+    unit_price: row.querySelector('.l-price').value,
+    vat_code: row.querySelector('.l-vat').value,
+  }));
+  return { el, read };
+}
+
+function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
+  const lines = salesLinesEditor(inv.lines, {
+    hint: 'Use 0% for international transport, and "No VAT (disbursement)" for costs paid on the customer\'s behalf, such as customs duty.',
+  });
 
   const customerOptions = [['', 'Pick a customer…'], ...customers.map(c => [String(c.id), c.name])];
   return handleForm(h('form', { class: 'form' },
@@ -1289,18 +1322,7 @@ function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
       field(kind === 'tax' ? 'Payment due' : 'Valid until', input('due_date', inv.due_date, { type: 'date' })),
       kind === 'tax' && field('Date of supply', input('supply_date', inv.supply_date, { type: 'date' }),
         { hint: 'When the work was done, if different from the invoice date.' })),
-    h('div', { class: 'field', 'data-field': 'lines' },
-      h('label', {}, 'Charges (AED)'),
-      h('div', { class: 'table-wrap' }, h('table', { class: 'inv-edit' },
-        h('thead', {}, h('tr', {},
-          h('th', {}, 'Description'), h('th', {}, 'Qty'), h('th', {}, 'Unit price'), h('th', {}, 'VAT'),
-          h('th', { class: 'num' }, 'Amount'), h('th', {}, ''))),
-        tbody)),
-      h('div', { class: 'inv-edit-foot' },
-        h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: () => addLine() }, '+ Add line'),
-        totals),
-      h('div', { class: 'hint' },
-        'Use 0% for international transport, and "No VAT (disbursement)" for costs paid on the customer\'s behalf, such as customs duty.')),
+    lines.el,
     field('Notes on the invoice (optional)', textarea('notes', inv.notes, { rows: 2, maxlength: 2000,
       placeholder: 'e.g. BL no. MEDU123456, container MSKU1234567' })),
     h('div', { class: 'btn-row' },
@@ -1308,12 +1330,7 @@ function invoiceForm(inv, kind, customers, onSubmit, cancelHref) {
       h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
   data => {
     data.kind = kind;
-    data.lines = [...tbody.rows].map(row => ({
-      description: row.querySelector('.l-desc').value,
-      quantity: row.querySelector('.l-qty').value,
-      unit_price: row.querySelector('.l-price').value,
-      vat_code: row.querySelector('.l-vat').value,
-    }));
+    data.lines = lines.read();
     return onSubmit(data);
   });
 }
@@ -1399,15 +1416,25 @@ function paymentLines(sup) {
 
 const PROFORMA_NOTE = 'This proforma invoice is not a tax invoice. A tax invoice will be issued when the work is completed.';
 
-/** On-screen version of the invoice, laid out like the PDF. */
-function invoiceDocument(inv) {
-  const sup = inv.supplier || {};
-  const meta = [
+const docTitle = inv => (inv.kind === 'credit_note' ? 'TAX CREDIT NOTE' : inv.kind === 'tax' ? 'TAX INVOICE' : 'PROFORMA INVOICE');
+
+function docMeta(inv) {
+  if (inv.kind === 'credit_note') {
+    return [['Credit note no.', inv.number], ['Date', fmtDate(inv.issue_date)], ['Against invoice', inv.invoice_number],
+      inv.invoice_date && ['Invoice date', fmtDate(inv.invoice_date)]].filter(Boolean);
+  }
+  return [
     ['Invoice no.', inv.number], ['Date', fmtDate(inv.issue_date)],
     inv.supply_date && ['Date of supply', fmtDate(inv.supply_date)],
     inv.due_date && [inv.kind === 'tax' ? 'Payment due' : 'Valid until', fmtDate(inv.due_date)],
     inv.proforma_number && ['Proforma ref.', inv.proforma_number],
   ].filter(Boolean);
+}
+
+/** On-screen version of the invoice (or credit note), laid out like the PDF. */
+function invoiceDocument(inv) {
+  const sup = inv.supplier || {};
+  const meta = docMeta(inv);
   const pay = paymentLines(sup);
   return h('article', { class: 'inv-doc', 'aria-label': `${INVOICE_KIND[inv.kind]} ${inv.number}` },
     h('header', { class: 'inv-head' },
@@ -1415,7 +1442,7 @@ function invoiceDocument(inv) {
         h('div', { class: 'inv-supplier' }, sup.legal_name || 'Lowcaps'),
         supplierLines(sup).map(l => h('div', { class: 'muted' }, l))),
       h('div', { class: 'inv-title-block' },
-        h('div', { class: 'inv-title' }, inv.kind === 'tax' ? 'TAX INVOICE' : 'PROFORMA INVOICE'),
+        h('div', { class: 'inv-title' }, docTitle(inv)),
         h('dl', { class: 'inv-meta' }, meta.map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])))),
     h('section', { class: 'inv-billto' },
       h('div', { class: 'inv-label' }, 'Bill to'),
@@ -1438,7 +1465,7 @@ function invoiceDocument(inv) {
         h('dt', {}, 'Paid'), h('dd', {}, `- ${money(inv.amount_paid)}`),
         h('dt', { class: 'grand' }, 'Balance due'), h('dd', { class: 'grand' }, money(Number(inv.total) - Number(inv.amount_paid)))]),
     inv.notes && h('p', { class: 'prewrap' }, inv.notes),
-    pay.length > 0 && h('section', { class: 'inv-pay' }, h('div', { class: 'inv-label' }, 'Payment details'), pay.map(l => h('div', {}, l))),
+    inv.kind !== 'credit_note' && pay.length > 0 && h('section', { class: 'inv-pay' }, h('div', { class: 'inv-label' }, 'Payment details'), pay.map(l => h('div', {}, l))),
     sup.invoice_notes && h('p', { class: 'muted prewrap' }, sup.invoice_notes),
     inv.kind === 'proforma' && h('p', { class: 'muted' }, PROFORMA_NOTE));
 }
@@ -1470,13 +1497,8 @@ function buildInvoicePdf(inv) {
   supLines.forEach((l, i) => doc.text(l, M, M + 11 + i * LH));
 
   doc.setFont('helvetica', 'bold'); doc.setFontSize(17); doc.setTextColor(...DARK);
-  doc.text(inv.kind === 'tax' ? 'TAX INVOICE' : 'PROFORMA INVOICE', W - M, M + 5, { align: 'right' });
-  const meta = [
-    ['Invoice no.', inv.number], ['Date', fmtDate(inv.issue_date)],
-    inv.supply_date && ['Date of supply', fmtDate(inv.supply_date)],
-    inv.due_date && [inv.kind === 'tax' ? 'Payment due' : 'Valid until', fmtDate(inv.due_date)],
-    inv.proforma_number && ['Proforma ref.', inv.proforma_number],
-  ].filter(Boolean);
+  doc.text(docTitle(inv), W - M, M + 5, { align: 'right' });
+  const meta = docMeta(inv);
   doc.setFontSize(9);
   meta.forEach(([k, v], i) => {
     doc.setFont('helvetica', 'bold'); doc.setTextColor(...GREY); doc.text(`${k}:`, W - M - 32, M + 12 + i * 5, { align: 'right' });
@@ -1540,7 +1562,7 @@ function buildInvoicePdf(inv) {
     y += 4;
   };
   block('Notes', inv.notes ? String(inv.notes).split('\n') : []);
-  block('Payment details', paymentLines(sup));
+  if (inv.kind !== 'credit_note') block('Payment details', paymentLines(sup));
   block('', sup.invoice_notes ? String(sup.invoice_notes).split('\n') : []);
   if (inv.kind === 'proforma') block('', [PROFORMA_NOTE]);
 
@@ -1676,6 +1698,8 @@ async function viewInvoice(id) {
       h('a', { class: 'btn btn-secondary', href: `#/invoices/new?kind=tax&task=${inv.task_id}` }, 'Create tax invoice'),
     isManager() && inv.kind === 'tax' && inv.status === 'sent' && balance > 0 &&
       h('button', { class: 'btn btn-secondary', onclick: () => paymentReminderDialog(inv, refresh) }, 'Payment reminder'),
+    isManager() && inv.kind === 'tax' && ['sent', 'paid'].includes(inv.status) &&
+      h('a', { class: 'btn btn-secondary', href: `#/finance/credit-notes/new?invoice=${id}` }, 'Credit note'),
     isManager() && live && h('button', {
       class: 'btn btn-danger',
       onclick: () => {
@@ -1699,6 +1723,7 @@ async function viewInvoice(id) {
     inv.status === 'draft' && isManager() && h('p', { class: 'notice' },
       'Draft: check the charges, then click "Email to customer". Once sent, the invoice can no longer be changed.'),
     inv.status !== 'cancelled' && paymentsCard(inv, today, refresh),
+    inv.status !== 'cancelled' && invoiceCreditsCard(inv),
     h('section', { class: 'card' }, invoiceDocument(inv)));
 }
 
@@ -2129,7 +2154,7 @@ function paymentsCard(inv, today, refresh) {
         h('button', { class: 'btn btn-primary btn-sm', onclick: () => recordPaymentDialog(inv, refresh) }, '+ Record payment')),
     h('dl', { class: 'pay-summary' },
       h('div', {}, h('dt', {}, 'Total'), h('dd', {}, money(inv.total))),
-      h('div', {}, h('dt', {}, 'Paid'), h('dd', {}, money(inv.amount_paid))),
+      h('div', {}, h('dt', {}, inv.allocations && inv.allocations.length ? 'Paid / credited' : 'Paid'), h('dd', {}, money(inv.amount_paid))),
       h('div', { class: overdue ? 'is-overdue' : balance > 0 ? '' : 'is-paid' },
         h('dt', {}, overdue ? `Balance · overdue ${daysBetween(inv.due_date, today)} days` : 'Balance'),
         h('dd', {}, money(balance)))),
@@ -3018,8 +3043,16 @@ function exportButtons(name, title, subtitle, header, rows, numCols) {
   ];
 }
 
-const sourceLink = j => (j.source_type === 'invoice' || (j.source && j.source.invoice_id)
-  ? `#/invoices/${j.source ? j.source.invoice_id : j.source_id}` : null);
+const sourceLink = j => {
+  const s = j.source || {};
+  if (s.invoice_id || j.source_type === 'invoice') return `#/invoices/${s.invoice_id || j.source_id}`;
+  if (s.bill_id) return `#/finance/bills/${s.bill_id}`;
+  if (s.supplier_payment_id) return `#/finance/supplier-payments/${s.supplier_payment_id}`;
+  if (s.credit_note_id) return `#/finance/credit-notes/${s.credit_note_id}`;
+  if (s.receipt_id) return `#/finance/receipts/${s.receipt_id}`;
+  if (s.petty_cash) return '#/finance/petty-cash';
+  return null;
+};
 
 async function viewFinance() {
   const o = await rpc('finance_overview');
@@ -3036,12 +3069,17 @@ async function viewFinance() {
   return layout('finance',
     pageHead('Finance', o.books_locked_until ? `Books closed up to ${fmtDate(o.books_locked_until)}` : 'Accounts, ledgers and reports', [
       h('a', { class: 'btn btn-secondary', href: '#/finance/journals/new' }, '+ Journal entry'),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/receipts/new' }, '+ Receipt'),
       h('a', { class: 'btn btn-secondary', href: '#/finance/bills/new' }, '+ Bill'),
       h('a', { class: 'btn btn-primary', href: '#/finance/reports' }, 'Reports'),
     ]),
+    o.recurring_due > 0 && h('p', { class: 'notice' }, `${o.recurring_due} recurring invoice${o.recurring_due === 1 ? ' is' : 's are'} due. `,
+      h('button', { class: 'btn btn-primary btn-sm', onclick: () => runRecurring(null) }, 'Create the draft invoices'), ' ', h('a', { href: '#/finance/recurring' }, 'See them')),
+    o.unreconciled > 0 && h('p', { class: 'notice' }, `${o.unreconciled} bank statement line${o.unreconciled === 1 ? '' : 's'} not matched yet. `,
+      h('a', { href: '#/finance/reconcile' }, 'Reconcile')),
     h('div', { class: 'grid stats' },
       tile('Bank & cash', cashTotal, '#/finance/bank', pdc ? `+ ${money(pdc)} in cheques not cleared` : null),
-      tile('Receivables', o.receivables, `#/finance/reports?report=tb`, 'Owed by customers'),
+      tile('Receivables', o.receivables, '#/finance/reports?report=ar', 'Owed by customers'),
       tile('Customer advances', o.advances, '#/finance/bank', 'Received, not yet invoiced'),
       tile('Payables', o.payables, '#/finance/reports?report=ap', 'Owed to suppliers'),
       tile('VAT output this quarter', o.vat_output_quarter, '#/finance/reports?report=tb', `Since ${fmtDate(o.quarter_start)}`)),
@@ -3415,12 +3453,12 @@ async function viewReports(params) {
     const n = new URLSearchParams({ report, from, to, ...changes });
     location.hash = '#/finance/reports?' + n;
   };
-  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['tb', 'Trial balance'], ['ap', 'Payables ageing']].map(([k, label]) =>
+  const tabs = h('div', { class: 'tabs' }, [['pl', 'Profit & loss'], ['bs', 'Balance sheet'], ['tb', 'Trial balance'], ['ar', 'Receivables ageing'], ['ap', 'Payables ageing']].map(([k, label]) =>
     h('button', { type: 'button', 'aria-pressed': String(report === k), onclick: () => go({ report: k }) }, label)));
   const dates = h('div', { class: 'filters report-dates' },
-    !['bs', 'ap'].includes(report) && input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go({ from: e.target.value }) }),
-    input('to', to, { type: 'date', 'aria-label': ['bs', 'ap'].includes(report) ? 'As at' : 'To', onchange: e => go({ to: e.target.value }) }),
-    !['bs', 'ap'].includes(report) && periodPresets(from, to, (f, t2) => go({ from: f, to: t2 })));
+    !['bs', 'ap', 'ar'].includes(report) && input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go({ from: e.target.value }) }),
+    input('to', to, { type: 'date', 'aria-label': ['bs', 'ap', 'ar'].includes(report) ? 'As at' : 'To', onchange: e => go({ to: e.target.value }) }),
+    !['bs', 'ap', 'ar'].includes(report) && periodPresets(from, to, (f, t2) => go({ from: f, to: t2 })));
   const ledgerLink = (r, text) => h('a', { class: 'row-link', href: `#/finance/ledger/${r.id}?from=${report === 'bs' ? `${to.slice(0, 4)}-01-01` : from}&to=${to}` }, text);
 
   let body;
@@ -3432,6 +3470,8 @@ async function viewReports(params) {
 
   if (report === 'ap') {
     ({ title, subtitle, header, exportRows, numCols, body } = await payablesAgeing(to));
+  } else if (report === 'ar') {
+    ({ title, subtitle, header, exportRows, numCols, body } = await receivablesAgeing(to));
   } else if (report === 'tb') {
     const tb = await rpc('trial_balance', { p_from: from, p_to: to });
     title = 'Trial balance';
@@ -3520,7 +3560,7 @@ async function viewReports(params) {
       h('p', { class: ok ? 'muted' : 'form-error' }, ok ? 'Assets equal liabilities plus equity ✓' : `Difference of ${money(Math.abs(assets - liabilities - equity))}`)];
   }
   return layout('finance-reports',
-    pageHead('Reports', null, exportButtons(`${title.replace(/ /g, '-')}-${['bs', 'ap'].includes(report) ? to : from + '-to-' + to}`, title, subtitle, header, exportRows, numCols)),
+    pageHead('Reports', null, exportButtons(`${title.replace(/ /g, '-')}-${['bs', 'ap', 'ar'].includes(report) ? to : from + '-to-' + to}`, title, subtitle, header, exportRows, numCols)),
     tabs, dates,
     h('section', { class: 'card' }, h('h2', {}, title), h('p', { class: 'muted' }, subtitle), body));
 }
@@ -3984,7 +4024,9 @@ async function viewVat(params) {
   ];
   const glOk = round2(v.gl.vat_output) === round2(due) && round2(v.gl.vat_input) === round2(rec);
   const ledgerHeader = ['Date', 'Document', 'Party', 'TRN', 'Type', 'Box', 'Net', 'VAT'];
-  const ledgerRows = v.ledger.map(l => [fmtDate(l.date), l.document, l.party, l.party_trn || '', `${l.side === 'sale' ? 'Sale' : 'Purchase'}: ${(l.side === 'sale' ? VAT_CODES : PURCHASE_VAT)[l.vat_code] || l.vat_code}${l.side === 'purchase' && !l.recoverable ? ' (not recoverable)' : ''}`, l.box, amount(l.net), amount(l.vat)]);
+  const DOC_LABEL = { invoice: 'Sale', credit_note: 'Credit note', bill: 'Purchase', petty_cash: 'Petty cash' };
+  const DOC_HREF = { invoice: id => `#/invoices/${id}`, credit_note: id => `#/finance/credit-notes/${id}`, bill: id => `#/finance/bills/${id}`, petty_cash: () => '#/finance/petty-cash' };
+  const ledgerRows = v.ledger.map(l => [fmtDate(l.date), l.document, l.party, l.party_trn || '', `${DOC_LABEL[l.doc_type] || l.side}: ${(l.side === 'sale' ? VAT_CODES : PURCHASE_VAT)[l.vat_code] || l.vat_code}${l.side === 'purchase' && !l.recoverable ? ' (not recoverable)' : ''}`, l.box, amount(l.net), amount(l.vat)]);
   const subtitle = `${fmtDate(v.from)} – ${fmtDate(v.to)}`;
   return layout('finance-vat',
     pageHead('VAT return', `${subtitle} · FTA VAT 201`, [
@@ -4023,7 +4065,7 @@ async function viewVat(params) {
             h('thead', {}, h('tr', {}, ledgerHeader.map((x, i) => h('th', { class: i >= 6 ? 'num' : '' }, x)))),
             h('tbody', {}, v.ledger.map((l, i) => h('tr', {},
               h('td', {}, ledgerRows[i][0]),
-              h('td', {}, h('a', { href: l.side === 'sale' ? `#/invoices/${l.doc_id}` : `#/finance/bills/${l.doc_id}` }, l.document)),
+              h('td', {}, h('a', { href: (DOC_HREF[l.doc_type] || DOC_HREF.bill)(l.doc_id) }, l.document)),
               h('td', {}, l.party), h('td', {}, l.party_trn || h('span', { class: 'muted' }, '—')), h('td', {}, ledgerRows[i][4]),
               h('td', {}, l.box), h('td', { class: 'num' }, amount(l.net)), h('td', { class: 'num' }, amount(l.vat)))))))
         : h('p', { class: 'empty' }, 'No VAT transactions in this period.')));
@@ -4049,6 +4091,959 @@ async function payablesAgeing(to) {
         h('tr', { class: 'total-row' }, h('td', {}, 'Total'), tot.map(x => h('td', { class: 'num' }, amount(x)))))))
       : h('p', { class: 'empty' }, 'Nothing owed to suppliers.'),
   };
+}
+
+// ---------- receivables: receipt vouchers ----------
+
+function receiptBadge(r) {
+  if (r.status === 'void') return h('span', { class: 'badge inv-cancelled' }, 'Void');
+  if (r.cheque_status === 'bounced') return h('span', { class: 'badge inv-cancelled' }, 'Cheque bounced');
+  if (r.cheque_status === 'pending') return chequeBadge('pending');
+  if (Number(r.unallocated) > 0) return h('span', { class: 'badge inv-partial' }, `${money(r.unallocated)} advance`);
+  return h('span', { class: 'badge inv-paid' }, 'Allocated');
+}
+
+function listPager(data, setParam) {
+  const pages = Math.max(1, Math.ceil(data.total / data.pageSize));
+  return data.total > data.pageSize && h('div', { class: 'pager' }, h('span', { class: 'muted' }, `Page ${data.page} of ${pages}`),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page <= 1, onclick: () => setParam('page', data.page - 1) }, 'Previous'),
+      h('button', { class: 'btn btn-secondary btn-sm', disabled: data.page >= pages, onclick: () => setParam('page', data.page + 1) }, 'Next')));
+}
+
+function paramSetter(path, params) {
+  return (k, v) => {
+    const n = new URLSearchParams(params);
+    if (v) n.set(k, v); else n.delete(k);
+    if (k !== 'page') n.delete('page');
+    location.hash = path + (n.toString() ? '?' + n : '');
+  };
+}
+
+async function viewReceipts(params) {
+  const data = await rpc('list_receipts', { p_q: params.q || null, p_status: params.status || null, p_customer: Number(params.customer) || null,
+    p_page: Number(params.page) || 1 });
+  const setParam = paramSetter('#/finance/receipts', params);
+  let timer;
+  return layout('finance-receipts',
+    pageHead('Receipts', `Money received from customers · ${data.total} receipt${data.total === 1 ? '' : 's'}, ${money(data.amount)}`, [
+      h('a', { class: 'btn btn-secondary', href: '#/finance/reports?report=ar' }, 'Receivables ageing'),
+      h('a', { class: 'btn btn-primary', href: '#/finance/receipts/new' }, '+ Receipt'),
+    ]),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' },
+        input('q', params.q, { type: 'search', placeholder: 'Search number, customer or reference…', 'aria-label': 'Search',
+          oninput: e => { clearTimeout(timer); timer = setTimeout(() => setParam('q', e.target.value.trim()), 350); } }),
+        select('status', params.status, [['', 'All receipts'], ['unallocated', 'With money not yet allocated'], ['cheques', 'Cheques not cleared'], ['void', 'Void or bounced']],
+          { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value) })),
+      data.receipts.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Number'), h('th', {}, 'Customer'), h('th', { class: 'hide-sm' }, 'Date'), h('th', { class: 'hide-sm' }, 'Paid by'),
+              h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Status'))),
+            h('tbody', {}, data.receipts.map(r => h('tr', {},
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/receipts/${r.id}` }, r.number)),
+              h('td', {}, h('a', { href: `#/customers/${r.customer_id}` }, r.customer_name)),
+              h('td', { class: 'hide-sm' }, fmtDate(r.received_on)),
+              h('td', { class: 'hide-sm' }, PAY_METHOD[r.method], r.reference && h('div', { class: 'meta muted' }, r.reference)),
+              h('td', { class: 'num' }, money(r.amount)),
+              h('td', {}, receiptBadge(r)))))))
+        : h('p', { class: 'empty' }, params.q || params.status ? 'Nothing matches.' : 'No receipts yet. Record money received from a customer, for one or several invoices or as an advance.'),
+      listPager(data, setParam)));
+}
+
+async function viewReceiptNew(params) {
+  const [customers, banks] = await Promise.all([rpc('receivable_customers'), rpc('cash_accounts')]);
+  const usable = banks.filter(a => a.active && a.subtype !== 'pdc');
+  const defaultFor = m => String((usable.find(a => a.subtype === (m === 'cash' ? 'cash' : 'bank')) || usable[0] || {}).id || '');
+  const customerSel = select('customer_id', params.customer || '', [['', 'Pick a customer…'],
+    ...customers.map(c => [String(c.id), Number(c.balance) > 0 ? `${c.name} (owes ${money(c.balance)})` : c.name])], { required: true });
+  const amountIn = input('amount', '', { type: 'number', min: '0.01', step: '0.01', required: true });
+  let intoTouched = false;
+  const into = select('account_id', defaultFor('bank_transfer'), usable.map(a => [String(a.id), `${a.code} · ${a.name}`]),
+    { required: true, onchange: () => { intoTouched = true; } });
+  const REF_LABEL = { bank_transfer: 'Transfer reference', cash: 'Receipt book number (optional)', cheque: 'Cheque number', other: 'Reference (optional)' };
+  const refField = field(REF_LABEL.bank_transfer, input('reference', '', { maxlength: 100 }));
+  const chequeFields = h('div', { class: 'form-grid', hidden: true },
+    field('Cheque bank', input('cheque_bank', '', { maxlength: 100 })),
+    field('Cheque date', input('cheque_date', '', { type: 'date' }), { hint: 'For a post-dated cheque, the date written on it.' }));
+  const method = select('method', 'bank_transfer', Object.entries(PAY_METHOD), {
+    onchange: e => {
+      refField.querySelector('label').textContent = REF_LABEL[e.target.value];
+      refField.querySelector('input').required = e.target.value === 'cheque';
+      chequeFields.hidden = e.target.value !== 'cheque';
+      if (!intoTouched) into.value = defaultFor(e.target.value);
+    },
+  });
+  const allocBody = h('tbody', {});
+  const summary = h('p', { class: 'muted' });
+  const creditsNote = h('p', { class: 'muted' });
+  const recalc = () => {
+    const total = [...allocBody.querySelectorAll('.alloc')].reduce((t, el) => t + (Number(el.value) || 0), 0);
+    const left = round2((Number(amountIn.value) || 0) - total);
+    summary.textContent = `Allocated ${money(total)} · ${left >= 0 ? `${money(left)} kept as an advance from the customer` : `over by ${money(-left)}`}`;
+    summary.className = left < 0 ? 'form-error' : 'muted';
+  };
+  const fillOldest = () => {
+    let left = Number(amountIn.value) || 0;
+    for (const el of allocBody.querySelectorAll('.alloc')) { const v = Math.min(Number(el.max), left); el.value = v > 0 ? v.toFixed(2) : ''; left = round2(left - (v > 0 ? v : 0)); }
+    recalc();
+  };
+  const load = async () => {
+    allocBody.replaceChildren();
+    creditsNote.textContent = '';
+    if (!customerSel.value) { recalc(); return; }
+    const items = await rpc('customer_open_items', { p_customer: Number(customerSel.value) });
+    const today = localToday();
+    for (const i of items.invoices) {
+      const pick = params.invoice && String(i.id) === String(params.invoice);
+      allocBody.append(h('tr', {}, h('td', {}, i.number), h('td', {}, fmtDate(i.issue_date)),
+        h('td', {}, i.due_date ? [fmtDate(i.due_date), i.due_date < today && [' ', h('span', { class: 'badge badge-overdue' }, 'Overdue')]] : '—'),
+        h('td', { class: 'num' }, money(i.balance)),
+        h('td', {}, h('input', { class: 'alloc', 'data-invoice': String(i.id), type: 'number', min: '0', step: '0.01', max: Number(i.balance).toFixed(2),
+          value: pick ? Number(i.balance).toFixed(2) : '', 'aria-label': `Towards ${i.number}`, oninput: recalc }))));
+      if (pick && !amountIn.value) amountIn.value = Number(i.balance).toFixed(2);
+    }
+    if (!items.invoices.length) allocBody.append(h('tr', {}, h('td', { colspan: 5, class: 'muted' }, 'No unpaid tax invoices: the whole amount will be an advance.')));
+    if (items.credits.length) {
+      creditsNote.textContent = `This customer already has ${money(items.credits.reduce((t, c) => t + Number(c.available), 0))} in unused advances or credit notes; use them from the invoice's page.`;
+    }
+    recalc();
+  };
+  customerSel.addEventListener('change', load);
+  amountIn.addEventListener('input', recalc);
+  const form = handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Customer', customerSel), field('Amount received (AED)', amountIn),
+      field('Paid by', method), refField,
+      field('Received into', into, { hint: 'For a cheque: the bank it will be deposited in. Until cleared it sits in "Cheques in hand".' }),
+      field('Date received', input('received_on', localToday(), { type: 'date', max: localToday(), required: true })),
+      field('Note (optional)', input('notes', '', { maxlength: 1000 }), { full: true })),
+    chequeFields,
+    h('div', { class: 'field', 'data-field': 'allocations' },
+      h('label', {}, 'Towards invoices'),
+      h('div', { class: 'table-wrap' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Invoice'), h('th', {}, 'Date'), h('th', {}, 'Due'),
+        h('th', { class: 'num' }, 'Balance'), h('th', {}, 'Receive now'))), allocBody)),
+      h('div', { class: 'inv-edit-foot' }, h('button', { class: 'btn btn-secondary btn-sm', type: 'button', onclick: fillOldest }, 'Fill oldest first'), summary),
+      creditsNote),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save receipt'),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/receipts' }, 'Cancel'))),
+  async data => {
+    data.allocations = [...allocBody.querySelectorAll('.alloc')].map(el => ({ invoice_id: el.dataset.invoice, amount: el.value }));
+    const rid = await rpc('record_receipt', { p_data: data });
+    toast('Receipt saved');
+    location.hash = `#/finance/receipts/${rid}`;
+  });
+  setTimeout(load);
+  return layout('finance-receipts', pageHead('Record a receipt', 'Money from a customer, for one or several invoices. Anything not allocated is kept as an advance.',
+    null, h('a', { href: '#/finance/receipts' }, '← Receipts')), h('section', { class: 'card' }, form));
+}
+
+function buildReceiptPdf(d) {
+  const r = d.receipt;
+  const co = d.company || {};
+  const paidBy = r.method === 'cheque'
+    ? `Cheque no. ${r.reference}${r.cheque_bank ? ', ' + r.cheque_bank : ''}${r.cheque_date ? ', dated ' + fmtDate(r.cheque_date) : ''}`
+    : `${PAY_METHOD[r.method]}${r.reference ? ' (ref. ' + r.reference + ')' : ''}`;
+  const rows = [['Receipt no.', r.number], ['Date', fmtDate(r.received_on)], ['Received from', r.customer_name],
+    r.customer_trn && ['Customer TRN', r.customer_trn], ['Amount', money(r.amount)], ['Paid by', paidBy],
+    ...r.allocations.map(a => [`Towards invoice ${a.invoice_number}`, money(a.amount)]),
+    Number(r.unallocated) > 0 && ['Held as advance', money(r.unallocated)], r.notes && ['Notes', r.notes]].filter(Boolean);
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(74, 122, 92);
+  doc.text(pdfText(co.legal_name || 'Lowcaps'), 15, 20);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90, 107, 96);
+  const coLines = supplierLines(co).map(pdfText);
+  coLines.forEach((l, i) => doc.text(l, 15, 26 + i * 4.3));
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(16); doc.setTextColor(28, 42, 34); doc.text('RECEIPT VOUCHER', 195, 20, { align: 'right' });
+  window.autoTable(doc, { startY: 30 + coLines.length * 4.3, margin: { left: 15, right: 15 }, body: rows.map(([k, v]) => [pdfText(k), pdfText(v)]),
+    styles: { font: 'helvetica', fontSize: 10, cellPadding: 2.5, lineColor: [219, 229, 222], lineWidth: 0.1 }, columnStyles: { 0: { fontStyle: 'bold', cellWidth: 60 } } });
+  const y = doc.lastAutoTable.finalY + 25;
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+  ['Received by', 'Authorised signatory'].forEach((t, i) => { doc.line(15 + i * 95, y, 85 + i * 95, y); doc.text(t, 15 + i * 95, y + 5); });
+  if (r.method === 'cheque') doc.text('Payment by cheque is subject to the cheque being cleared.', 15, y + 15);
+  return doc;
+}
+
+/** "Apply" rows: set a credit (receipt or credit note) against an invoice, or an invoice against a credit. */
+function applyList(items, max, onApply, describe) {
+  return h('ul', { class: 'list' }, items.map(o => {
+    const cap = Math.min(Number(o.available ?? o.balance), max);
+    const amt = h('input', { type: 'number', min: '0.01', step: '0.01', max: cap.toFixed(2), value: cap.toFixed(2), class: 'apply-amt', 'aria-label': 'Amount to apply' });
+    return h('li', {},
+      h('div', { class: 'grow' }, h('strong', {}, o.number), h('div', { class: 'meta' }, describe(o))),
+      h('div', { class: 'btn-row' }, amt, h('button', {
+        class: 'btn btn-secondary btn-sm',
+        onclick: async () => { try { await onApply(o, Number(amt.value)); toast('Applied'); render(); } catch (err) { toast(err.message, true); } },
+      }, 'Apply')));
+  }));
+}
+
+async function viewReceipt(id) {
+  const d = await rpc('get_receipt', { p_id: id });
+  const r = d.receipt;
+  const act = (fn, args, msg) => async () => { try { await rpc(fn, args); toast(msg); render(); } catch (err) { toast(err.message, true); } };
+  const live = r.status === 'posted' && r.cheque_status !== 'bounced';
+  return layout('finance-receipts',
+    pageHead(`Receipt ${r.number}`, `${fmtDate(r.received_on)} · ${r.customer_name}`, [
+      h('button', { class: 'btn btn-secondary', onclick: () => { try { buildReceiptPdf(d).save(`${r.number}.pdf`); } catch (err) { toast(err.message, true); } } }, icon('download'), 'PDF'),
+      r.journal_id && h('a', { class: 'btn btn-secondary', href: `#/finance/journals/${r.journal_id}` }, 'Ledger entry'),
+      live && r.cheque_status === 'pending' && h('button', { class: 'btn btn-secondary', onclick: act('set_receipt_cheque', { p_id: r.id, p_status: 'cleared' }, 'Cheque cleared') }, 'Cheque cleared'),
+      live && r.cheque_status && h('button', { class: 'btn btn-danger', onclick: () => {
+        if (confirmAction(`Mark cheque ${r.reference} as bounced? Everything this receipt paid goes back on the invoices.`)) act('set_receipt_cheque', { p_id: r.id, p_status: 'bounced' }, 'Cheque marked as bounced')();
+      } }, 'Bounced'),
+      r.status === 'posted' && h('button', { class: 'btn btn-danger', onclick: () => {
+        if (confirmAction(`Void ${r.number}? Its ledger entries are reversed and the invoices it paid become unpaid again.`)) act('void_receipt', { p_id: r.id }, 'Voided')();
+      } }, 'Void'),
+    ], [h('a', { href: `#/customers/${r.customer_id}` }, `← ${r.customer_name}`), ' ', receiptBadge(r)]),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [['Amount', h('strong', {}, money(r.amount))], ['Paid by', PAY_METHOD[r.method]],
+        ['Reference', r.method === 'cheque' ? `Cheque no. ${r.reference}` : r.reference],
+        ['Cheque', r.method === 'cheque' && [r.cheque_bank, r.cheque_date && `dated ${fmtDate(r.cheque_date)}`, CHEQUE_STATUS[r.cheque_status]].filter(Boolean).join(' · ')],
+        ['Received into', r.account], ['Recorded by', r.created_by_name], ['Notes', r.notes]]
+        .filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('h3', { class: 'notes-heading' }, 'Allocated to'),
+      r.allocations.length ? h('ul', { class: 'list' }, r.allocations.map(a => h('li', {},
+        h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/invoices/${a.invoice_id}` }, a.invoice_number), h('div', { class: 'meta' }, fmtDate(a.created_at))),
+        h('strong', {}, money(a.amount)),
+        h('button', { class: 'btn btn-danger btn-sm', onclick: () => { if (confirmAction('Take this amount off the invoice? It goes back to the customer\'s advance.')) act('remove_receivable_allocation', { p_id: a.id }, 'Removed')(); } }, 'Remove'))))
+        : h('p', { class: 'empty' }, 'Not allocated to any invoice.'),
+      Number(r.unallocated) > 0 && [
+        h('p', { class: 'notice' }, `${money(r.unallocated)} is held as an advance from the customer.`),
+        r.open_invoices.length > 0 && [h('h3', { class: 'notes-heading' }, 'Apply to an invoice'),
+          applyList(r.open_invoices, Number(r.unallocated),
+            (o, amt) => rpc('apply_customer_credit', { p_invoice_id: o.id, p_source_type: 'receipt', p_source_id: r.id, p_amount: amt }),
+            o => `Tax invoice · ${fmtDate(o.issue_date)} · balance ${money(o.balance)}`)]]));
+}
+
+// ---------- receivables: credit notes ----------
+
+function creditNoteBadge(c) {
+  if (c.status === 'draft') return h('span', { class: 'badge badge-plain' }, 'Draft');
+  if (c.status === 'cancelled') return h('span', { class: 'badge inv-cancelled' }, 'Cancelled');
+  const left = round2(c.total - c.amount_applied);
+  return left > 0 ? h('span', { class: 'badge inv-partial' }, `${money(left)} unused`) : h('span', { class: 'badge inv-paid' }, 'Issued');
+}
+
+const creditNoteDoc = cn => ({ ...cn, kind: 'credit_note', amount_paid: 0, notes: [`Reason: ${cn.reason}`, cn.notes].filter(Boolean).join('\n') });
+
+async function viewCreditNotes(params) {
+  const data = await rpc('list_credit_notes', { p_q: params.q || null, p_status: params.status || null, p_page: Number(params.page) || 1 });
+  const setParam = paramSetter('#/finance/credit-notes', params);
+  let timer;
+  return layout('finance-credit-notes',
+    pageHead('Credit notes', 'Tax credit notes to customers. Create one from the tax invoice it corrects.'),
+    h('section', { class: 'card' },
+      h('div', { class: 'filters' },
+        input('q', params.q, { type: 'search', placeholder: 'Search number, customer, invoice or reason…', 'aria-label': 'Search',
+          oninput: e => { clearTimeout(timer); timer = setTimeout(() => setParam('q', e.target.value.trim()), 350); } }),
+        select('status', params.status, [['', 'Any status'], ['draft', 'Draft'], ['issued', 'Issued'], ['unused', 'With credit not yet used'], ['cancelled', 'Cancelled']],
+          { 'aria-label': 'Status', onchange: e => setParam('status', e.target.value) })),
+      data.credit_notes.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'Number'), h('th', {}, 'Customer'), h('th', { class: 'hide-sm' }, 'Invoice'), h('th', { class: 'hide-sm' }, 'Date'),
+              h('th', { class: 'num' }, 'Total'), h('th', {}, 'Status'))),
+            h('tbody', {}, data.credit_notes.map(c => h('tr', {},
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/credit-notes/${c.id}` }, c.number), h('div', { class: 'meta muted' }, c.reason)),
+              h('td', {}, c.customer_id ? h('a', { href: `#/customers/${c.customer_id}` }, c.customer_name) : c.customer_name),
+              h('td', { class: 'hide-sm' }, h('a', { href: `#/invoices/${c.invoice_id}` }, c.invoice_number)),
+              h('td', { class: 'hide-sm' }, fmtDate(c.issue_date)),
+              h('td', { class: 'num' }, money(c.total)),
+              h('td', {}, creditNoteBadge(c)))))))
+        : h('p', { class: 'empty' }, params.q || params.status ? 'Nothing matches.' : 'No credit notes yet. Open a sent tax invoice and click "Credit note" to correct or discount it.'),
+      listPager(data, setParam)));
+}
+
+function creditNoteForm(cn, inv, onSubmit, cancelHref) {
+  const lines = salesLinesEditor(cn.lines, {
+    label: 'Lines to credit (AED)', totalLabel: 'Total credit',
+    hint: `Credit only what is being corrected: change quantities or prices, or remove lines. At most ${money(inv.total)} in total for ${inv.number}, less any earlier credit notes.`,
+  });
+  return handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Credit note date', input('issue_date', cn.issue_date || localToday(), { type: 'date', required: true })),
+      field('Reason', input('reason', cn.reason, { required: true, maxlength: 500, placeholder: 'e.g. Clearance fee overcharged, agreed discount' }))),
+    lines.el,
+    field('Notes (optional)', textarea('notes', cn.notes, { rows: 2, maxlength: 1000 })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, cn.id ? 'Save changes' : 'Save as draft'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  data => { data.lines = lines.read(); return onSubmit(data); });
+}
+
+async function viewCreditNoteNew(params) {
+  const { invoice: inv } = await rpc('get_invoice', { p_id: Number(params.invoice) });
+  const back = `#/invoices/${inv.id}`;
+  return layout('finance-credit-notes',
+    pageHead(`Credit note for ${inv.number}`, `${inv.customer_name} · invoice total ${money(inv.total)}`, null, h('a', { href: back }, `← ${inv.number}`)),
+    h('section', { class: 'card' }, creditNoteForm({ lines: inv.lines.map(l => ({ description: l.description, quantity: l.quantity, unit_price: l.unit_price, vat_code: l.vat_code })) },
+      inv, async data => {
+        data.invoice_id = inv.id;
+        const cid = await rpc('save_credit_note', { p_id: null, p_data: data });
+        toast('Draft saved. Check it, then Issue.');
+        location.hash = `#/finance/credit-notes/${cid}`;
+      }, back)));
+}
+
+async function viewCreditNoteEdit(id) {
+  const { credit_note: cn } = await rpc('get_credit_note', { p_id: id });
+  return layout('finance-credit-notes', pageHead(`Edit ${cn.number}`, `${cn.customer_name} · on ${cn.invoice_number}`, null, h('a', { href: `#/finance/credit-notes/${id}` }, '← Back')),
+    h('section', { class: 'card' }, creditNoteForm(cn, { number: cn.invoice_number, total: cn.invoice_total }, async data => {
+      await rpc('save_credit_note', { p_id: id, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/credit-notes/${id}`;
+    }, `#/finance/credit-notes/${id}`)));
+}
+
+function creditNoteEmail(cn) {
+  const sup = cn.supplier || {};
+  composeEmail({
+    title: `Email ${cn.number} to the customer`,
+    recipients: cn.recipients,
+    to: cn.sent_to || cn.recipients[0] || '',
+    subject: `Tax credit note ${cn.number} from ${sup.legal_name || 'Lowcaps'}`,
+    body: [`Dear ${cn.customer_name},`, '', `Please find attached our tax credit note ${cn.number} for ${money(cn.total)} (including VAT of ${money(cn.vat_total)}), against invoice ${cn.invoice_number}.`,
+      `Reason: ${cn.reason}`, '', 'Kind regards,', state.user.name, sup.legal_name, sup.phone].filter(l => typeof l === 'string').join('\n'),
+    attachment: { label: `Download ${cn.number}.pdf`, download: () => { try { buildInvoicePdf(creditNoteDoc(cn)).save(`${cn.number}.pdf`); } catch (err) { toast(err.message, true); } } },
+    onSent: async to => { await rpc('mark_credit_note_sent', { p_id: cn.id, p_to: to }); toast(`${cn.number} marked as sent`); render(); },
+  });
+}
+
+async function viewCreditNote(id) {
+  const { credit_note: cn } = await rpc('get_credit_note', { p_id: id });
+  const act = (fn, args, msg) => async () => { try { await rpc(fn, args); toast(msg); render(); } catch (err) { toast(err.message, true); } };
+  const unused = round2(cn.total - cn.amount_applied);
+  const history = [`Created ${fmtDate(cn.created_at, true)}${cn.created_by_name ? ' by ' + cn.created_by_name : ''}`,
+    cn.issued_at && `Issued ${fmtDate(cn.issued_at, true)}`, cn.sent_at && `Sent to ${cn.sent_to || 'the customer'} ${fmtDate(cn.sent_at, true)}`,
+    cn.cancelled_at && `Cancelled ${fmtDate(cn.cancelled_at, true)}`].filter(Boolean).join(' · ');
+  return layout('finance-credit-notes',
+    pageHead(cn.number, history, [
+      cn.status === 'draft' && h('button', { class: 'btn btn-primary', onclick: act('issue_credit_note', { p_id: cn.id }, 'Credit note issued') }, 'Issue'),
+      cn.status === 'draft' && h('a', { class: 'btn btn-secondary', href: `#/finance/credit-notes/${cn.id}/edit` }, 'Edit'),
+      h('button', { class: 'btn btn-secondary', onclick: () => { try { buildInvoicePdf(creditNoteDoc(cn)).save(`${cn.number}.pdf`); } catch (err) { toast(err.message, true); } } }, icon('download'), 'PDF'),
+      cn.status === 'issued' && h('button', { class: 'btn btn-primary', onclick: () => creditNoteEmail(cn) }, cn.sent_at ? 'Email again' : 'Email to customer'),
+      cn.journal_id && h('a', { class: 'btn btn-secondary', href: `#/finance/journals/${cn.journal_id}` }, 'Ledger entry'),
+      cn.status !== 'cancelled' && h('button', { class: 'btn btn-danger', onclick: () => {
+        if (confirmAction(`Cancel ${cn.number}?${cn.status === 'issued' ? ' Its ledger entry is reversed and the invoice balance goes back up.' : ''}`)) act('cancel_credit_note', { p_id: cn.id }, 'Cancelled')();
+      } }, 'Cancel'),
+    ], [h('a', { href: `#/invoices/${cn.invoice_id}` }, `← ${cn.invoice_number}`), ' ', creditNoteBadge(cn)]),
+    cn.status === 'draft' && h('p', { class: 'notice' }, 'Draft: not in the books yet. Check it, then click Issue. Issuing reduces the invoice balance and the VAT due.'),
+    cn.status === 'issued' && h('section', { class: 'card' },
+      h('h2', {}, 'Used against'),
+      cn.allocations.length ? h('ul', { class: 'list' }, cn.allocations.map(a => h('li', {},
+        h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/invoices/${a.invoice_id}` }, a.invoice_number), h('div', { class: 'meta' }, fmtDate(a.created_at))),
+        h('strong', {}, money(a.amount)),
+        h('button', { class: 'btn btn-danger btn-sm', onclick: () => { if (confirmAction('Take this credit off the invoice?')) act('remove_receivable_allocation', { p_id: a.id }, 'Removed')(); } }, 'Remove'))))
+        : h('p', { class: 'empty' }, 'Not used yet.'),
+      unused > 0 && [h('p', { class: 'notice' }, `${money(unused)} of credit is not used yet. Apply it to another invoice, or refund it with a "Money out" entry against Accounts receivable.`),
+        cn.open_invoices.length > 0 && applyList(cn.open_invoices, unused,
+          (o, amt) => rpc('apply_customer_credit', { p_invoice_id: o.id, p_source_type: 'credit_note', p_source_id: cn.id, p_amount: amt }),
+          o => `Tax invoice · ${fmtDate(o.issue_date)} · balance ${money(o.balance)}`)]),
+    h('section', { class: 'card' }, invoiceDocument(creditNoteDoc(cn))));
+}
+
+/** On the invoice page: receipts and credit notes set against it, and unused credits to apply. */
+function invoiceCreditsCard(inv) {
+  const balance = round2(inv.total - inv.amount_paid);
+  const act = (fn, args, msg) => async () => { try { await rpc(fn, args); toast(msg); render(); } catch (err) { toast(err.message, true); } };
+  if (!inv.allocations.length && !inv.credit_notes.length && !(inv.open_credits.length && balance > 0)) return null;
+  return h('section', { class: 'card' },
+    h('h2', {}, 'Receipts and credit notes'),
+    inv.allocations.length > 0 && h('ul', { class: 'list' }, inv.allocations.map(a => h('li', {},
+      h('div', { class: 'grow' }, h('a', { class: 'row-link', href: a.receipt_id ? `#/finance/receipts/${a.receipt_id}` : `#/finance/credit-notes/${a.credit_note_id}` }, a.source),
+        h('div', { class: 'meta' }, `${a.receipt_id ? 'Receipt' : 'Credit note'} · ${fmtDate(a.created_at)}`)),
+      h('strong', {}, money(a.amount)),
+      isManager() && h('button', { class: 'btn btn-danger btn-sm', onclick: () => { if (confirmAction('Take this off the invoice?')) act('remove_receivable_allocation', { p_id: a.id }, 'Removed')(); } }, 'Remove')))),
+    inv.credit_notes.filter(c => c.status === 'draft').map(c => h('p', { class: 'notice' }, 'Draft credit note ', h('a', { href: `#/finance/credit-notes/${c.id}` }, c.number), ` (${money(c.total)}) is waiting to be issued.`)),
+    isManager() && balance > 0 && inv.open_credits.length > 0 && [h('h3', { class: 'notes-heading' }, 'Use an advance or credit note'),
+      applyList(inv.open_credits, balance,
+        (o, amt) => rpc('apply_customer_credit', { p_invoice_id: inv.id, p_source_type: o.type, p_source_id: o.id, p_amount: amt }),
+        o => `${o.type === 'receipt' ? 'Advance on receipt' : 'Credit note'} · ${fmtDate(o.date)} · ${money(o.available)} available`)]);
+}
+
+// ---------- receivables: customer statement ----------
+
+function buildStatementPdf(st) {
+  const co = st.company || {};
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'mm', format: 'a4' });
+  const W = 210; const M = 15;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(74, 122, 92);
+  doc.text(pdfText(co.legal_name || 'Lowcaps'), M, 20);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(90, 107, 96);
+  const coLines = supplierLines(co).map(pdfText);
+  coLines.forEach((l, i) => doc.text(l, M, 26 + i * 4.3));
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(15); doc.setTextColor(28, 42, 34);
+  doc.text('STATEMENT OF ACCOUNT', W - M, 20, { align: 'right' });
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+  doc.text(pdfText(`${fmtDate(st.from)} - ${fmtDate(st.to)}`), W - M, 26, { align: 'right' });
+  let y = 30 + coLines.length * 4.3 + 4;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(90, 107, 96); doc.text('CUSTOMER', M, y);
+  doc.setFontSize(11); doc.setTextColor(28, 42, 34); doc.text(pdfText(st.customer.name), M, y + 5.5);
+  doc.setFont('helvetica', 'normal'); doc.setFontSize(9);
+  const cl = [...String(st.customer.address || '').split('\n'), st.customer.trn && `TRN: ${st.customer.trn}`].filter(Boolean).map(pdfText);
+  cl.forEach((l, i) => doc.text(l, M, y + 10.5 + i * 4.3));
+  y += 12 + cl.length * 4.3;
+  const body = [[fmtDate(st.from), '', 'Opening balance', '', '', amount(st.opening)],
+    ...st.lines.map(l => [fmtDate(l.entry_date), l.document, l.memo || '', amt0(l.debit), amt0(l.credit), amount(l.balance)]),
+    [fmtDate(st.to), '', 'Closing balance', '', '', amount(st.closing)]];
+  window.autoTable(doc, {
+    startY: y, margin: { left: M, right: M }, head: [['Date', 'Document', 'Details', 'Charges', 'Payments & credits', 'Balance']],
+    body: body.map(r => r.map(pdfText)),
+    styles: { font: 'helvetica', fontSize: 8, cellPadding: 1.8, textColor: [28, 42, 34], lineColor: [219, 229, 222], lineWidth: 0.1 },
+    headStyles: { fillColor: [74, 122, 92], textColor: 255 }, columnStyles: { 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } },
+    didParseCell: c => { if (c.section === 'head' && c.column.index >= 3) c.cell.styles.halign = 'right'; if (c.section === 'body' && (c.row.index === 0 || c.row.index === body.length - 1)) c.cell.styles.fontStyle = 'bold'; },
+  });
+  y = doc.lastAutoTable.finalY + 8;
+  doc.setFont('helvetica', 'bold'); doc.setFontSize(11);
+  doc.text(pdfText(Number(st.closing) >= 0 ? `Balance due: ${money(st.closing)}` : `In credit: ${money(-st.closing)}`), W - M, y, { align: 'right' });
+  if (st.open_invoices.length) {
+    window.autoTable(doc, {
+      startY: y + 5, margin: { left: M, right: M }, head: [['Unpaid invoice', 'Date', 'Due', 'Days overdue', 'Balance']],
+      body: st.open_invoices.map(o => [o.number, fmtDate(o.issue_date), o.due_date ? fmtDate(o.due_date) : '-', o.days > 0 ? String(o.days) : '-', amount(o.balance)]),
+      styles: { font: 'helvetica', fontSize: 8, cellPadding: 1.8, textColor: [28, 42, 34], lineColor: [219, 229, 222], lineWidth: 0.1 },
+      headStyles: { fillColor: [90, 107, 96], textColor: 255 }, columnStyles: { 3: { halign: 'right' }, 4: { halign: 'right' } },
+    });
+    y = doc.lastAutoTable.finalY + 8;
+  } else y += 8;
+  const pay = paymentLines(co);
+  if (pay.length) {
+    doc.setFont('helvetica', 'bold'); doc.setFontSize(8); doc.setTextColor(90, 107, 96); doc.text('PAYMENT DETAILS', M, y);
+    doc.setFont('helvetica', 'normal'); doc.setFontSize(9); doc.setTextColor(28, 42, 34);
+    pay.forEach((l, i) => doc.text(pdfText(l), M, y + 5 + i * 4.3));
+  }
+  return doc;
+}
+
+async function viewCustomerStatement(id, params) {
+  const fy = `${localToday().slice(0, 4)}-01-01`;
+  const st = await rpc('customer_statement', { p_customer: id, p_from: params.from || fy, p_to: params.to || localToday() });
+  const go = (k, v) => { const n = new URLSearchParams(params); n.set(k, v); location.hash = `#/finance/customers/${id}/statement?` + n; };
+  const header = ['Date', 'Document', 'Details', 'Charges', 'Payments & credits', 'Balance'];
+  const rows = [[fmtDate(st.from), '', { text: 'Opening balance' }, '', '', { text: amount(st.opening) }],
+    ...st.lines.map(l => [fmtDate(l.entry_date), l.document, l.memo || JOURNAL_KIND[l.kind], amt0(l.debit), amt0(l.credit), amount(l.balance)]),
+    [fmtDate(st.to), '', { text: 'Closing balance' }, '', '', { text: amount(st.closing) }]];
+  const subtitle = `${st.customer.name}${st.customer.trn ? ' · TRN ' + st.customer.trn : ''} · ${fmtDate(st.from)} – ${fmtDate(st.to)}`;
+  const fileName = `Statement-${st.customer.name.replace(/[^A-Za-z0-9]+/g, '-')}-${st.to}`;
+  const pdf = () => { try { buildStatementPdf(st).save(`${fileName}.pdf`); } catch (err) { toast(err.message, true); } };
+  const email = () => composeEmail({
+    title: `Email the statement to ${st.customer.name}`, recipients: st.recipients, to: st.recipients[0] || '',
+    subject: `Statement of account from ${(st.company || {}).legal_name || 'Lowcaps'} to ${fmtDate(st.to)}`,
+    body: [`Dear ${st.customer.name},`, '', `Please find attached your statement of account for ${fmtDate(st.from)} to ${fmtDate(st.to)}.`,
+      Number(st.closing) > 0 ? `The balance due is ${money(st.closing)}.` : Number(st.closing) < 0 ? `Your account is in credit by ${money(-st.closing)}.` : 'Your account is fully settled. Thank you.',
+      '', 'If anything does not match your records, please let us know.', '', 'Kind regards,', state.user.name, (st.company || {}).legal_name].filter(l => typeof l === 'string').join('\n'),
+    attachment: { label: `Download ${fileName}.pdf`, download: pdf },
+    onSent: async () => { toast('Statement sent'); },
+  });
+  return layout('customers',
+    pageHead('Statement of account', subtitle, [
+      input('from', st.from, { type: 'date', 'aria-label': 'From', onchange: e => go('from', e.target.value) }),
+      input('to', st.to, { type: 'date', 'aria-label': 'To', onchange: e => go('to', e.target.value) }),
+      h('button', { class: 'btn btn-primary', onclick: email }, 'Email statement'),
+      h('button', { class: 'btn btn-secondary', onclick: pdf }, icon('download'), 'Statement PDF'),
+      downloadCsvButton(fileName, header, rows),
+    ], [h('a', { href: `#/customers/${id}` }, `← ${st.customer.name}`)]),
+    h('dl', { class: 'pay-summary' },
+      h('div', {}, h('dt', {}, 'Opening'), h('dd', {}, money(st.opening))),
+      h('div', { class: Number(st.closing) > 0 && st.open_invoices.some(o => o.days > 0) ? 'is-overdue' : Number(st.closing) <= 0 ? 'is-paid' : '' },
+        h('dt', {}, Number(st.closing) >= 0 ? 'Balance due' : 'In credit'), h('dd', {}, money(Math.abs(st.closing))))),
+    h('section', { class: 'card' }, h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+      h('thead', {}, h('tr', {}, header.map((t, i) => h('th', { class: i >= 3 ? 'num' : '' }, t)))),
+      h('tbody', {}, rows.map((r, i) => h('tr', { class: i === 0 || i === rows.length - 1 ? 'total-row' : '' },
+        r.map((c, j) => h('td', { class: j >= 3 ? 'num' : '' }, j === 1 && c && i > 0 && i < rows.length - 1
+          ? h('a', { href: `#/finance/journals/${st.lines[i - 1].journal_id}` }, c) : (c && typeof c === 'object' ? c.text : c))))))))),
+    h('div', { class: 'grid two-col' },
+      h('section', { class: 'card' }, h('h2', {}, 'Unpaid invoices'),
+        st.open_invoices.length ? h('ul', { class: 'list' }, st.open_invoices.map(o => h('li', {},
+          h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/invoices/${o.id}` }, o.number),
+            h('div', { class: 'meta' }, `${fmtDate(o.issue_date)}${o.due_date ? ' · due ' + fmtDate(o.due_date) : ''}`)),
+          h('div', { class: 'badge-stack' }, h('strong', {}, money(o.balance)), o.days > 0 && h('span', { class: 'badge badge-overdue' }, `${o.days} days late`)))))
+          : h('p', { class: 'empty' }, 'Nothing unpaid.')),
+      h('section', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', {}, 'Advances and credits'),
+        h('a', { class: 'btn btn-secondary btn-sm', href: `#/finance/receipts/new?customer=${id}` }, '+ Receipt')),
+        st.credits.length ? h('ul', { class: 'list' }, st.credits.map(c => h('li', {},
+          h('div', { class: 'grow' }, h('a', { class: 'row-link', href: c.type === 'receipt' ? `#/finance/receipts/${c.id}` : `#/finance/credit-notes/${c.id}` }, c.number),
+            h('div', { class: 'meta' }, `${c.type === 'receipt' ? 'Receipt (advance)' : 'Credit note'} · ${fmtDate(c.date)}`)),
+          h('strong', {}, money(c.available)))))
+          : h('p', { class: 'empty' }, 'None.'))));
+}
+
+function downloadCsvButton(name, header, rows) {
+  const plain = rows.map(r => r.map(c => (c && typeof c === 'object' ? c.text : c)));
+  return h('button', { class: 'btn btn-secondary', onclick: () => downloadCsv(`${name}.csv`, header, plain) }, icon('download'), 'Excel (CSV)');
+}
+
+async function receivablesAgeing(to) {
+  const a = await rpc('receivables_ageing', { p_as_of: to });
+  const header = ['Customer', 'Not yet due', '1–30 days', '31–60 days', '61–90 days', 'Over 90 days', 'Total due', 'Advances & credits'];
+  const tot = Array(7).fill(0);
+  const rows = a.rows.map(r => {
+    const vals = [r.current, r.d30, r.d60, r.d90, r.d90plus].map(Number);
+    const total = vals.reduce((x, y) => x + y, 0);
+    [...vals, total, Number(r.unallocated)].forEach((v, i) => { tot[i] += v; });
+    return { r, cells: [...vals, total, Number(r.unallocated)] };
+  });
+  const exportRows = [...rows.map(({ r, cells }) => [r.name, ...cells.map(amt0)]), [{ text: 'Total' }, ...tot.map(x => ({ text: amount(x) }))]];
+  return {
+    title: 'Receivables ageing', subtitle: `As at ${fmtDate(a.as_of)}, by days past the due date`, header, exportRows, numCols: [1, 2, 3, 4, 5, 6, 7],
+    body: rows.length ? h('div', { class: 'table-wrap' }, h('table', { class: 'report' },
+      h('thead', {}, h('tr', {}, header.map((x, i) => h('th', { class: i ? 'num' : '' }, x)))),
+      h('tbody', {}, rows.map(({ r, cells }) => h('tr', {}, h('td', {}, h('a', { class: 'row-link', href: `#/finance/customers/${r.id}/statement` }, r.name)),
+        cells.map((c, i) => h('td', { class: 'num' }, i >= 1 && i <= 4 && c ? h('span', { class: 'text-bad' }, amount(c)) : amt0(c))))),
+        h('tr', { class: 'total-row' }, h('td', {}, 'Total'), tot.map(x => h('td', { class: 'num' }, amount(x)))))))
+      : h('p', { class: 'empty' }, 'Nothing owed by customers.'),
+  };
+}
+
+// ---------- receivables: recurring invoices ----------
+
+const EVERY = { 1: 'Every month', 2: 'Every 2 months', 3: 'Every 3 months', 6: 'Every 6 months', 12: 'Every year' };
+
+function recurringBadge(r) {
+  if (!r.active) return h('span', { class: 'badge inv-cancelled' }, 'Stopped');
+  if (r.due) return h('span', { class: 'badge badge-overdue' }, 'Due now');
+  return h('span', { class: 'badge inv-sent' }, 'Active');
+}
+
+async function runRecurring(rid) {
+  try {
+    const res = await rpc('run_recurring_invoices', { p_id: rid || null });
+    toast(res.created.length ? `Created ${res.created.length} draft invoice${res.created.length === 1 ? '' : 's'}: ${res.created.map(c => c.number).join(', ')}. Check and send them from Invoices.` : 'Nothing due');
+    render();
+  } catch (err) { toast(err.message, true); }
+}
+
+async function viewRecurring() {
+  const data = await rpc('list_recurring_invoices');
+  const due = data.rows.filter(r => r.due).length;
+  return layout('finance-recurring',
+    pageHead('Recurring invoices', 'Regular charges (warehousing, retainers, monthly services) that become a draft tax invoice each period.', [
+      due > 0 && h('button', { class: 'btn btn-primary', onclick: () => runRecurring(null) }, `Create due invoices (${due})`),
+      h('a', { class: 'btn btn-secondary', href: '#/finance/recurring/new' }, '+ Recurring invoice'),
+    ]),
+    h('section', { class: 'card' },
+      data.rows.length
+        ? h('div', { class: 'table-wrap' }, h('table', {},
+            h('thead', {}, h('tr', {}, h('th', {}, 'What'), h('th', {}, 'Customer'), h('th', { class: 'hide-sm' }, 'Repeats'), h('th', {}, 'Next invoice'),
+              h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Status'))),
+            h('tbody', {}, data.rows.map(r => h('tr', { class: r.active ? '' : 'row-off' },
+              h('td', {}, h('a', { class: 'row-link', href: `#/finance/recurring/${r.id}` }, r.title),
+                r.last_invoice_number && h('div', { class: 'meta muted' }, `Last: ${r.last_invoice_number}`)),
+              h('td', {}, h('a', { href: `#/customers/${r.customer_id}` }, r.customer_name)),
+              h('td', { class: 'hide-sm' }, EVERY[r.every_months]),
+              h('td', {}, r.active ? fmtDate(r.next_date) : '—'),
+              h('td', { class: 'num' }, money(r.total)),
+              h('td', {}, recurringBadge(r)))))))
+        : h('p', { class: 'empty' }, 'No recurring invoices yet.')),
+    h('p', { class: 'muted' }, 'Invoices are created as drafts when you click "Create due invoices" (it also shows on the Finance overview when any are due). Check each draft, then email it as usual.'));
+}
+
+function recurringForm(r, customers, onSubmit, cancelHref) {
+  const lines = salesLinesEditor(r.lines, {
+    placeholder: 'e.g. Warehousing for {period}',
+    hint: 'Write {period} in a description to show the month (or months) the invoice is for, e.g. "Warehousing for {period}" becomes "Warehousing for November 2026".',
+  });
+  return handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Customer', select('customer_id', r.customer_id ? String(r.customer_id) : '', [['', 'Pick a customer…'], ...customers.map(c => [String(c.id), c.name])], { required: true })),
+      field('What it is for', input('title', r.title, { required: true, maxlength: 200, placeholder: 'e.g. Monthly warehousing' })),
+      field('Repeats', select('every_months', String(r.every_months || 1), Object.entries(EVERY))),
+      field('Next invoice date', input('next_date', r.next_date || localToday(), { type: 'date', required: true })),
+      field('Payment due after (days)', input('due_days', r.due_days ?? 30, { type: 'number', min: 0, max: 365 })),
+      field('Stop after (optional)', input('end_date', r.end_date, { type: 'date' }), { hint: 'No invoices after this date.' })),
+    lines.el,
+    field('Notes on each invoice (optional)', textarea('notes', r.notes, { rows: 2, maxlength: 2000 })),
+    r.id && h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'active', checked: r.active !== false }), 'Active'),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, r.id ? 'Save changes' : 'Save'),
+      h('a', { class: 'btn btn-secondary', href: cancelHref }, 'Cancel'))),
+  data => { data.lines = lines.read(); if (!r.id) data.active = true; return onSubmit(data); });
+}
+
+async function viewRecurringNew(params) {
+  const customers = await rpc('customer_options');
+  return layout('finance-recurring', pageHead('New recurring invoice', null, null, h('a', { href: '#/finance/recurring' }, '← Recurring invoices')),
+    h('section', { class: 'card' }, recurringForm({ customer_id: Number(params.customer) || null }, customers, async data => {
+      const rid = await rpc('save_recurring_invoice', { p_id: null, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/recurring/${rid}`;
+    }, '#/finance/recurring')));
+}
+
+async function viewRecurringEdit(id) {
+  const [{ recurring: r }, customers] = await Promise.all([rpc('get_recurring_invoice', { p_id: id }), rpc('customer_options')]);
+  return layout('finance-recurring', pageHead(`Edit ${r.title}`, r.customer_name, null, h('a', { href: `#/finance/recurring/${id}` }, '← Back')),
+    h('section', { class: 'card' }, recurringForm(r, customers, async data => {
+      await rpc('save_recurring_invoice', { p_id: id, p_data: data });
+      toast('Saved');
+      location.hash = `#/finance/recurring/${id}`;
+    }, `#/finance/recurring/${id}`)));
+}
+
+async function viewRecurringOne(id) {
+  const { recurring: r, today } = await rpc('get_recurring_invoice', { p_id: id });
+  const due = r.active && r.next_date <= today;
+  const net = r.lines.reduce((t, l) => t + Number(l.net), 0);
+  const vat = r.lines.reduce((t, l) => t + Number(l.vat), 0);
+  return layout('finance-recurring',
+    pageHead(r.title, `${r.customer_name} · ${EVERY[r.every_months].toLowerCase()}`, [
+      due && h('button', { class: 'btn btn-primary', onclick: () => runRecurring(r.id) }, 'Create due invoice now'),
+      h('a', { class: 'btn btn-secondary', href: `#/finance/recurring/${r.id}/edit` }, 'Edit'),
+      h('button', { class: 'btn btn-danger', onclick: async () => {
+        if (!confirmAction(`Delete "${r.title}"? Invoices already created stay as they are.`)) return;
+        try { await rpc('delete_recurring_invoice', { p_id: r.id }); toast('Deleted'); location.hash = '#/finance/recurring'; } catch (err) { toast(err.message, true); }
+      } }, 'Delete'),
+    ], [h('a', { href: '#/finance/recurring' }, '← Recurring invoices'), ' ', recurringBadge({ ...r, due })]),
+    h('section', { class: 'card' },
+      h('dl', { class: 'facts' }, [['Customer', h('a', { href: `#/customers/${r.customer_id}` }, r.customer_name)], ['Next invoice', r.active ? fmtDate(r.next_date) : 'Stopped'],
+        ['Stops after', r.end_date && fmtDate(r.end_date)], ['Payment due', `${r.due_days} days after the invoice date`], ['Notes', r.notes]]
+        .filter(([, v]) => v).map(([k, v]) => [h('dt', {}, k), h('dd', {}, v)])),
+      h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Description'), h('th', {}, 'VAT'), h('th', { class: 'num' }, 'Amount'))),
+        h('tbody', {}, r.lines.map(l => h('tr', {}, h('td', {}, l.description), h('td', {}, VAT_CODES[l.vat_code]), h('td', { class: 'num' }, amount(l.net))))))),
+      h('dl', { class: 'inv-totals' }, h('dt', {}, 'Total excl. VAT'), h('dd', {}, money(net)), h('dt', {}, 'VAT 5%'), h('dd', {}, money(vat)),
+        h('dt', { class: 'grand' }, 'Each invoice'), h('dd', { class: 'grand' }, money(net + vat)))),
+    h('section', { class: 'card' }, h('h2', {}, 'Invoices created'),
+      r.invoices.length ? h('ul', { class: 'list' }, r.invoices.map(i => h('li', {},
+        h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/invoices/${i.id}` }, i.number), h('div', { class: 'meta' }, fmtDate(i.issue_date))),
+        h('div', { class: 'badge-stack' }, h('strong', {}, money(i.total)), invoiceStateBadge({ ...i, kind: 'tax' }, today)))))
+        : h('p', { class: 'empty' }, 'None yet.')));
+}
+
+// ---------- bank reconciliation ----------
+
+/** Parse CSV text (commas or semicolons, quoted fields) into rows of strings. */
+function parseCsv(text) {
+  const sep = (text.split('\n')[0].match(/;/g) || []).length > (text.split('\n')[0].match(/,/g) || []).length ? ';' : ',';
+  const rows = [];
+  let row = []; let cell = ''; let q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; } else if (c === '"') q = false; else cell += c;
+    } else if (c === '"') q = true;
+    else if (c === sep) { row.push(cell); cell = ''; } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); cell = '';
+      if (row.some(x => x.trim())) rows.push(row);
+      row = [];
+    } else cell += c;
+  }
+  row.push(cell);
+  if (row.some(x => x.trim())) rows.push(row);
+  return rows.map(r => r.map(x => x.trim()));
+}
+
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+/** A bank date to YYYY-MM-DD. fmt: 'dmy' | 'mdy' | 'ymd'. Month names (01-Nov-2026) are understood. */
+function parseBankDate(str, fmt) {
+  const s = String(str || '').trim().split(/[ T]/)[0];
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  const parts = s.split(/[/\-.]/).filter(Boolean);
+  if (parts.length !== 3) return null;
+  let d; let m; let y;
+  const named = parts.findIndex(p => /^[a-z]{3,}$/i.test(p));
+  if (named >= 0) {
+    m = MONTHS.indexOf(parts[named].slice(0, 3).toLowerCase()) + 1;
+    const nums = parts.filter((_, i) => i !== named);
+    if (nums[0].length === 4) [y, d] = nums; else [d, y] = nums;
+  } else if (fmt === 'ymd' || parts[0].length === 4) [y, m, d] = parts;
+  else if (fmt === 'mdy') [m, d, y] = parts;
+  else [d, m, y] = parts;
+  y = Number(y); m = Number(m); d = Number(d);
+  if (y < 100) y += 2000;
+  if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31 && y > 1900)) return null;
+  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+}
+
+/** A bank amount to a number: thousands separators, AED, (brackets) or a trailing - / DR for money out. */
+function parseBankAmount(str) {
+  const s = String(str || '').trim();
+  if (!s) return null;
+  const negative = /^\(.*\)$/.test(s) || /^-/.test(s) || /-$/.test(s) || /\bDR\b/i.test(s);
+  const n = Number(s.replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(n) || s.replace(/[^0-9]/g, '') === '') return null;
+  return negative ? -n : n;
+}
+
+function importStatementDialog(account) {
+  let rows = [];
+  let fileName = '';
+  const colSel = name => select(name, '', [['', '—']], { 'aria-label': name });
+  const cols = { date: colSel('date'), description: colSel('description'), reference: colSel('reference'), amount: colSel('amount'), in: colSel('in'), out: colSel('out'), balance: colSel('balance') };
+  const fmt = select('date_format', 'dmy', [['dmy', 'Day/Month/Year (UAE)'], ['mdy', 'Month/Day/Year'], ['ymd', 'Year-Month-Day']]);
+  const preview = h('div', { class: 'table-wrap' });
+  const note = h('p', { class: 'muted' }, 'Download the statement from your online banking as CSV (or save the Excel file as CSV), then choose it here.');
+  const mapping = h('div', { hidden: true },
+    h('div', { class: 'form-grid' },
+      field('Date column', cols.date), field('Date format', fmt),
+      field('Description column', cols.description), field('Reference column (optional)', cols.reference),
+      field('Amount column (+ in / − out)', cols.amount, { hint: 'Or leave this empty and pick separate columns:' }), field('Balance column (optional)', cols.balance),
+      field('Money in (credit) column', cols.in), field('Money out (debit) column', cols.out)),
+    h('h3', { class: 'notes-heading' }, 'Preview'), preview);
+  const parsed = () => rows.slice(1).map(r => {
+    const get = k => (cols[k].value === '' ? '' : r[Number(cols[k].value)]);
+    const amt = cols.amount.value !== '' ? parseBankAmount(get('amount')) : round2((Math.abs(parseBankAmount(get('in')) || 0)) - (Math.abs(parseBankAmount(get('out')) || 0)));
+    return { date: parseBankDate(get('date'), fmt.value), description: get('description'), reference: get('reference'), amount: amt, balance: parseBankAmount(get('balance')) };
+  }).filter(x => x.date || x.amount);
+  const showPreview = () => {
+    const p = parsed();
+    const bad = p.filter(x => !x.date || x.amount == null).length;
+    preview.replaceChildren(h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Description'), h('th', { class: 'num' }, 'Amount'), h('th', { class: 'num' }, 'Balance'))),
+      h('tbody', {}, p.slice(0, 6).map(x => h('tr', {}, h('td', {}, x.date ? fmtDate(x.date) : h('span', { class: 'text-bad' }, '?')), h('td', {}, x.description),
+        h('td', { class: 'num' }, x.amount == null ? h('span', { class: 'text-bad' }, '?') : amount(x.amount)), h('td', { class: 'num' }, x.balance == null ? '' : amount(x.balance)))))),
+      h('p', { class: bad ? 'form-error' : 'muted' }, `${p.length} transactions${bad ? `, ${bad} not understood: check the columns and date format` : ''}`));
+  };
+  Object.values(cols).forEach(s => s.addEventListener('change', showPreview));
+  fmt.addEventListener('change', showPreview);
+  const guess = (header, re) => { const i = header.findIndex(x => re.test(x)); return i >= 0 ? String(i) : ''; };
+  const fileIn = h('input', { type: 'file', accept: '.csv,text/csv', 'aria-label': 'Statement file', onchange: async e => {
+    const file = e.target.files[0];
+    if (!file) return;
+    fileName = file.name;
+    rows = parseCsv(await file.text());
+    if (rows.length < 2) { toast('No rows found in the file', true); return; }
+    const header = rows[0];
+    const opts = [['', '—'], ...header.map((x, i) => [String(i), x || `Column ${i + 1}`])];
+    for (const s of Object.values(cols)) s.replaceChildren(...opts.map(([v, l]) => h('option', { value: v }, l)));
+    cols.date.value = guess(header, /date/i);
+    cols.description.value = guess(header, /desc|narr|detail|particular|remark/i);
+    cols.reference.value = guess(header, /ref|cheque|chq/i);
+    cols.amount.value = guess(header, /^amount/i);
+    cols.in.value = cols.amount.value ? '' : guess(header, /credit|deposit|money in|^in$/i);
+    cols.out.value = cols.amount.value ? '' : guess(header, /debit|withdraw|money out|^out$/i);
+    cols.balance.value = guess(header, /balance/i);
+    const sample = rows.slice(1, 20).map(r => r[Number(cols.date.value)] || '');
+    if (sample.some(x => /^\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}/.test(x) && Number(x.split(/[/\-.]/)[1]) > 12)) fmt.value = 'mdy';
+    if (sample.some(x => /^\d{4}/.test(x))) fmt.value = 'ymd';
+    mapping.hidden = false;
+    showPreview();
+  } });
+  const dlg = openDialog(`Import a statement for ${account.code} · ${account.name}`, h('div', { class: 'form' },
+    note, field('Statement file (CSV)', fileIn), mapping,
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'button', onclick: async () => {
+        const p = parsed();
+        if (!p.length) { toast('Choose a file first', true); return; }
+        if (p.some(x => !x.date || x.amount == null)) { toast('Some lines are not understood: check the columns and date format', true); return; }
+        try {
+          const res = await rpc('import_bank_statement', { p_account: account.id, p_file_name: fileName, p_lines: p });
+          dlg.close();
+          toast(`Imported ${res.imported} line${res.imported === 1 ? '' : 's'}${res.skipped ? `, ${res.skipped} already there or zero skipped` : ''}`);
+          render();
+        } catch (err) { toast(err.message, true); }
+      } }, 'Import'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))));
+}
+
+function bankEntryDialog(line, accounts) {
+  const bankish = a => !['bank', 'cash', 'pdc', 'receivable', 'payable', 'customer_advance'].includes(a.subtype);
+  const dlg = openDialog(line.amount > 0 ? 'Record money in' : 'Record money out', handleForm(h('form', { class: 'form' },
+    h('p', { class: 'muted' }, `${fmtDate(line.txn_date)} · ${line.description} · ${money(line.amount)}`),
+    field(line.amount > 0 ? 'Where it came from' : 'What it was for', accountSelect('other_account_id', line.amount < 0 ? (accounts.find(a => a.code === '6400') || {}).id : '', accounts, { required: true }, bankish),
+      { hint: 'For example Bank charges, Other income, Owner\'s capital. Customer and supplier money: record a receipt or payment voucher instead, then match it.' }),
+    field('Description', input('memo', line.description, { maxlength: 500 })),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save and match'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('bank_line_entry', { p_statement_line: line.id, p_other_account: Number(data.other_account_id), p_memo: data.memo });
+    dlg.close();
+    toast('Recorded and matched');
+    render();
+  }));
+}
+
+async function viewReconcile(params) {
+  const [cash, accounts] = await Promise.all([rpc('cash_accounts'), rpc('list_accounts', { p_include_inactive: false })]);
+  const banks = cash.filter(a => a.subtype === 'bank');
+  if (!banks.length) return layout('finance-reconcile', pageHead('Bank reconciliation'), h('p', { class: 'empty' }, 'No bank accounts in the chart of accounts.'));
+  const accountId = Number(params.account) || banks[0].id;
+  const asOf = params.to || localToday();
+  const rec = await rpc('bank_reconciliation', { p_account: accountId, p_as_of: asOf });
+  const go = (k, v) => { const n = new URLSearchParams({ account: accountId, to: asOf, ...params }); n.set(k, v); location.hash = '#/finance/reconcile?' + n; };
+  const act = (fn, args, msg) => async () => { try { const r = await rpc(fn, args); toast(typeof msg === 'function' ? msg(r) : msg); render(); } catch (err) { toast(err.message, true); } };
+  const diff = rec.statement_balance == null ? null : round2(Number(rec.statement_balance) - Number(rec.expected_statement_balance));
+  const candidates = line => rec.ledger_lines.filter(l => round2(l.amount) === round2(line.amount));
+  return layout('finance-reconcile',
+    pageHead('Bank reconciliation', `${rec.account.code} · ${rec.account.name}${rec.account.bank_name ? ' · ' + rec.account.bank_name : ''}`, [
+      h('button', { class: 'btn btn-primary', onclick: () => importStatementDialog(rec.account) }, 'Import statement'),
+      rec.statement_lines.length > 0 && h('button', { class: 'btn btn-secondary', onclick: act('auto_match_bank', { p_account: accountId }, n => `Matched ${n} line${n === 1 ? '' : 's'}`) }, 'Match automatically'),
+    ]),
+    h('div', { class: 'filters report-dates' },
+      banks.length > 1 && select('account', String(accountId), banks.map(b => [String(b.id), `${b.code} · ${b.name}`]), { 'aria-label': 'Bank account', onchange: e => go('account', e.target.value) }),
+      input('to', asOf, { type: 'date', 'aria-label': 'As at', onchange: e => go('to', e.target.value) })),
+    h('section', { class: 'card' },
+      h('div', { class: 'table-wrap' }, h('table', { class: 'report report-narrow' }, h('tbody', {},
+        h('tr', {}, h('td', {}, `Balance in the books at ${fmtDate(rec.as_of)}`), h('td', { class: 'num' }, amount(rec.book_balance))),
+        h('tr', {}, h('td', {}, 'Less: in the books, not yet on the statement'), h('td', { class: 'num' }, amount(-rec.uncleared_ledger))),
+        h('tr', {}, h('td', {}, 'Add: on the statement, not yet in the books'), h('td', { class: 'num' }, amount(rec.unrecorded_statement))),
+        h('tr', { class: 'total-row' }, h('td', {}, 'Statement balance should be'), h('td', { class: 'num' }, amount(rec.expected_statement_balance))),
+        h('tr', {}, h('td', {}, rec.statement_balance == null ? 'Statement balance (none imported with a balance column)' : `Statement balance at ${fmtDate(rec.statement_date)}`),
+          h('td', { class: 'num' }, rec.statement_balance == null ? '—' : amount(rec.statement_balance))),
+        diff != null && h('tr', { class: 'grand-row' }, h('td', {}, 'Difference'), h('td', { class: 'num' }, amount(diff)))))),
+      diff != null && h('p', { class: diff === 0 ? 'muted' : 'form-error' }, diff === 0
+        ? (rec.statement_lines.length || rec.ledger_lines.length ? 'Adds up ✓ Match the remaining lines below as they clear.' : 'Reconciled ✓')
+        : 'The difference means a transaction is missing or entered with the wrong amount or date. Check the unmatched lines below.')),
+    h('section', { class: 'card' },
+      h('h2', {}, `On the statement, not matched (${rec.statement_lines.length})`),
+      rec.statement_lines.length ? h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Description'), h('th', { class: 'num' }, 'Amount'), h('th', {}, 'Match with'))),
+        h('tbody', {}, rec.statement_lines.map(l => {
+          const c = candidates(l);
+          const pick = c.length > 1 && !l.suggestion
+            ? select('', '', [['', 'Pick an entry…'], ...c.map(x => [String(x.line_id), `${x.number} · ${fmtDate(x.entry_date)} · ${x.memo || ''}`])], { 'aria-label': 'Ledger entry' })
+            : null;
+          const target = l.suggestion || (c.length === 1 ? c[0] : null);
+          return h('tr', { class: 'stmt-line' },
+            h('td', {}, fmtDate(l.txn_date)), h('td', {}, l.description, l.reference && h('div', { class: 'meta muted' }, l.reference)),
+            h('td', { class: 'num' }, h('span', { class: Number(l.amount) < 0 ? 'text-bad' : '' }, amount(l.amount))),
+            h('td', {}, h('div', { class: 'btn-row' },
+              target && h('button', { class: 'btn btn-secondary btn-sm', onclick: act('match_bank_line', { p_statement_line: l.id, p_journal_line: target.line_id }, 'Matched') },
+                `Match ${target.number}`),
+              pick, pick && h('button', { class: 'btn btn-secondary btn-sm', onclick: () => { if (pick.value) act('match_bank_line', { p_statement_line: l.id, p_journal_line: Number(pick.value) }, 'Matched')(); } }, 'Match'),
+              h('button', { class: 'btn btn-secondary btn-sm', onclick: () => bankEntryDialog(l, accounts) }, 'Record'))));
+        }))))
+        : h('p', { class: 'empty' }, 'Every imported line is matched.'),
+      h('p', { class: 'hint' }, '"Match" links the bank line to the entry already in the books. "Record" adds an entry for something only the bank knows about yet (bank charges, interest, a direct debit).')),
+    h('section', { class: 'card' },
+      h('h2', {}, `In the books, not on the statement (${rec.ledger_lines.length})`),
+      rec.ledger_lines.length ? h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Date'), h('th', {}, 'Entry'), h('th', {}, 'Details'), h('th', { class: 'num' }, 'Amount'))),
+        h('tbody', {}, rec.ledger_lines.map(l => h('tr', {},
+          h('td', {}, fmtDate(l.entry_date)), h('td', {}, h('a', { href: `#/finance/journals/${l.journal_id}` }, l.number)),
+          h('td', {}, l.memo, l.reference && h('div', { class: 'meta muted' }, l.reference)),
+          h('td', { class: 'num' }, amount(l.amount)))))))
+        : h('p', { class: 'empty' }, 'Nothing outstanding.'),
+      h('p', { class: 'hint' }, 'Usually cheques not yet presented or deposits not yet credited. If something stays here for long, check it was really paid or received.')),
+    h('div', { class: 'grid two-col' },
+      h('section', { class: 'card' }, h('h2', {}, 'Recently matched'),
+        rec.matched.length ? h('ul', { class: 'list' }, rec.matched.map(m => h('li', {},
+          h('div', { class: 'grow' }, h('div', { class: 'body' }, m.description), h('div', { class: 'meta' }, `${fmtDate(m.txn_date)} · `, h('a', { href: `#/finance/journals/${m.journal_id}` }, m.number))),
+          h('strong', {}, amount(m.amount)),
+          h('button', { class: 'btn btn-secondary btn-sm', onclick: act('unmatch_bank_line', { p_statement_line: m.id }, 'Unmatched') }, 'Unmatch'))))
+          : h('p', { class: 'empty' }, 'Nothing matched yet.')),
+      h('section', { class: 'card' }, h('h2', {}, 'Imported statements'),
+        rec.imports.length ? h('ul', { class: 'list' }, rec.imports.map(i => h('li', {},
+          h('div', { class: 'grow' }, h('div', { class: 'body' }, i.file_name || 'Statement'),
+            h('div', { class: 'meta' }, `${i.line_count} lines${i.first_date ? ` · ${fmtDate(i.first_date)} – ${fmtDate(i.last_date)}` : ''} · ${fmtDate(i.created_at, true)}${i.imported_by_name ? ' by ' + i.imported_by_name : ''}`)),
+          h('button', { class: 'btn btn-danger btn-sm', onclick: () => { if (confirmAction('Delete this import and its lines (matches are undone; entries in the books stay)?')) act('delete_bank_import', { p_id: i.id }, 'Import deleted')(); } }, 'Delete'))))
+          : h('p', { class: 'empty' }, 'None yet.'))));
+}
+
+// ---------- petty cash ----------
+
+function pettyExpenseDialog(boxId, accounts) {
+  const vatSel = select('vat_code', 'standard', Object.entries(VAT_CODES).map(([k, v]) => [k, k === 'out_of_scope' ? 'No VAT' : v]));
+  const totalIn = input('total', '', { type: 'number', min: '0.01', step: '0.01', required: true });
+  const rec = h('input', { type: 'checkbox', name: 'recoverable', checked: true });
+  const vatNote = h('p', { class: 'muted' });
+  const upd = () => {
+    const t = Number(totalIn.value) || 0;
+    const v = vatSel.value === 'standard' ? round2(t * 5 / 105) : 0;
+    vatNote.textContent = v ? `Includes VAT of ${money(v)}${rec.checked ? ', claimed back in the VAT return' : ', added to the cost'}.` : '';
+    rec.closest('label').hidden = vatSel.value !== 'standard';
+  };
+  vatSel.addEventListener('change', upd); totalIn.addEventListener('input', upd); rec.addEventListener('change', upd);
+  const dlg = openDialog('Petty cash expense', handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('Paid to', input('payee', '', { required: true, maxlength: 200, placeholder: 'Shop or person' })),
+      field('Their TRN (on the receipt)', input('payee_trn', '', { inputmode: 'numeric', placeholder: 'If shown' })),
+      field('What for', input('description', '', { required: true, maxlength: 500 }), { full: true }),
+      field('Expense account', accountSelect('expense_account_id', (accounts.find(a => a.code === '6600') || {}).id, accounts, { required: true }, costAccount)),
+      field('Date', input('spent_on', localToday(), { type: 'date', max: localToday(), required: true })),
+      field('Amount paid (AED, incl. VAT)', totalIn),
+      field('VAT on the receipt', vatSel),
+      field('Receipt number (optional)', input('receipt_ref', '', { maxlength: 100 }))),
+    h('label', { class: 'check' }, rec, 'VAT recoverable (a proper tax invoice or receipt with the seller\'s TRN)'),
+    vatNote,
+    h('input', { type: 'hidden', name: 'account_id', value: String(boxId) }),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Save'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('record_petty_cash', { p_data: data });
+    dlg.close();
+    toast('Expense saved');
+    render();
+  }));
+  upd();
+}
+
+function topUpDialog(box, banks) {
+  const dlg = openDialog(`Top up ${box.name}`, handleForm(h('form', { class: 'form' },
+    h('div', { class: 'form-grid' },
+      field('From', select('account_id', String((banks[0] || {}).id || ''), banks.map(b => [String(b.id), `${b.code} · ${b.name}`]), { required: true })),
+      field('Amount (AED)', input('amount', '', { type: 'number', min: '0.01', step: '0.01', required: true })),
+      field('Date', input('entry_date', localToday(), { type: 'date', required: true })),
+      field('Reference (optional)', input('reference', '', { maxlength: 100, placeholder: 'Cheque or withdrawal no.' }))),
+    h('div', { class: 'btn-row' },
+      h('button', { class: 'btn btn-primary', type: 'submit' }, 'Top up'),
+      h('button', { class: 'btn btn-secondary', type: 'button', onclick: () => dlg.close() }, 'Cancel'))),
+  async data => {
+    await rpc('bank_transaction', { p_data: { ...data, kind: 'transfer', other_account_id: box.id, memo: `Petty cash top-up (${box.name})` } });
+    dlg.close();
+    toast('Topped up');
+    render();
+  }));
+}
+
+async function viewPettyCash(params) {
+  const t = localToday();
+  const from = params.from || `${t.slice(0, 7)}-01`;
+  const to = params.to || t;
+  const [pc, accounts, cash] = await Promise.all([rpc('petty_cash', { p_from: from, p_to: to, p_account: Number(params.account) || null }),
+    rpc('list_accounts', { p_include_inactive: false }), rpc('cash_accounts')]);
+  const box = pc.accounts.find(a => a.id === pc.account_id) || pc.accounts[0];
+  const go = (k, v) => { const n = new URLSearchParams({ from, to, ...params }); n.set(k, v); location.hash = '#/finance/petty-cash?' + n; };
+  const posted = pc.expenses.filter(e => e.status === 'posted');
+  const spent = posted.reduce((s, e) => s + Number(e.total), 0);
+  const topped = pc.money_in.reduce((s, m) => s + Number(m.amount), 0);
+  const header = ['No.', 'Date', 'Paid to', 'TRN', 'What for', 'Account', 'VAT', 'Net', 'VAT amount', 'Total'];
+  const rows = posted.map(e => [e.number, fmtDate(e.spent_on), e.payee, e.payee_trn || '', e.description, e.expense_account,
+    `${VAT_CODES[e.vat_code]}${e.vat_code === 'standard' && !e.recoverable ? ' (not recoverable)' : ''}`, amount(e.net), amount(e.vat), amount(e.total)]);
+  const subtitle = `${box.code} · ${box.name} · ${fmtDate(from)} – ${fmtDate(to)}`;
+  return layout('finance-petty',
+    pageHead('Petty cash', subtitle, [
+      h('button', { class: 'btn btn-secondary', onclick: () => topUpDialog(box, cash.filter(a => a.subtype === 'bank' && a.active)) }, 'Top up'),
+      h('button', { class: 'btn btn-primary', onclick: () => pettyExpenseDialog(box.id, accounts) }, '+ Expense'),
+    ]),
+    h('div', { class: 'filters report-dates' },
+      pc.accounts.length > 1 && select('account', String(box.id), pc.accounts.map(a => [String(a.id), `${a.code} · ${a.name}`]), { 'aria-label': 'Cash box', onchange: e => go('account', e.target.value) }),
+      input('from', from, { type: 'date', 'aria-label': 'From', onchange: e => go('from', e.target.value) }),
+      input('to', to, { type: 'date', 'aria-label': 'To', onchange: e => go('to', e.target.value) }),
+      periodPresets(from, to, (f, t2) => { const n = new URLSearchParams({ ...params, from: f, to: t2 }); location.hash = '#/finance/petty-cash?' + n; })),
+    h('dl', { class: 'pay-summary' },
+      h('div', {}, h('dt', {}, `At ${fmtDate(from)}`), h('dd', {}, money(pc.opening))),
+      h('div', {}, h('dt', {}, 'Topped up'), h('dd', {}, money(topped))),
+      h('div', {}, h('dt', {}, 'Spent'), h('dd', {}, money(spent))),
+      h('div', { class: Number(pc.closing) < 0 ? 'is-overdue' : 'is-paid' }, h('dt', {}, `In the box at ${fmtDate(to)}`), h('dd', {}, money(pc.closing)))),
+    h('section', { class: 'card' },
+      h('div', { class: 'card-head' }, h('h2', {}, `Expenses (${posted.length})`),
+        h('div', { class: 'btn-row' }, exportButtons(`Petty-cash-${from}-to-${to}`, 'Petty cash expenses', subtitle, header, rows, [7, 8, 9]),
+          h('a', { class: 'btn btn-secondary btn-sm', href: `#/finance/ledger/${box.id}?from=${from}&to=${to}` }, 'Cash book'))),
+      pc.expenses.length ? h('div', { class: 'table-wrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'No.'), h('th', { class: 'hide-sm' }, 'Date'), h('th', {}, 'Paid to'), h('th', { class: 'hide-sm' }, 'Account'),
+          h('th', { class: 'num hide-sm' }, 'VAT'), h('th', { class: 'num' }, 'Total'), h('th', {}, ''))),
+        h('tbody', {}, pc.expenses.map(e => h('tr', { class: e.status === 'void' ? 'row-off' : '' },
+          h('td', {}, e.journal_id ? h('a', { class: 'row-link', href: `#/finance/journals/${e.journal_id}` }, e.number) : e.number),
+          h('td', { class: 'hide-sm' }, fmtDate(e.spent_on)),
+          h('td', {}, e.payee, h('div', { class: 'meta muted' }, e.description)),
+          h('td', { class: 'hide-sm' }, e.expense_account),
+          h('td', { class: 'num hide-sm' }, Number(e.vat) ? [amount(e.vat), !e.recoverable && h('div', { class: 'meta muted' }, 'not recoverable')] : '—'),
+          h('td', { class: 'num' }, money(e.total)),
+          h('td', {}, e.status === 'void' ? h('span', { class: 'badge inv-cancelled' }, 'Void')
+            : h('button', { class: 'btn btn-danger btn-sm', onclick: async () => {
+              if (!confirmAction(`Void ${e.number}? The money goes back into the box.`)) return;
+              try { await rpc('void_petty_cash', { p_id: e.id }); toast('Voided'); render(); } catch (err) { toast(err.message, true); }
+            } }, 'Void')))))))
+        : h('p', { class: 'empty' }, 'No expenses in this period.')),
+    pc.money_in.length > 0 && h('section', { class: 'card' }, h('h2', {}, 'Money in'),
+      h('ul', { class: 'list' }, pc.money_in.map(m => h('li', {},
+        h('div', { class: 'grow' }, h('a', { class: 'row-link', href: `#/finance/journals/${m.id}` }, m.number), h('div', { class: 'meta' }, `${fmtDate(m.entry_date)} · ${m.memo || ''}`)),
+        h('strong', {}, money(m.amount)))))));
 }
 
 // ---------- users (admin) ----------
@@ -4223,6 +5218,20 @@ async function render() {
       else if (path === '/finance/supplier-payments/new') view = await viewSupplierPaymentNew(params);
       else if ((m = path.match(/^\/finance\/supplier-payments\/(\d+)$/))) view = await viewSupplierPayment(Number(m[1]));
       else if (path === '/finance/vat') view = await viewVat(params);
+      else if (path === '/finance/receipts') view = await viewReceipts(params);
+      else if (path === '/finance/receipts/new') view = await viewReceiptNew(params);
+      else if ((m = path.match(/^\/finance\/receipts\/(\d+)$/))) view = await viewReceipt(Number(m[1]));
+      else if (path === '/finance/credit-notes') view = await viewCreditNotes(params);
+      else if (path === '/finance/credit-notes/new') view = await viewCreditNoteNew(params);
+      else if ((m = path.match(/^\/finance\/credit-notes\/(\d+)$/))) view = await viewCreditNote(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/credit-notes\/(\d+)\/edit$/))) view = await viewCreditNoteEdit(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/customers\/(\d+)\/statement$/))) view = await viewCustomerStatement(Number(m[1]), params);
+      else if (path === '/finance/recurring') view = await viewRecurring();
+      else if (path === '/finance/recurring/new') view = await viewRecurringNew(params);
+      else if ((m = path.match(/^\/finance\/recurring\/(\d+)$/))) view = await viewRecurringOne(Number(m[1]));
+      else if ((m = path.match(/^\/finance\/recurring\/(\d+)\/edit$/))) view = await viewRecurringEdit(Number(m[1]));
+      else if (path === '/finance/reconcile') view = await viewReconcile(params);
+      else if (path === '/finance/petty-cash') view = await viewPettyCash(params);
       else if (path === '/renewals') view = await viewRenewals(params);
       else if (path === '/renewals/new') view = await viewRenewalNew(params);
       else if ((m = path.match(/^\/renewals\/(\d+)$/))) view = await viewRenewal(Number(m[1]));

@@ -565,6 +565,170 @@ create table if not exists public.bill_allocations (
 );
 create index if not exists bill_allocations_bill_idx on public.bill_allocations (bill_id);
 
+-- -------------------------------------------------------------------------------------
+-- Finance phase 3: customer credit notes, receipt vouchers, recurring invoices,
+-- bank statement import and reconciliation, petty cash
+-- -------------------------------------------------------------------------------------
+
+alter table public.journals drop constraint if exists journals_kind_check;
+alter table public.journals add constraint journals_kind_check check (kind in ('journal', 'adjustment', 'accrual', 'prepayment', 'opening',
+  'invoice', 'payment', 'reversal', 'bank_receipt', 'bank_payment', 'transfer', 'bill', 'supplier_credit', 'supplier_payment', 'vat_settlement',
+  'credit_note', 'receipt', 'petty_cash'));
+alter table public.journals drop constraint if exists journals_source_type_check;
+alter table public.journals add constraint journals_source_type_check check (source_type in ('invoice', 'payment', 'bill', 'supplier_payment',
+  'credit_note', 'receipt', 'petty_cash'));
+
+-- Tax credit notes to customers, always against one of our tax invoices. Customer and company details are
+-- copied in when saved, like invoices. amount_applied: how much has been set against invoices.
+create table if not exists public.credit_notes (
+  id               bigint generated always as identity primary key,
+  number           text not null unique,
+  invoice_id       bigint not null references public.invoices (id) on delete restrict,
+  customer_id      bigint references public.customers (id) on delete set null,
+  customer_name    text not null,
+  customer_address text,
+  customer_trn     text,
+  customer_email   text,
+  supplier         jsonb not null default '{}',
+  issue_date       date not null,
+  reason           text not null check (char_length(btrim(reason)) between 1 and 500),
+  notes            text check (char_length(notes) <= 1000),
+  status           text not null default 'draft' check (status in ('draft', 'issued', 'cancelled')),
+  subtotal         numeric(14, 2) not null default 0,
+  vat_total        numeric(14, 2) not null default 0,
+  total            numeric(14, 2) not null default 0,
+  amount_applied   numeric(14, 2) not null default 0,
+  sent_at          timestamptz,
+  sent_to          text,
+  created_by       uuid references public.profiles (id) on delete set null,
+  created_at       timestamptz not null default now(),
+  issued_at        timestamptz,
+  cancelled_at     timestamptz
+);
+create index if not exists credit_notes_invoice_idx on public.credit_notes (invoice_id);
+create index if not exists credit_notes_customer_idx on public.credit_notes (customer_id);
+
+create table if not exists public.credit_note_lines (
+  id             bigint generated always as identity primary key,
+  credit_note_id bigint not null references public.credit_notes (id) on delete cascade,
+  position       int not null,
+  description    text not null check (char_length(btrim(description)) between 1 and 500),
+  quantity       numeric(12, 3) not null check (quantity > 0),
+  unit_price     numeric(14, 2) not null check (unit_price >= 0),
+  vat_code       text not null check (vat_code in ('standard', 'zero', 'exempt', 'out_of_scope')),
+  net            numeric(14, 2) not null,
+  vat            numeric(14, 2) not null
+);
+create index if not exists credit_note_lines_cn_idx on public.credit_note_lines (credit_note_id);
+
+-- Receipt vouchers: money received from a customer, set against one or more tax invoices; the rest
+-- is held as an advance (customer advances) until set against a later invoice.
+create table if not exists public.receipts (
+  id            bigint generated always as identity primary key,
+  number        text not null unique,
+  customer_id   bigint not null references public.customers (id) on delete restrict,
+  received_on   date not null,
+  amount        numeric(14, 2) not null check (amount > 0),
+  method        text not null check (method in ('bank_transfer', 'cash', 'cheque', 'other')),
+  account_id    bigint not null references public.accounts (id) on delete restrict,
+  reference     text check (char_length(reference) <= 100),
+  cheque_bank   text check (char_length(cheque_bank) <= 100),
+  cheque_date   date,
+  cheque_status text check (cheque_status in ('pending', 'cleared', 'bounced')),
+  notes         text check (char_length(notes) <= 1000),
+  status        text not null default 'posted' check (status in ('posted', 'void')),
+  created_by    uuid references public.profiles (id) on delete set null,
+  created_at    timestamptz not null default now(),
+  voided_at     timestamptz,
+  constraint receipts_cheque_status_only_for_cheques check ((method = 'cheque') = (cheque_status is not null))
+);
+create index if not exists receipts_customer_idx on public.receipts (customer_id);
+
+-- What settles a tax invoice besides direct payments: a receipt voucher or a credit note, in full or in part.
+create table if not exists public.receivable_allocations (
+  id             bigint generated always as identity primary key,
+  invoice_id     bigint not null references public.invoices (id) on delete cascade,
+  receipt_id     bigint references public.receipts (id) on delete cascade,
+  credit_note_id bigint references public.credit_notes (id) on delete cascade,
+  amount         numeric(14, 2) not null check (amount > 0),
+  journal_id     bigint references public.journals (id) on delete set null,
+  created_by     uuid references public.profiles (id) on delete set null,
+  created_at     timestamptz not null default now(),
+  check ((receipt_id is null) <> (credit_note_id is null))
+);
+create index if not exists receivable_allocations_invoice_idx on public.receivable_allocations (invoice_id);
+create index if not exists receivable_allocations_receipt_idx on public.receivable_allocations (receipt_id);
+create index if not exists receivable_allocations_cn_idx on public.receivable_allocations (credit_note_id);
+
+-- Recurring invoices: a template that creates a draft tax invoice every period.
+-- lines: [{description, quantity, unit_price, vat_code}]; "{period}" in a description becomes e.g. "November 2026".
+create table if not exists public.recurring_invoices (
+  id              bigint generated always as identity primary key,
+  customer_id     bigint not null references public.customers (id) on delete cascade,
+  title           text not null check (char_length(btrim(title)) between 1 and 200),
+  every_months    int not null check (every_months in (1, 2, 3, 6, 12)),
+  next_date       date not null,
+  end_date        date,
+  due_days        int not null default 30 check (due_days between 0 and 365),
+  lines           jsonb not null,
+  notes           text check (char_length(notes) <= 2000),
+  active          boolean not null default true,
+  last_invoice_id bigint references public.invoices (id) on delete set null,
+  created_by      uuid references public.profiles (id) on delete set null,
+  created_at      timestamptz not null default now()
+);
+alter table public.invoices add column if not exists recurring_id bigint references public.recurring_invoices (id) on delete set null;
+
+-- Bank statement lines imported from the bank's CSV. amount: + money in, - money out.
+-- journal_line_id: the ledger line it was matched to (reconciled).
+create table if not exists public.bank_imports (
+  id          bigint generated always as identity primary key,
+  account_id  bigint not null references public.accounts (id) on delete cascade,
+  file_name   text check (char_length(file_name) <= 200),
+  line_count  int not null default 0,
+  skipped     int not null default 0,
+  imported_by uuid references public.profiles (id) on delete set null,
+  created_at  timestamptz not null default now()
+);
+create table if not exists public.bank_statement_lines (
+  id              bigint generated always as identity primary key,
+  account_id      bigint not null references public.accounts (id) on delete cascade,
+  import_id       bigint references public.bank_imports (id) on delete cascade,
+  txn_date        date not null,
+  description     text not null check (char_length(description) <= 500),
+  reference       text check (char_length(reference) <= 100),
+  amount          numeric(14, 2) not null check (amount <> 0),
+  balance         numeric(14, 2),
+  journal_line_id bigint unique references public.journal_lines (id) on delete set null,
+  matched_by      uuid references public.profiles (id) on delete set null,
+  matched_at      timestamptz,
+  created_at      timestamptz not null default now()
+);
+create index if not exists bank_statement_lines_account_idx on public.bank_statement_lines (account_id, txn_date);
+
+-- Petty cash spending (with input VAT where there's a valid tax receipt). Top-ups are bank transfers.
+create table if not exists public.petty_cash_expenses (
+  id                 bigint generated always as identity primary key,
+  number             text not null unique,
+  account_id         bigint not null references public.accounts (id) on delete restrict,
+  spent_on           date not null,
+  payee              text not null check (char_length(btrim(payee)) between 1 and 200),
+  payee_trn          text check (payee_trn ~ '^\d{15}$'),
+  description        text not null check (char_length(btrim(description)) between 1 and 500),
+  expense_account_id bigint not null references public.accounts (id) on delete restrict,
+  vat_code           text not null check (vat_code in ('standard', 'zero', 'exempt', 'out_of_scope')),
+  recoverable        boolean not null default true,
+  net                numeric(14, 2) not null check (net > 0),
+  vat                numeric(14, 2) not null default 0,
+  total              numeric(14, 2) not null,
+  receipt_ref        text check (char_length(receipt_ref) <= 100),
+  status             text not null default 'posted' check (status in ('posted', 'void')),
+  created_by         uuid references public.profiles (id) on delete set null,
+  created_at         timestamptz not null default now(),
+  voided_at          timestamptz
+);
+create index if not exists petty_cash_expenses_date_idx on public.petty_cash_expenses (spent_on);
+
 -- Running totals on each invoice, kept up to date by private.refresh_invoice_payments().
 alter table public.invoices add column if not exists amount_paid numeric(14, 2) not null default 0;
 alter table public.invoices add column if not exists payment_reminded_at timestamptz;
@@ -669,13 +833,23 @@ alter table public.bills             enable row level security;
 alter table public.bill_lines        enable row level security;
 alter table public.supplier_payments enable row level security;
 alter table public.bill_allocations  enable row level security;
+alter table public.credit_notes           enable row level security;
+alter table public.credit_note_lines      enable row level security;
+alter table public.receipts               enable row level security;
+alter table public.receivable_allocations enable row level security;
+alter table public.recurring_invoices     enable row level security;
+alter table public.bank_imports           enable row level security;
+alter table public.bank_statement_lines   enable row level security;
+alter table public.petty_cash_expenses    enable row level security;
 revoke all on public.profiles, public.customers, public.contacts, public.activities,
               public.work_types, public.tasks, public.task_updates,
               public.company_settings, public.invoice_counters, public.invoices, public.invoice_lines,
               public.renewal_types, public.renewals, public.renewal_events, public.payments,
               public.employees, public.attendance, public.leave_requests, public.payslips,
               public.accounts, public.journals, public.journal_lines,
-              public.suppliers, public.bills, public.bill_lines, public.supplier_payments, public.bill_allocations
+              public.suppliers, public.bills, public.bill_lines, public.supplier_payments, public.bill_allocations,
+              public.credit_notes, public.credit_note_lines, public.receipts, public.receivable_allocations, public.recurring_invoices,
+              public.bank_imports, public.bank_statement_lines, public.petty_cash_expenses
   from public, anon, authenticated;
 
 -- -------------------------------------------------------------------------------------
@@ -1178,6 +1352,9 @@ language plpgsql security definer set search_path = '' as $$
 declare
   me public.profiles := private.current_manager();
 begin
+  if exists (select 1 from public.receipts where customer_id = p_id) then
+    raise exception 'This customer has receipt vouchers, so it can''t be deleted. Set it to inactive instead.' using errcode = '22023';
+  end if;
   delete from public.customers where id = p_id;
   if not found then
     raise exception 'Customer not found' using errcode = 'P0002';
@@ -1877,6 +2054,16 @@ begin
                                              order by pm.paid_on desc, pm.id desc)
                             from public.payments pm left join public.profiles pu on pu.id = pm.recorded_by
                             where pm.invoice_id = i.id), '[]'),
+      'allocations', coalesce((select jsonb_agg(jsonb_build_object('id', a.id, 'amount', a.amount, 'created_at', a.created_at,
+                                 'receipt_id', a.receipt_id, 'credit_note_id', a.credit_note_id,
+                                 'source', coalesce((select number from public.receipts where id = a.receipt_id),
+                                                    (select number from public.credit_notes where id = a.credit_note_id))) order by a.id)
+                               from public.receivable_allocations a where a.invoice_id = i.id), '[]'),
+      'credit_notes', coalesce((select jsonb_agg(jsonb_build_object('id', c.id, 'number', c.number, 'issue_date', c.issue_date,
+                                  'status', c.status, 'total', c.total) order by c.id)
+                                from public.credit_notes c where c.invoice_id = i.id), '[]'),
+      'open_credits', case when i.kind = 'tax' and i.status = 'sent' and i.total > i.amount_paid
+                           then private.customer_open_credits(i.customer_id) else '[]'::jsonb end,
       -- Email addresses the invoice could go to: the customer's, then its contacts' (main contact first).
       'recipients', coalesce((
         select jsonb_agg(distinct_emails.email order by distinct_emails.rank, distinct_emails.email) from (
@@ -1985,6 +2172,12 @@ declare
 begin
   if exists (select 1 from public.payments where invoice_id = p_id) then
     raise exception 'This invoice has payments recorded. Delete them first if the invoice really is to be cancelled.' using errcode = '22023';
+  end if;
+  if exists (select 1 from public.receivable_allocations where invoice_id = p_id) then
+    raise exception 'Receipts or credit notes are set against this invoice. Remove them first.' using errcode = '22023';
+  end if;
+  if exists (select 1 from public.credit_notes where invoice_id = p_id and status <> 'cancelled') then
+    raise exception 'This invoice has a credit note. Cancel the credit note first.' using errcode = '22023';
   end if;
   update public.invoices set status = 'cancelled', cancelled_at = now(), updated_at = now()
   where id = p_id and status <> 'cancelled';
@@ -2328,6 +2521,9 @@ declare
 begin
   select coalesce(sum(amount), 0), max(paid_on) into paid, last_paid
   from public.payments where invoice_id = p_invoice_id and cheque_status is distinct from 'bounced';
+  -- Receipt vouchers and credit notes set against the invoice count too.
+  select paid + coalesce(sum(a.amount), 0), greatest(last_paid, max(a.created_at)::date) into paid, last_paid
+  from public.receivable_allocations a where a.invoice_id = p_invoice_id;
   update public.invoices set
     amount_paid = paid,
     status = case
@@ -3816,7 +4012,10 @@ begin
            from public.payments p join public.invoices i on i.id = p.invoice_id where p.id = j.source_id),
           jsonb_build_object('label', 'Deleted payment'))
         when 'bill' then (select jsonb_build_object('label', b.number || ' (' || b.supplier_ref || ')', 'bill_id', b.id) from public.bills b where b.id = j.source_id)
-        when 'supplier_payment' then (select jsonb_build_object('label', sp.number, 'supplier_payment_id', sp.id) from public.supplier_payments sp where sp.id = j.source_id) end,
+        when 'supplier_payment' then (select jsonb_build_object('label', sp.number, 'supplier_payment_id', sp.id) from public.supplier_payments sp where sp.id = j.source_id)
+        when 'credit_note' then (select jsonb_build_object('label', c.number, 'credit_note_id', c.id) from public.credit_notes c where c.id = j.source_id)
+        when 'receipt' then (select jsonb_build_object('label', r.number, 'receipt_id', r.id) from public.receipts r where r.id = j.source_id)
+        when 'petty_cash' then (select jsonb_build_object('label', e.number || ' - ' || e.payee, 'petty_cash', true) from public.petty_cash_expenses e where e.id = j.source_id) end,
       'lines', (select jsonb_agg(jsonb_build_object('account_id', l.account_id, 'code', a.code, 'account', a.name,
                   'description', l.description, 'debit', l.debit, 'credit', l.credit,
                   'customer_id', l.customer_id, 'customer_name', c.name,
@@ -3968,6 +4167,8 @@ begin
     'receivables', (select coalesce(sum(l.debit - l.credit), 0) from public.journal_lines l where l.account_id = private.acct('ar')),
     'advances', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('customer_advances')),
     'payables', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l where l.account_id = private.acct('ap')),
+    'recurring_due', (select count(*) from public.recurring_invoices where active and next_date <= t),
+    'unreconciled', (select count(*) from public.bank_statement_lines where journal_line_id is null),
     'vat_output_quarter', (select coalesce(sum(l.credit - l.debit), 0) from public.journal_lines l join public.journals j on j.id = l.journal_id
                            where l.account_id = private.acct('vat_output') and j.entry_date between q and t),
     'month', (select json_build_object(
@@ -4656,15 +4857,23 @@ begin
   end if;
   return (
     with sales as (
-      select 'sale' as side, i.issue_date as date, i.number as document, i.id as doc_id, i.customer_name as party, i.customer_trn as party_trn,
+      select 'sale' as side, 'invoice' as doc_type, i.issue_date as date, i.number as document, i.id as doc_id, i.customer_name as party, i.customer_trn as party_trn,
              l.description, l.vat_code, true as recoverable, l.net, l.vat
       from public.invoices i join public.invoice_lines l on l.invoice_id = i.id
       where i.kind = 'tax' and i.status in ('sent', 'paid') and i.issue_date between f and t
+      union all
+      select 'sale', 'credit_note', c.issue_date, c.number, c.id, c.customer_name, c.customer_trn, l.description, l.vat_code, true, -l.net, -l.vat
+      from public.credit_notes c join public.credit_note_lines l on l.credit_note_id = c.id
+      where c.status = 'issued' and c.issue_date between f and t
     ), purchases as (
-      select 'purchase' as side, b.bill_date, b.number || ' (' || b.supplier_ref || ')', b.id, s.name, s.trn, l.description, l.vat_code, l.recoverable,
+      select 'purchase' as side, 'bill' as doc_type, b.bill_date, b.number || ' (' || b.supplier_ref || ')', b.id, s.name, s.trn, l.description, l.vat_code, l.recoverable,
              case b.kind when 'bill' then l.net else -l.net end, case b.kind when 'bill' then l.vat else -l.vat end
       from public.bills b join public.bill_lines l on l.bill_id = b.id join public.suppliers s on s.id = b.supplier_id
       where b.status = 'posted' and b.bill_date between f and t
+      union all
+      select 'purchase', 'petty_cash', e.spent_on, e.number, e.id, e.payee, e.payee_trn, e.description, e.vat_code, e.recoverable, e.net, e.vat
+      from public.petty_cash_expenses e
+      where e.status = 'posted' and e.spent_on between f and t
     ), all_lines as (
       select *, case
         when side = 'sale' and vat_code = 'standard' then '1'
@@ -4691,7 +4900,7 @@ begin
                                  'vat', coalesce(sum(vat) filter (where side = 'purchase' and vat_code = 'standard' and recoverable), 0)),
       'box10', json_build_object('amount', coalesce(sum(net) filter (where side = 'purchase' and vat_code in ('reverse_charge', 'import_goods') and recoverable), 0),
                                  'vat', coalesce(sum(vat) filter (where side = 'purchase' and vat_code in ('reverse_charge', 'import_goods') and recoverable), 0)),
-      'ledger', coalesce(json_agg(json_build_object('side', side, 'date', date, 'document', document, 'doc_id', doc_id, 'party', party,
+      'ledger', coalesce(json_agg(json_build_object('side', side, 'doc_type', doc_type, 'date', date, 'document', document, 'doc_id', doc_id, 'party', party,
                   'party_trn', party_trn, 'description', description, 'vat_code', vat_code, 'recoverable', recoverable, 'net', net, 'vat', vat, 'box', box)
                   order by date, document) filter (where vat_code <> 'out_of_scope'), '[]'),
       'gl', (select json_build_object(
@@ -4733,6 +4942,1245 @@ begin
       jsonb_build_object('account_id', private.acct('vat_input'), 'debit', greatest(-inv, 0), 'credit', greatest(inv, 0)),
       jsonb_build_object('account_id', private.acct('vat_payable'), 'debit', greatest(inv - outv, 0), 'credit', greatest(outv - inv, 0))),
     me.id);
+end $$;
+
+
+-- -------------------------------------------------------------------------------------
+-- API: customer credit notes, receipt vouchers, statements, receivables ageing,
+-- recurring invoices, bank statement import and reconciliation, petty cash
+-- -------------------------------------------------------------------------------------
+
+-- Check sales lines [{description, quantity, unit_price, vat_code}] the way invoices do.
+-- Returns {lines: [... with net and vat], subtotal, vat, error}.
+create or replace function private.check_sales_lines(p_lines jsonb) returns jsonb
+language plpgsql immutable set search_path = '' as $$
+declare
+  ln    jsonb;
+  i     int := 0;
+  qty   numeric;
+  price numeric;
+  net   numeric;
+  vat   numeric;
+  sub   numeric := 0;
+  vsum  numeric := 0;
+  errs  text[] := '{}';
+  res   jsonb := '[]';
+begin
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    return jsonb_build_object('error', 'Add at least one line');
+  elsif jsonb_array_length(p_lines) > 100 then
+    return jsonb_build_object('error', 'At most 100 lines');
+  end if;
+  for ln in select value from jsonb_array_elements(p_lines) loop
+    i := i + 1;
+    begin
+      qty := nullif(btrim(ln ->> 'quantity'), '')::numeric;
+      price := nullif(btrim(ln ->> 'unit_price'), '')::numeric;
+    exception when others then
+      errs := errs || format('Line %s: quantity and price must be numbers', i);
+      continue;
+    end;
+    if nullif(btrim(ln ->> 'description'), '') is null then
+      errs := errs || format('Line %s: add a description', i);
+    elsif char_length(btrim(ln ->> 'description')) > 500 then
+      errs := errs || format('Line %s: description is too long', i);
+    elsif qty is null or qty <= 0 or qty >= 1000000000 or scale(qty) > 3 then
+      errs := errs || format('Line %s: quantity must be more than 0', i);
+    elsif price is null or price < 0 or price >= 1000000000000 or scale(price) > 2 then
+      errs := errs || format('Line %s: price must be 0 or more, with at most 2 decimals', i);
+    elsif coalesce(ln ->> 'vat_code', '') not in ('standard', 'zero', 'exempt', 'out_of_scope') then
+      errs := errs || format('Line %s: pick a VAT treatment', i);
+    else
+      net := round(qty * price, 2);
+      vat := case when ln ->> 'vat_code' = 'standard' then round(net * 0.05, 2) else 0 end;
+      sub := sub + net;
+      vsum := vsum + vat;
+      res := res || jsonb_build_object('description', btrim(ln ->> 'description'), 'quantity', qty,
+        'unit_price', price, 'vat_code', ln ->> 'vat_code', 'net', net, 'vat', vat);
+    end if;
+  end loop;
+  if array_length(errs, 1) > 0 then
+    return jsonb_build_object('error', array_to_string(errs, '. '));
+  end if;
+  return jsonb_build_object('lines', res, 'subtotal', sub, 'vat', vsum);
+end $$;
+
+create or replace function private.refresh_credit_note(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+begin
+  update public.credit_notes set amount_applied = coalesce((select sum(amount) from public.receivable_allocations where credit_note_id = p_id), 0)
+  where id = p_id;
+end $$;
+
+-- What is left of a receipt to set against invoices (nothing once void or the cheque bounced).
+create or replace function private.receipt_unallocated(p_id bigint) returns numeric
+language sql stable security definer set search_path = '' as $$
+  select case when r.status = 'void' or r.cheque_status = 'bounced' then 0
+              else r.amount - coalesce((select sum(a.amount) from public.receivable_allocations a where a.receipt_id = r.id), 0) end
+  from public.receipts r where r.id = p_id
+$$;
+
+-- Income account a credit note line reverses: the invoice's own account for that kind of line, the
+-- task's type of work, or other operating revenue (disbursements: "disbursements recoverable").
+create or replace function private.credit_line_account(p_invoice_id bigint, p_vat_code text) returns bigint
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  inv public.invoices;
+begin
+  select * into inv from public.invoices where id = p_invoice_id;
+  return coalesce(
+    (select l.account_id from public.invoice_lines l where l.invoice_id = p_invoice_id and l.vat_code = p_vat_code and l.account_id is not null limit 1),
+    case when p_vat_code = 'out_of_scope' then private.acct('disbursements') end,
+    (select w.revenue_account_id from public.tasks t join public.work_types w on w.id = t.work_type_id where t.id = inv.task_id),
+    private.acct('revenue_other'));
+end $$;
+
+-- Customer's credits not yet used: receipts with money left and issued credit notes not fully applied.
+create or replace function private.customer_open_credits(p_customer bigint) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(x order by x.date, x.number), '[]') from (
+    select 'receipt' as type, r.id, r.number, r.received_on as date, private.receipt_unallocated(r.id) as available
+    from public.receipts r where r.customer_id = p_customer and private.receipt_unallocated(r.id) > 0
+    union all
+    select 'credit_note', c.id, c.number, c.issue_date, c.total - c.amount_applied
+    from public.credit_notes c where c.customer_id = p_customer and c.status = 'issued' and c.total > c.amount_applied) x
+$$;
+
+-- Customer's tax invoices with a balance, oldest first.
+create or replace function private.customer_open_invoices(p_customer bigint) returns jsonb
+language sql stable security definer set search_path = '' as $$
+  select coalesce(jsonb_agg(jsonb_build_object('id', i.id, 'number', i.number, 'issue_date', i.issue_date, 'due_date', i.due_date,
+                                               'total', i.total, 'balance', i.total - i.amount_paid) order by i.issue_date, i.id), '[]')
+  from public.invoices i
+  where i.customer_id = p_customer and i.kind = 'tax' and i.status = 'sent' and i.total > i.amount_paid
+$$;
+
+-- Set part of a receipt against an invoice: moves it from customer advances to receivables.
+create or replace function private.allocate_receipt(r public.receipts, inv public.invoices, p_amount numeric, p_user uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  jid bigint;
+begin
+  jid := private.post_journal(greatest(r.received_on, inv.issue_date, coalesce((select books_locked_until + 1 from public.company_settings where id = 1), r.received_on)),
+    'receipt', format('%s set against %s - %s', r.number, inv.number, inv.customer_name), r.number, 'receipt', r.id,
+    jsonb_build_array(
+      jsonb_build_object('account_id', private.acct('customer_advances'), 'debit', p_amount, 'credit', 0, 'customer_id', r.customer_id),
+      jsonb_build_object('account_id', private.acct('ar'), 'debit', 0, 'credit', p_amount, 'customer_id', r.customer_id, 'description', inv.number)),
+    p_user);
+  insert into public.receivable_allocations (invoice_id, receipt_id, amount, journal_id, created_by) values (inv.id, r.id, p_amount, jid, p_user);
+  perform private.refresh_invoice_payments(inv.id);
+end $$;
+
+-- ---------- credit notes ----------
+
+-- Create (p_id null) or edit a draft credit note. p_data: invoice_id (on create), issue_date, reason, notes,
+-- lines: [{description, quantity, unit_price, vat_code}]
+create or replace function public.save_credit_note(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "invoice_id": {"type": "int"},
+    "issue_date": {"type": "date", "required": true},
+    "reason":     {"type": "text", "required": true, "max": 500},
+    "notes":      {"type": "text", "max": 1000}
+  }');
+  v_old public.credit_notes;
+  inv   public.invoices;
+  cust  public.customers;
+  co    public.company_settings;
+  chk   jsonb := private.check_sales_lines(p_data -> 'lines');
+  errs  jsonb := '{}';
+  other numeric;
+  v_id  bigint;
+begin
+  if p_id is not null then
+    select * into v_old from public.credit_notes where id = p_id;
+    if v_old.id is null then
+      raise exception 'Credit note not found' using errcode = 'P0002';
+    end if;
+    if v_old.status <> 'draft' then
+      raise exception 'This credit note has been issued, so it can''t be changed' using errcode = '22023';
+    end if;
+    select * into inv from public.invoices where id = v_old.invoice_id;
+  else
+    select * into inv from public.invoices where id = (d ->> 'invoice_id')::bigint;
+    if inv.id is null or inv.kind <> 'tax' or inv.status not in ('sent', 'paid') then
+      raise exception 'A credit note is issued against a tax invoice that has been sent' using errcode = '22023';
+    end if;
+  end if;
+  if (d ->> 'issue_date')::date < inv.issue_date then
+    errs := errs || jsonb_build_object('issue_date', format('Can''t be before the invoice date (%s)', to_char(inv.issue_date, 'DD Mon YYYY')));
+  end if;
+  if chk ? 'error' then
+    errs := errs || jsonb_build_object('lines', chk ->> 'error');
+  else
+    select coalesce(sum(total), 0) into other from public.credit_notes
+    where invoice_id = inv.id and status <> 'cancelled' and id is distinct from p_id;
+    if (chk ->> 'subtotal')::numeric + (chk ->> 'vat')::numeric > inv.total - other then
+      errs := errs || jsonb_build_object('lines', format('The credit can''t be more than AED %s (the invoice total%s)',
+        to_char(inv.total - other, 'FM999,999,999,990.00'), case when other > 0 then ' less earlier credit notes' else '' end));
+    elsif (chk ->> 'subtotal')::numeric + (chk ->> 'vat')::numeric <= 0 then
+      errs := errs || '{"lines": "The credit must be more than 0"}';
+    end if;
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  select * into cust from public.customers where id = inv.customer_id;
+  select * into co from public.company_settings where id = 1;
+  if p_id is null then
+    insert into public.credit_notes (number, invoice_id, customer_id, customer_name, customer_address, customer_trn, customer_email, supplier,
+                                     issue_date, reason, notes, subtotal, vat_total, total, created_by)
+    values (private.next_doc_number('credit_note', 'CN', (d ->> 'issue_date')::date), inv.id, inv.customer_id,
+            coalesce(cust.name, inv.customer_name), coalesce(concat_ws(E'\n', cust.address, cust.city, cust.country), inv.customer_address),
+            coalesce(cust.trn, inv.customer_trn), coalesce(cust.email, inv.customer_email), to_jsonb(co) - 'id' - 'updated_at',
+            (d ->> 'issue_date')::date, d ->> 'reason', d ->> 'notes', (chk ->> 'subtotal')::numeric, (chk ->> 'vat')::numeric,
+            (chk ->> 'subtotal')::numeric + (chk ->> 'vat')::numeric, me.id)
+    returning id into v_id;
+  else
+    v_id := p_id;
+    update public.credit_notes set issue_date = (d ->> 'issue_date')::date, reason = d ->> 'reason', notes = d ->> 'notes',
+      supplier = to_jsonb(co) - 'id' - 'updated_at',
+      subtotal = (chk ->> 'subtotal')::numeric, vat_total = (chk ->> 'vat')::numeric, total = (chk ->> 'subtotal')::numeric + (chk ->> 'vat')::numeric
+    where id = v_id;
+    delete from public.credit_note_lines where credit_note_id = v_id;
+  end if;
+  insert into public.credit_note_lines (credit_note_id, position, description, quantity, unit_price, vat_code, net, vat)
+  select v_id, x.ord, x.l ->> 'description', (x.l ->> 'quantity')::numeric, (x.l ->> 'unit_price')::numeric,
+         x.l ->> 'vat_code', (x.l ->> 'net')::numeric, (x.l ->> 'vat')::numeric
+  from jsonb_array_elements(chk -> 'lines') with ordinality as x(l, ord);
+  return v_id;
+end $$;
+
+-- Issue a draft credit note: Dr income (per line) / Dr VAT output / Cr receivables, then set it against
+-- the invoice's balance (any rest stays as a credit for the customer).
+create or replace function public.issue_credit_note(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  cn    public.credit_notes;
+  inv   public.invoices;
+  co    public.company_settings;
+  lines jsonb;
+  apply numeric;
+begin
+  select * into cn from public.credit_notes where id = p_id for update;
+  if cn.id is null then
+    raise exception 'Credit note not found' using errcode = 'P0002';
+  end if;
+  if cn.status <> 'draft' then
+    raise exception 'Only a draft can be issued' using errcode = '22023';
+  end if;
+  select * into co from public.company_settings where id = 1;
+  if co.trn is null then
+    raise exception 'Add Lowcaps'' TRN under Company settings before issuing a tax credit note' using errcode = '22023';
+  end if;
+  select * into inv from public.invoices where id = cn.invoice_id;
+  if inv.status = 'cancelled' then
+    raise exception 'The invoice has been cancelled' using errcode = '22023';
+  end if;
+  lines := coalesce((
+    select jsonb_agg(jsonb_build_object('account_id', x.acct, 'debit', x.amount, 'credit', 0, 'description', cn.number))
+    from (select private.credit_line_account(cn.invoice_id, l.vat_code) as acct, sum(l.net) as amount
+          from public.credit_note_lines l where l.credit_note_id = p_id group by 1) x), '[]');
+  if cn.vat_total > 0 then
+    lines := lines || jsonb_build_object('account_id', private.acct('vat_output'), 'debit', cn.vat_total, 'credit', 0, 'description', 'VAT on ' || cn.number);
+  end if;
+  lines := lines || jsonb_build_object('account_id', private.acct('ar'), 'debit', 0, 'credit', cn.total, 'description', cn.customer_name,
+                                       'customer_id', cn.customer_id);
+  perform private.post_journal(cn.issue_date, 'credit_note', format('Credit note %s - %s (on %s)', cn.number, cn.customer_name, inv.number),
+                               cn.number, 'credit_note', cn.id, lines, me.id);
+  update public.credit_notes set status = 'issued', issued_at = now(), supplier = to_jsonb(co) - 'id' - 'updated_at' where id = p_id;
+  apply := least(cn.total, inv.total - inv.amount_paid);
+  if apply > 0 then
+    insert into public.receivable_allocations (invoice_id, credit_note_id, amount, created_by) values (inv.id, cn.id, apply, me.id);
+    perform private.refresh_invoice_payments(inv.id);
+    perform private.refresh_credit_note(cn.id);
+  end if;
+  if inv.task_id is not null then
+    insert into public.task_updates (task_id, user_id, kind, body)
+    values (inv.task_id, me.id, 'comment', format('Issued credit note %s (AED %s) on %s', cn.number, to_char(cn.total, 'FM999,999,999,990.00'), inv.number));
+  end if;
+end $$;
+
+-- Cancel a credit note (a draft, or an issued one entered by mistake: its entry is reversed and its uses removed).
+create or replace function public.cancel_credit_note(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  cn  public.credit_notes;
+  iid bigint;
+  jid bigint;
+begin
+  select * into cn from public.credit_notes where id = p_id for update;
+  if cn.id is null then
+    raise exception 'Credit note not found' using errcode = 'P0002';
+  end if;
+  if cn.status = 'cancelled' then
+    return;
+  end if;
+  if cn.status = 'issued' then
+    for iid in delete from public.receivable_allocations where credit_note_id = p_id returning invoice_id loop
+      perform private.refresh_invoice_payments(iid);
+    end loop;
+    for jid in select id from public.journals where source_type = 'credit_note' and source_id = p_id and reversed_by_id is null and reverses_id is null loop
+      perform private.reverse_journal(jid, greatest(private.today(), cn.issue_date), null, me.id);
+    end loop;
+  end if;
+  update public.credit_notes set status = 'cancelled', cancelled_at = now(), amount_applied = 0 where id = p_id;
+end $$;
+
+create or replace function public.mark_credit_note_sent(p_id bigint, p_to text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  update public.credit_notes set sent_at = now(), sent_to = left(nullif(btrim(p_to), ''), 500) where id = p_id and status = 'issued';
+  if not found then
+    raise exception 'Issue the credit note before sending it' using errcode = '22023';
+  end if;
+end $$;
+
+create or replace function public.get_credit_note(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  result json;
+begin
+  select json_build_object('today', private.today(),
+    'credit_note', to_jsonb(c) || jsonb_build_object(
+      'invoice_number', i.number, 'invoice_date', i.issue_date, 'invoice_total', i.total,
+      'created_by_name', u.name,
+      'journal_id', (select j.id from public.journals j where j.source_type = 'credit_note' and j.source_id = c.id and j.kind = 'credit_note' order by j.id limit 1),
+      'lines', coalesce((select jsonb_agg(to_jsonb(l) order by l.position) from public.credit_note_lines l where l.credit_note_id = c.id), '[]'),
+      'allocations', coalesce((select jsonb_agg(jsonb_build_object('id', a.id, 'invoice_id', a.invoice_id, 'invoice_number', ai.number,
+                                 'amount', a.amount, 'created_at', a.created_at) order by a.id)
+                               from public.receivable_allocations a join public.invoices ai on ai.id = a.invoice_id where a.credit_note_id = c.id), '[]'),
+      'open_invoices', case when c.status = 'issued' and c.total > c.amount_applied then private.customer_open_invoices(c.customer_id) else '[]'::jsonb end,
+      'recipients', coalesce((
+        select jsonb_agg(e.email order by e.rank, e.email) from (
+          select lower(x.email) as email, min(x.rank) as rank from (
+            select cu.email, 0 as rank from public.customers cu where cu.id = c.customer_id and cu.email is not null
+            union all
+            select k.email, case when k.is_primary then 1 else 2 end from public.contacts k where k.customer_id = c.customer_id and k.email is not null) x
+          group by lower(x.email)) e), '[]')))
+  into result
+  from public.credit_notes c join public.invoices i on i.id = c.invoice_id left join public.profiles u on u.id = c.created_by
+  where c.id = p_id;
+  if result is null then
+    raise exception 'Credit note not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+-- status: '' | draft | issued | cancelled | unused (issued with credit left)
+create or replace function public.list_credit_notes(p_q text default null, p_status text default null, p_page int default 1) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_manager();
+  page_size constant int := 25;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  pat       text;
+  total     bigint;
+  v_rows    json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  with f as (
+    select c.*, i.number as invoice_number from public.credit_notes c join public.invoices i on i.id = c.invoice_id
+    where (pat is null or c.number ilike pat or c.customer_name ilike pat or i.number ilike pat or c.reason ilike pat)
+      and (case coalesce(p_status, '') when '' then true when 'unused' then c.status = 'issued' and c.total > c.amount_applied else c.status = p_status end))
+  select (select count(*) from f), coalesce((select json_agg(x order by x.issue_date desc, x.id desc) from (
+    select f.id, f.number, f.invoice_id, f.invoice_number, f.customer_id, f.customer_name, f.issue_date, f.reason, f.status, f.total, f.amount_applied
+    from f order by f.issue_date desc, f.id desc limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, v_rows;
+  return json_build_object('credit_notes', v_rows, 'total', total, 'page', pg, 'pageSize', page_size);
+end $$;
+
+-- Set a receipt's unallocated money or a credit note's unused credit against a tax invoice of the same customer.
+create or replace function public.apply_customer_credit(p_invoice_id bigint, p_source_type text, p_source_id bigint, p_amount numeric) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  inv public.invoices;
+  r   public.receipts;
+  cn  public.credit_notes;
+  avail numeric;
+begin
+  select * into inv from public.invoices where id = p_invoice_id for update;
+  if inv.id is null or inv.kind <> 'tax' or inv.status <> 'sent' then
+    raise exception 'Credits can only be set against a sent tax invoice with a balance' using errcode = '22023';
+  end if;
+  if p_amount is null or p_amount <= 0 or scale(p_amount) > 2 then
+    raise exception 'Enter an amount above 0' using errcode = '22023';
+  end if;
+  if p_amount > inv.total - inv.amount_paid then
+    raise exception 'More than the invoice balance of AED %', to_char(inv.total - inv.amount_paid, 'FM999,999,999,990.00') using errcode = '22023';
+  end if;
+  if p_source_type = 'receipt' then
+    select * into r from public.receipts where id = p_source_id for update;
+    avail := private.receipt_unallocated(r.id);
+    if r.id is null or r.customer_id is distinct from inv.customer_id then
+      raise exception 'That receipt is not from this customer' using errcode = '22023';
+    end if;
+    if p_amount > coalesce(avail, 0) then
+      raise exception 'Only AED % of % is left to use', to_char(coalesce(avail, 0), 'FM999,999,999,990.00'), r.number using errcode = '22023';
+    end if;
+    perform private.allocate_receipt(r, inv, p_amount, me.id);
+  elsif p_source_type = 'credit_note' then
+    select * into cn from public.credit_notes where id = p_source_id for update;
+    if cn.id is null or cn.customer_id is distinct from inv.customer_id or cn.status <> 'issued' then
+      raise exception 'That credit note is not an issued one for this customer' using errcode = '22023';
+    end if;
+    if p_amount > cn.total - cn.amount_applied then
+      raise exception 'Only AED % of % is left to use', to_char(cn.total - cn.amount_applied, 'FM999,999,999,990.00'), cn.number using errcode = '22023';
+    end if;
+    insert into public.receivable_allocations (invoice_id, credit_note_id, amount, created_by) values (inv.id, cn.id, p_amount, me.id);
+    perform private.refresh_invoice_payments(inv.id);
+    perform private.refresh_credit_note(cn.id);
+  else
+    raise exception 'Unknown credit type' using errcode = '22023';
+  end if;
+end $$;
+
+-- Undo setting a receipt or credit note against an invoice.
+create or replace function public.remove_receivable_allocation(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  a   public.receivable_allocations;
+  r   public.receipts;
+  inv public.invoices;
+begin
+  select * into a from public.receivable_allocations where id = p_id for update;
+  if a.id is null then
+    raise exception 'Not found' using errcode = 'P0002';
+  end if;
+  if a.receipt_id is not null then
+    select * into r from public.receipts where id = a.receipt_id;
+    select * into inv from public.invoices where id = a.invoice_id;
+    perform private.post_journal(private.today(), 'receipt', format('%s taken off %s - %s', r.number, inv.number, inv.customer_name),
+      r.number, 'receipt', r.id,
+      jsonb_build_array(
+        jsonb_build_object('account_id', private.acct('ar'), 'debit', a.amount, 'credit', 0, 'customer_id', r.customer_id, 'description', inv.number),
+        jsonb_build_object('account_id', private.acct('customer_advances'), 'debit', 0, 'credit', a.amount, 'customer_id', r.customer_id)),
+      me.id);
+  end if;
+  delete from public.receivable_allocations where id = p_id;
+  perform private.refresh_invoice_payments(a.invoice_id);
+  if a.credit_note_id is not null then
+    perform private.refresh_credit_note(a.credit_note_id);
+  end if;
+end $$;
+
+-- ---------- receipt vouchers ----------
+
+-- Record money received from a customer. p_data: customer_id, received_on, amount, method, account_id, reference,
+-- cheque_bank, cheque_date, notes, allocations: [{invoice_id, amount}]. The rest is held as an advance.
+create or replace function public.record_receipt(p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "customer_id": {"type": "int", "required": true},
+    "received_on": {"type": "date", "required": true},
+    "method":      {"type": "enum", "required": true, "values": ["bank_transfer", "cash", "cheque", "other"]},
+    "account_id":  {"type": "int", "required": true},
+    "reference":   {"type": "text", "max": 100},
+    "cheque_bank": {"type": "text", "max": 100},
+    "cheque_date": {"type": "date"},
+    "notes":       {"type": "text", "max": 1000}
+  }');
+  cust  public.customers;
+  amt   numeric;
+  errs  jsonb := '{}';
+  al    jsonb;
+  inv   public.invoices;
+  a_amt numeric;
+  alloc numeric := 0;
+  lerrs text[] := '{}';
+  r     public.receipts;
+  cheque boolean := d ->> 'method' = 'cheque';
+begin
+  select * into cust from public.customers where id = (d ->> 'customer_id')::bigint;
+  if cust.id is null then errs := errs || '{"customer_id": "Pick a customer"}'; end if;
+  if not exists (select 1 from public.accounts where id = (d ->> 'account_id')::bigint and subtype in ('bank', 'cash') and active) then
+    errs := errs || '{"account_id": "Pick a bank or cash account"}';
+  end if;
+  begin
+    amt := nullif(btrim(p_data ->> 'amount'), '')::numeric;
+  exception when others then amt := null;
+  end;
+  if amt is null or amt <= 0 or scale(amt) > 2 or amt >= 1000000000000 then
+    errs := errs || '{"amount": "Enter an amount above 0, with at most 2 decimals"}';
+  end if;
+  if (d ->> 'received_on')::date > private.today() then
+    errs := errs || '{"received_on": "Can''t be in the future"}';
+  end if;
+  if cheque and d ->> 'reference' is null then
+    errs := errs || '{"reference": "Enter the cheque number"}';
+  end if;
+  for al in select value from jsonb_array_elements(coalesce(p_data -> 'allocations', '[]')) loop
+    begin
+      a_amt := coalesce(nullif(btrim(al ->> 'amount'), '')::numeric, 0);
+    exception when others then a_amt := -1;
+    end;
+    continue when a_amt = 0;
+    select * into inv from public.invoices where id = (al ->> 'invoice_id')::bigint;
+    if inv.id is null or inv.kind <> 'tax' or inv.status <> 'sent' or inv.customer_id is distinct from cust.id then
+      lerrs := lerrs || 'An allocation is to an invoice that isn''t open for this customer';
+    elsif a_amt < 0 or scale(a_amt) > 2 or a_amt > inv.total - inv.amount_paid then
+      lerrs := lerrs || format('%s: between 0 and its balance of AED %s', inv.number, to_char(inv.total - inv.amount_paid, 'FM999,999,999,990.00'));
+    else
+      alloc := alloc + a_amt;
+    end if;
+  end loop;
+  if amt is not null and alloc > amt then
+    lerrs := lerrs || format('Allocations (AED %s) add up to more than the amount received', to_char(alloc, 'FM999,999,999,990.00'));
+  end if;
+  if array_length(lerrs, 1) > 0 then errs := errs || jsonb_build_object('allocations', array_to_string(lerrs, '. ')); end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+
+  insert into public.receipts (number, customer_id, received_on, amount, method, account_id, reference, cheque_bank, cheque_date, cheque_status, notes, created_by)
+  values (private.next_doc_number('receipt', 'RV', (d ->> 'received_on')::date), cust.id, (d ->> 'received_on')::date, amt, d ->> 'method',
+          (d ->> 'account_id')::bigint, d ->> 'reference', case when cheque then d ->> 'cheque_bank' end,
+          case when cheque then (d ->> 'cheque_date')::date end, case when cheque then 'pending' end, d ->> 'notes', me.id)
+  returning * into r;
+  -- Money in: the bank or cash account (cheques in hand until cleared) against customer advances.
+  perform private.post_journal(r.received_on, 'receipt',
+    format('Receipt %s from %s%s', r.number, cust.name, case when cheque then ' (cheque ' || r.reference || ')' else '' end),
+    coalesce(r.reference, r.number), 'receipt', r.id,
+    jsonb_build_array(
+      jsonb_build_object('account_id', case when cheque then private.acct('pdc') else r.account_id end, 'debit', amt, 'credit', 0, 'description', cust.name),
+      jsonb_build_object('account_id', private.acct('customer_advances'), 'debit', 0, 'credit', amt, 'description', cust.name, 'customer_id', cust.id)),
+    me.id);
+  for al in select value from jsonb_array_elements(coalesce(p_data -> 'allocations', '[]')) loop
+    a_amt := coalesce(nullif(btrim(al ->> 'amount'), '')::numeric, 0);
+    continue when a_amt = 0;
+    select * into inv from public.invoices where id = (al ->> 'invoice_id')::bigint for update;
+    perform private.allocate_receipt(r, inv, a_amt, me.id);
+  end loop;
+  return r.id;
+end $$;
+
+-- Undo everything a receipt did (void, or its cheque bounced): reverse its entries and free the invoices.
+create or replace function private.unwind_receipt(p_id bigint, p_user uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  iid bigint;
+  j   public.journals;
+begin
+  for j in select * from public.journals where source_type = 'receipt' and source_id = p_id and reversed_by_id is null and reverses_id is null order by id desc loop
+    perform private.reverse_journal(j.id, greatest(private.today(), j.entry_date), null, p_user);
+  end loop;
+  for iid in delete from public.receivable_allocations where receipt_id = p_id returning invoice_id loop
+    perform private.refresh_invoice_payments(iid);
+  end loop;
+end $$;
+
+create or replace function public.void_receipt(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  r  public.receipts;
+begin
+  select * into r from public.receipts where id = p_id for update;
+  if r.id is null then
+    raise exception 'Receipt not found' using errcode = 'P0002';
+  end if;
+  if r.status = 'void' then
+    return;
+  end if;
+  if r.cheque_status is distinct from 'bounced' then
+    perform private.unwind_receipt(p_id, me.id);
+  end if;
+  update public.receipts set status = 'void', voided_at = now() where id = p_id;
+end $$;
+
+-- A receipt's cheque cleared (cheques in hand -> bank) or bounced (everything it did is undone).
+create or replace function public.set_receipt_cheque(p_id bigint, p_status text) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  r  public.receipts;
+begin
+  select * into r from public.receipts where id = p_id for update;
+  if r.id is null then
+    raise exception 'Receipt not found' using errcode = 'P0002';
+  end if;
+  if r.method <> 'cheque' or r.status <> 'posted' then
+    raise exception 'Only a cheque receipt that is not void can change' using errcode = '22023';
+  end if;
+  if r.cheque_status = 'bounced' then
+    raise exception 'This cheque bounced. Record a new receipt when the customer pays again.' using errcode = '22023';
+  end if;
+  if p_status = 'cleared' and r.cheque_status = 'pending' then
+    perform private.post_journal(private.today(), 'receipt', format('Cheque %s cleared - %s', r.reference, r.number), r.reference, 'receipt', r.id,
+      jsonb_build_array(jsonb_build_object('account_id', r.account_id, 'debit', r.amount, 'credit', 0),
+                        jsonb_build_object('account_id', private.acct('pdc'), 'debit', 0, 'credit', r.amount)), me.id);
+  elsif p_status = 'bounced' then
+    perform private.unwind_receipt(p_id, me.id);
+  elsif p_status is distinct from r.cheque_status then
+    raise exception 'Unknown cheque status' using errcode = '22023';
+  end if;
+  update public.receipts set cheque_status = p_status where id = p_id;
+end $$;
+
+create or replace function public.get_receipt(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  result json;
+begin
+  select json_build_object('today', private.today(),
+    'company', (select json_build_object('legal_name', legal_name, 'address', address, 'trn', trn, 'phone', phone, 'email', email)
+                from public.company_settings where id = 1),
+    'receipt', to_jsonb(r) || jsonb_build_object(
+      'customer_name', c.name, 'customer_trn', c.trn, 'customer_address', concat_ws(E'\n', c.address, c.city, c.country),
+      'account', (select code || ' · ' || name from public.accounts where id = r.account_id),
+      'created_by_name', u.name,
+      'unallocated', private.receipt_unallocated(r.id),
+      'journal_id', (select j.id from public.journals j where j.source_type = 'receipt' and j.source_id = r.id order by j.id limit 1),
+      'allocations', coalesce((select jsonb_agg(jsonb_build_object('id', a.id, 'invoice_id', a.invoice_id, 'invoice_number', i.number,
+                                 'amount', a.amount, 'created_at', a.created_at) order by a.id)
+                               from public.receivable_allocations a join public.invoices i on i.id = a.invoice_id where a.receipt_id = r.id), '[]'),
+      'open_invoices', case when private.receipt_unallocated(r.id) > 0 then private.customer_open_invoices(r.customer_id) else '[]'::jsonb end))
+  into result
+  from public.receipts r join public.customers c on c.id = r.customer_id left join public.profiles u on u.id = r.created_by
+  where r.id = p_id;
+  if result is null then
+    raise exception 'Receipt not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+-- status: '' | unallocated (money left to set against invoices) | cheques (not cleared) | void
+create or replace function public.list_receipts(p_q text default null, p_status text default null, p_customer bigint default null, p_page int default 1) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me        public.profiles := private.current_manager();
+  page_size constant int := 25;
+  pg        int := greatest(coalesce(p_page, 1), 1);
+  pat       text;
+  total     bigint;
+  amount    numeric;
+  v_rows    json;
+begin
+  if nullif(btrim(p_q), '') is not null then
+    pat := '%' || replace(replace(replace(btrim(p_q), '\', '\\'), '%', '\%'), '_', '\_') || '%';
+  end if;
+  with f as (
+    select r.*, c.name as customer_name, private.receipt_unallocated(r.id) as unallocated
+    from public.receipts r join public.customers c on c.id = r.customer_id
+    where (pat is null or r.number ilike pat or c.name ilike pat or r.reference ilike pat)
+      and (p_customer is null or r.customer_id = p_customer)
+      and (case coalesce(p_status, '')
+             when '' then true
+             when 'unallocated' then private.receipt_unallocated(r.id) > 0
+             when 'cheques' then r.cheque_status = 'pending' and r.status = 'posted'
+             when 'void' then r.status = 'void' or r.cheque_status = 'bounced'
+             else false end))
+  select (select count(*) from f),
+         (select coalesce(sum(f.amount) filter (where f.status = 'posted' and f.cheque_status is distinct from 'bounced'), 0) from f),
+         coalesce((select json_agg(x order by x.received_on desc, x.id desc) from (
+           select f.id, f.number, f.customer_id, f.customer_name, f.received_on, f.amount, f.method, f.reference, f.cheque_status, f.status, f.unallocated
+           from f order by f.received_on desc, f.id desc limit page_size offset (pg - 1) * page_size) x), '[]')
+  into total, amount, v_rows;
+  return json_build_object('receipts', v_rows, 'total', total, 'amount', amount, 'page', pg, 'pageSize', page_size);
+end $$;
+
+-- Customers with what they owe, for picking on the receipt form.
+create or replace function public.receivable_customers() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return coalesce((select json_agg(x order by lower(x.name)) from (
+    select c.id, c.name, c.status,
+           coalesce((select sum(i.total - i.amount_paid) from public.invoices i
+                     where i.customer_id = c.id and i.kind = 'tax' and i.status = 'sent'), 0) as balance
+    from public.customers c where c.status <> 'inactive'
+       or exists (select 1 from public.invoices i where i.customer_id = c.id and i.kind = 'tax' and i.status = 'sent')) x), '[]');
+end $$;
+
+create or replace function public.customer_open_items(p_customer bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return json_build_object('invoices', private.customer_open_invoices(p_customer), 'credits', private.customer_open_credits(p_customer));
+end $$;
+
+-- ---------- customer statements and receivables ageing ----------
+
+-- Statement of account from the ledger (receivables and advances for the customer). Entries that only move money
+-- between the two (an advance set against an invoice) net to nothing and are left out.
+create or replace function public.customer_statement(p_customer bigint, p_from date, p_to date) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  f       date := coalesce(p_from, private.fy_start(private.today()));
+  t       date := coalesce(p_to, private.today());
+  opening numeric;
+  accts   bigint[] := array[private.acct('ar'), private.acct('customer_advances')];
+  c       public.customers;
+begin
+  select * into c from public.customers where id = p_customer;
+  if c.id is null then
+    raise exception 'Customer not found' using errcode = 'P0002';
+  end if;
+  select coalesce(sum(l.debit - l.credit), 0) into opening
+  from public.journal_lines l join public.journals j on j.id = l.journal_id
+  where l.customer_id = p_customer and l.account_id = any(accts) and j.entry_date < f;
+  return (
+    with per_journal as (
+      select j.id as journal_id, j.entry_date, j.number, j.kind, j.memo, j.reference, j.source_type, j.source_id,
+             sum(l.debit) - least(sum(l.debit), sum(l.credit)) as debit,
+             sum(l.credit) - least(sum(l.debit), sum(l.credit)) as credit
+      from public.journal_lines l join public.journals j on j.id = l.journal_id
+      where l.customer_id = p_customer and l.account_id = any(accts) and j.entry_date between f and t
+      group by j.id
+      having sum(l.debit) <> sum(l.credit)
+    )
+    select json_build_object('from', f, 'to', t, 'opening', opening, 'today', private.today(),
+      'customer', jsonb_build_object('id', c.id, 'name', c.name, 'trn', c.trn, 'email', c.email,
+                                     'address', concat_ws(E'\n', c.address, c.city, c.country)),
+      'company', (select json_build_object('legal_name', legal_name, 'address', address, 'trn', trn, 'phone', phone, 'email', email,
+                                           'account_name', account_name, 'bank_name', bank_name, 'iban', iban, 'swift', swift)
+                  from public.company_settings where id = 1),
+      'lines', coalesce((select json_agg(x order by x.entry_date, x.journal_id) from (
+        select p.*, coalesce(
+                 case p.source_type when 'invoice' then (select number from public.invoices where id = p.source_id)
+                                    when 'credit_note' then (select number from public.credit_notes where id = p.source_id)
+                                    when 'receipt' then (select number from public.receipts where id = p.source_id)
+                                    when 'payment' then (select 'Payment on ' || i.number from public.payments pm join public.invoices i on i.id = pm.invoice_id where pm.id = p.source_id) end,
+                 p.reference, p.number) as document,
+               opening + sum(p.debit - p.credit) over (order by p.entry_date, p.journal_id) as balance
+        from per_journal p) x), '[]'),
+      'closing', opening + coalesce((select sum(debit - credit) from per_journal), 0),
+      'open_invoices', (select coalesce(jsonb_agg(o || jsonb_build_object('days', private.today() - coalesce((o ->> 'due_date')::date, (o ->> 'issue_date')::date))), '[]')
+                        from jsonb_array_elements(private.customer_open_invoices(p_customer)) o),
+      'credits', private.customer_open_credits(p_customer),
+      'recipients', coalesce((
+        select jsonb_agg(e.email order by e.rank, e.email) from (
+          select lower(x.email) as email, min(x.rank) as rank from (
+            select c.email, 0 as rank where c.email is not null
+            union all
+            select k.email, case when k.is_primary then 1 else 2 end from public.contacts k where k.customer_id = c.id and k.email is not null) x
+          group by lower(x.email)) e), '[]')));
+end $$;
+
+-- Receivables ageing at a date: open tax invoice balances by days past due, per customer, with unused credits.
+create or replace function public.receivables_ageing(p_as_of date default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  t  date := coalesce(p_as_of, private.today());
+begin
+  return json_build_object('as_of', t, 'rows', coalesce((select json_agg(x order by lower(x.name)) from (
+    select c.id, c.name, x2.current, x2.d30, x2.d60, x2.d90, x2.d90plus, cr.unallocated
+    from public.customers c
+    cross join lateral (
+      select coalesce(sum(i.total - i.amount_paid) filter (where t - coalesce(i.due_date, i.issue_date) <= 0), 0) as current,
+             coalesce(sum(i.total - i.amount_paid) filter (where t - coalesce(i.due_date, i.issue_date) between 1 and 30), 0) as d30,
+             coalesce(sum(i.total - i.amount_paid) filter (where t - coalesce(i.due_date, i.issue_date) between 31 and 60), 0) as d60,
+             coalesce(sum(i.total - i.amount_paid) filter (where t - coalesce(i.due_date, i.issue_date) between 61 and 90), 0) as d90,
+             coalesce(sum(i.total - i.amount_paid) filter (where t - coalesce(i.due_date, i.issue_date) > 90), 0) as d90plus
+      from public.invoices i
+      where i.customer_id = c.id and i.kind = 'tax' and i.status = 'sent' and i.issue_date <= t and i.total > i.amount_paid) x2
+    cross join lateral (
+      select coalesce((select sum(private.receipt_unallocated(r.id)) from public.receipts r where r.customer_id = c.id and r.received_on <= t), 0)
+           + coalesce((select sum(n.total - n.amount_applied) from public.credit_notes n
+                       where n.customer_id = c.id and n.status = 'issued' and n.issue_date <= t), 0) as unallocated) cr
+    where x2.current + x2.d30 + x2.d60 + x2.d90 + x2.d90plus > 0 or cr.unallocated > 0) x), '[]'));
+end $$;
+
+-- ---------- recurring invoices ----------
+
+create or replace function public.save_recurring_invoice(p_id bigint, p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me   public.profiles := private.current_manager();
+  d    jsonb := private.clean(p_data, '{
+    "customer_id":  {"type": "int", "required": true},
+    "title":        {"type": "text", "required": true, "max": 200},
+    "every_months": {"type": "enum", "required": true, "values": ["1", "2", "3", "6", "12"]},
+    "next_date":    {"type": "date", "required": true},
+    "end_date":     {"type": "date"},
+    "due_days":     {"type": "int", "default": "30"},
+    "notes":        {"type": "text", "max": 2000},
+    "active":       {"type": "bool"}
+  }');
+  chk  jsonb := private.check_sales_lines(p_data -> 'lines');
+  errs jsonb := '{}';
+  v_id bigint;
+begin
+  if not exists (select 1 from public.customers where id = (d ->> 'customer_id')::bigint) then
+    errs := errs || '{"customer_id": "Pick a customer"}';
+  end if;
+  if (d ->> 'due_days')::int > 365 then
+    errs := errs || '{"due_days": "At most 365 days"}';
+  end if;
+  if (d ->> 'end_date')::date < (d ->> 'next_date')::date then
+    errs := errs || '{"end_date": "Can''t be before the next invoice date"}';
+  end if;
+  if chk ? 'error' then
+    errs := errs || jsonb_build_object('lines', chk ->> 'error');
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  if p_id is null then
+    insert into public.recurring_invoices (customer_id, title, every_months, next_date, end_date, due_days, lines, notes, active, created_by)
+    values ((d ->> 'customer_id')::bigint, d ->> 'title', (d ->> 'every_months')::int, (d ->> 'next_date')::date, (d ->> 'end_date')::date,
+            (d ->> 'due_days')::int, chk -> 'lines', d ->> 'notes', true, me.id)
+    returning id into v_id;
+  else
+    update public.recurring_invoices set customer_id = (d ->> 'customer_id')::bigint, title = d ->> 'title', every_months = (d ->> 'every_months')::int,
+      next_date = (d ->> 'next_date')::date, end_date = (d ->> 'end_date')::date, due_days = (d ->> 'due_days')::int, lines = chk -> 'lines',
+      notes = d ->> 'notes', active = (d ->> 'active')::boolean
+    where id = p_id returning id into v_id;
+    if v_id is null then
+      raise exception 'Recurring invoice not found' using errcode = 'P0002';
+    end if;
+  end if;
+  return v_id;
+end $$;
+
+create or replace function public.list_recurring_invoices() returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  return json_build_object('today', private.today(), 'rows', coalesce((select json_agg(x order by x.active desc, x.next_date, x.id) from (
+    select r.id, r.title, r.customer_id, c.name as customer_name, r.every_months, r.next_date, r.end_date, r.active,
+           (select sum(round(round((l ->> 'quantity')::numeric * (l ->> 'unit_price')::numeric, 2)
+                             * case when l ->> 'vat_code' = 'standard' then 1.05 else 1 end, 2)) from jsonb_array_elements(r.lines) l) as total,
+           r.last_invoice_id, (select number from public.invoices where id = r.last_invoice_id) as last_invoice_number,
+           r.active and r.next_date <= private.today() as due
+    from public.recurring_invoices r join public.customers c on c.id = r.customer_id) x), '[]'));
+end $$;
+
+create or replace function public.get_recurring_invoice(p_id bigint) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me     public.profiles := private.current_manager();
+  result json;
+begin
+  select json_build_object('today', private.today(), 'recurring', to_jsonb(r) || jsonb_build_object('customer_name', c.name,
+    'invoices', coalesce((select jsonb_agg(jsonb_build_object('id', i.id, 'number', i.number, 'issue_date', i.issue_date, 'status', i.status,
+                            'total', i.total, 'amount_paid', i.amount_paid) order by i.issue_date desc, i.id desc)
+                          from public.invoices i where i.recurring_id = r.id), '[]')))
+  into result
+  from public.recurring_invoices r join public.customers c on c.id = r.customer_id where r.id = p_id;
+  if result is null then
+    raise exception 'Recurring invoice not found' using errcode = 'P0002';
+  end if;
+  return result;
+end $$;
+
+create or replace function public.delete_recurring_invoice(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  delete from public.recurring_invoices where id = p_id;
+  if not found then
+    raise exception 'Recurring invoice not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Create the draft tax invoices that are due (for one template, or all), catching up missed periods
+-- (at most 12 per template per run). Returns the invoices created.
+create or replace function public.run_recurring_invoices(p_id bigint default null) returns json
+language plpgsql security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  r       public.recurring_invoices;
+  n       int;
+  period  text;
+  inv_id  bigint;
+  created jsonb := '[]';
+begin
+  for r in select * from public.recurring_invoices
+           where active and next_date <= private.today() and (p_id is null or id = p_id)
+           order by next_date, id for update loop
+    n := 0;
+    while r.active and r.next_date <= private.today() and n < 12 loop
+      period := case when r.every_months = 1 then to_char(r.next_date, 'FMMonth YYYY')
+                     else to_char(r.next_date, 'Mon YYYY') || ' - ' || to_char((r.next_date + make_interval(months => r.every_months))::date - 1, 'Mon YYYY') end;
+      inv_id := public.save_invoice(null, jsonb_build_object(
+        'kind', 'tax', 'customer_id', r.customer_id, 'issue_date', r.next_date, 'due_date', r.next_date + r.due_days,
+        'supply_date', r.next_date, 'notes', r.notes,
+        'lines', (select jsonb_agg(l || jsonb_build_object('description', replace(l ->> 'description', '{period}', period)))
+                  from jsonb_array_elements(r.lines) l)));
+      update public.invoices set recurring_id = r.id where id = inv_id;
+      created := created || jsonb_build_object('id', inv_id, 'number', (select number from public.invoices where id = inv_id), 'title', r.title);
+      r.next_date := (r.next_date + make_interval(months => r.every_months))::date;
+      r.active := r.end_date is null or r.next_date <= r.end_date;
+      update public.recurring_invoices set next_date = r.next_date, active = r.active, last_invoice_id = inv_id where id = r.id;
+      n := n + 1;
+    end loop;
+  end loop;
+  return json_build_object('created', created);
+end $$;
+
+-- ---------- bank statement import and reconciliation ----------
+
+-- p_lines: [{date, description, reference, amount (+ in / - out), balance}]. Lines already imported
+-- (same account, date, amount, description and reference) are skipped.
+create or replace function public.import_bank_statement(p_account bigint, p_file_name text, p_lines jsonb) returns json
+language plpgsql security definer set search_path = '' as $$
+declare
+  me      public.profiles := private.current_manager();
+  ln      jsonb;
+  i       int := 0;
+  dt      date;
+  amt     numeric;
+  bal     numeric;
+  descr   text;
+  ref     text;
+  errs    text[] := '{}';
+  imp     bigint;
+  added   int := 0;
+  n_skip  int := 0;
+begin
+  if not exists (select 1 from public.accounts where id = p_account and subtype = 'bank') then
+    raise exception 'Pick a bank account' using errcode = '22023';
+  end if;
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'The file has no transactions' using errcode = '22023';
+  end if;
+  if jsonb_array_length(p_lines) > 5000 then
+    raise exception 'At most 5,000 lines at a time' using errcode = '22023';
+  end if;
+  insert into public.bank_imports (account_id, file_name, imported_by) values (p_account, left(p_file_name, 200), me.id) returning id into imp;
+  for ln in select value from jsonb_array_elements(p_lines) loop
+    i := i + 1;
+    begin
+      dt := (ln ->> 'date')::date;
+      amt := round(nullif(btrim(ln ->> 'amount'), '')::numeric, 2);
+      bal := round(nullif(btrim(ln ->> 'balance'), '')::numeric, 2);
+    exception when others then
+      errs := errs || format('Line %s: date or amount not understood', i);
+      continue;
+    end;
+    descr := left(coalesce(nullif(btrim(ln ->> 'description'), ''), '(no description)'), 500);
+    ref := left(nullif(btrim(ln ->> 'reference'), ''), 100);
+    if dt is null or amt is null then
+      errs := errs || format('Line %s: date or amount missing', i);
+      continue;
+    end if;
+    if amt = 0 or abs(amt) >= 1000000000000 then
+      n_skip := n_skip + 1;
+      continue;
+    end if;
+    if exists (select 1 from public.bank_statement_lines s where s.account_id = p_account and s.txn_date = dt and s.amount = amt
+               and s.description = descr and s.reference is not distinct from ref) then
+      n_skip := n_skip + 1;
+      continue;
+    end if;
+    insert into public.bank_statement_lines (account_id, import_id, txn_date, description, reference, amount, balance)
+    values (p_account, imp, dt, descr, ref, amt, bal);
+    added := added + 1;
+  end loop;
+  if array_length(errs, 1) > 0 then
+    raise exception 'Some lines could not be read: %', array_to_string(errs[1:5], '; ') || case when array_length(errs, 1) > 5 then '…' else '' end
+      using errcode = '22023';
+  end if;
+  update public.bank_imports set line_count = added, skipped = n_skip where id = imp;
+  return json_build_object('import_id', imp, 'imported', added, 'skipped', n_skip);
+end $$;
+
+-- Ledger lines on a bank account still to be matched (left out: entries that were reversed together with their reversal).
+create or replace function private.unmatched_bank_ledger(p_account bigint, p_as_of date) returns table (
+  line_id bigint, journal_id bigint, number text, entry_date date, memo text, reference text, amount numeric)
+language sql stable security definer set search_path = '' as $$
+  select l.id, j.id, j.number, j.entry_date, coalesce(l.description, j.memo), j.reference, l.debit - l.credit
+  from public.journal_lines l join public.journals j on j.id = l.journal_id
+  where l.account_id = p_account and j.entry_date <= p_as_of and l.debit <> l.credit
+    and not exists (select 1 from public.bank_statement_lines s where s.journal_line_id = l.id)
+    and not (j.reversed_by_id is not null and not exists (
+               select 1 from public.journal_lines l2 join public.bank_statement_lines s2 on s2.journal_line_id = l2.id
+               where l2.journal_id in (j.id, j.reversed_by_id)))
+    and not (j.reverses_id is not null and not exists (
+               select 1 from public.journal_lines l2 join public.bank_statement_lines s2 on s2.journal_line_id = l2.id
+               where l2.journal_id in (j.id, j.reverses_id)))
+$$;
+
+create or replace function public.bank_reconciliation(p_account bigint, p_as_of date default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  t     date := coalesce(p_as_of, private.today());
+  a     public.accounts;
+  book  numeric;
+  s_bal  numeric;
+  s_date date;
+  uncl  numeric;
+  unst  numeric;
+begin
+  select * into a from public.accounts where id = p_account and subtype = 'bank';
+  if a.id is null then
+    raise exception 'Bank account not found' using errcode = 'P0002';
+  end if;
+  select coalesce(sum(l.debit - l.credit), 0) into book
+  from public.journal_lines l join public.journals j on j.id = l.journal_id where l.account_id = a.id and j.entry_date <= t;
+  select s.balance, s.txn_date into s_bal, s_date from public.bank_statement_lines s
+  where s.account_id = a.id and s.txn_date <= t and s.balance is not null order by s.txn_date desc, s.id desc limit 1;
+  select coalesce(sum(amount), 0) into uncl from private.unmatched_bank_ledger(a.id, t);
+  select coalesce(sum(amount), 0) into unst from public.bank_statement_lines where account_id = a.id and txn_date <= t and journal_line_id is null;
+  return json_build_object(
+    'account', jsonb_build_object('id', a.id, 'code', a.code, 'name', a.name, 'bank_name', a.bank_name, 'account_number', a.account_number),
+    'as_of', t, 'book_balance', book,
+    'statement_balance', s_bal, 'statement_date', s_date,
+    'uncleared_ledger', uncl, 'unrecorded_statement', unst,
+    'expected_statement_balance', book - uncl + unst,
+    'statement_lines', coalesce((select json_agg(x order by x.txn_date, x.id) from (
+      select s.id, s.txn_date, s.description, s.reference, s.amount, s.balance,
+             (select jsonb_build_object('line_id', u.line_id, 'number', u.number, 'entry_date', u.entry_date, 'memo', u.memo)
+              from private.unmatched_bank_ledger(a.id, s.txn_date + 10) u
+              where u.amount = s.amount and abs(u.entry_date - s.txn_date) <= 10
+              order by abs(u.entry_date - s.txn_date), u.line_id limit 1) as suggestion
+      from public.bank_statement_lines s where s.account_id = a.id and s.journal_line_id is null and s.txn_date <= t) x), '[]'),
+    'ledger_lines', coalesce((select json_agg(u order by u.entry_date, u.line_id) from private.unmatched_bank_ledger(a.id, t) u), '[]'),
+    'matched', coalesce((select json_agg(x order by x.txn_date desc, x.id desc) from (
+      select s.id, s.txn_date, s.description, s.amount, j.id as journal_id, j.number, j.entry_date
+      from public.bank_statement_lines s join public.journal_lines l on l.id = s.journal_line_id join public.journals j on j.id = l.journal_id
+      where s.account_id = a.id order by s.txn_date desc, s.id desc limit 50) x), '[]'),
+    'imports', coalesce((select json_agg(x order by x.id desc) from (
+      select i.id, i.file_name, i.line_count, i.skipped, i.created_at, u.name as imported_by_name,
+             (select min(txn_date) from public.bank_statement_lines where import_id = i.id) as first_date,
+             (select max(txn_date) from public.bank_statement_lines where import_id = i.id) as last_date
+      from public.bank_imports i left join public.profiles u on u.id = i.imported_by
+      where i.account_id = a.id order by i.id desc limit 10) x), '[]'));
+end $$;
+
+create or replace function public.match_bank_line(p_statement_line bigint, p_journal_line bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+  s  public.bank_statement_lines;
+  l  public.journal_lines;
+begin
+  select * into s from public.bank_statement_lines where id = p_statement_line for update;
+  select * into l from public.journal_lines where id = p_journal_line;
+  if s.id is null or l.id is null then
+    raise exception 'Not found' using errcode = 'P0002';
+  end if;
+  if s.journal_line_id is not null then
+    raise exception 'This bank line is already matched' using errcode = '22023';
+  end if;
+  if l.account_id <> s.account_id then
+    raise exception 'That entry is on a different account' using errcode = '22023';
+  end if;
+  if l.debit - l.credit <> s.amount then
+    raise exception 'The amounts differ (bank AED %, ledger AED %)', to_char(s.amount, 'FM999,999,999,990.00'),
+      to_char(l.debit - l.credit, 'FM999,999,999,990.00') using errcode = '22023';
+  end if;
+  if exists (select 1 from public.bank_statement_lines where journal_line_id = l.id) then
+    raise exception 'That ledger entry is already matched to another bank line' using errcode = '22023';
+  end if;
+  update public.bank_statement_lines set journal_line_id = l.id, matched_by = me.id, matched_at = now() where id = s.id;
+end $$;
+
+create or replace function public.unmatch_bank_line(p_statement_line bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  update public.bank_statement_lines set journal_line_id = null, matched_by = null, matched_at = null where id = p_statement_line;
+  if not found then
+    raise exception 'Not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- Match every bank line that has exactly one ledger entry of the same amount within 10 days (closest date first).
+create or replace function public.auto_match_bank(p_account bigint) returns int
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  s   public.bank_statement_lines;
+  hit bigint;
+  n   int := 0;
+begin
+  for s in select * from public.bank_statement_lines where account_id = p_account and journal_line_id is null order by txn_date, id loop
+    select u.line_id into hit from private.unmatched_bank_ledger(p_account, s.txn_date + 10) u
+    where u.amount = s.amount and abs(u.entry_date - s.txn_date) <= 10
+    order by abs(u.entry_date - s.txn_date), u.line_id limit 1;
+    if hit is not null then
+      update public.bank_statement_lines set journal_line_id = hit, matched_by = me.id, matched_at = now() where id = s.id;
+      n := n + 1;
+    end if;
+  end loop;
+  return n;
+end $$;
+
+-- Record a bank line that isn't in the books yet (bank charges, interest, a direct debit...) and match it.
+create or replace function public.bank_line_entry(p_statement_line bigint, p_other_account bigint, p_memo text) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  s     public.bank_statement_lines;
+  other public.accounts;
+  jid   bigint;
+  lid   bigint;
+begin
+  select * into s from public.bank_statement_lines where id = p_statement_line for update;
+  if s.id is null then
+    raise exception 'Not found' using errcode = 'P0002';
+  end if;
+  if s.journal_line_id is not null then
+    raise exception 'This bank line is already matched' using errcode = '22023';
+  end if;
+  select * into other from public.accounts where id = p_other_account and active;
+  if other.id is null or other.id = s.account_id then
+    raise exception 'Pick the account for the other side' using errcode = '22023';
+  end if;
+  if other.system_key in ('ar', 'ap', 'customer_advances') then
+    raise exception 'Customer and supplier money goes through a receipt or payment voucher instead' using errcode = '22023';
+  end if;
+  jid := private.post_journal(s.txn_date, case when s.amount > 0 then 'bank_receipt' else 'bank_payment' end,
+    coalesce(nullif(btrim(p_memo), ''), s.description), s.reference, null, null,
+    jsonb_build_array(
+      jsonb_build_object('account_id', s.account_id, 'debit', greatest(s.amount, 0), 'credit', greatest(-s.amount, 0), 'description', s.description),
+      jsonb_build_object('account_id', other.id, 'debit', greatest(-s.amount, 0), 'credit', greatest(s.amount, 0), 'description', s.description)),
+    me.id);
+  select id into lid from public.journal_lines where journal_id = jid and account_id = s.account_id;
+  update public.bank_statement_lines set journal_line_id = lid, matched_by = me.id, matched_at = now() where id = s.id;
+  return jid;
+end $$;
+
+create or replace function public.delete_bank_import(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me public.profiles := private.current_manager();
+begin
+  delete from public.bank_imports where id = p_id;
+  if not found then
+    raise exception 'Import not found' using errcode = 'P0002';
+  end if;
+end $$;
+
+-- ---------- petty cash ----------
+
+-- p_data: account_id (a cash account; default petty cash), spent_on, payee, payee_trn, description, expense_account_id,
+-- vat_code, recoverable, total (amount paid, VAT included), receipt_ref
+create or replace function public.record_petty_cash(p_data jsonb) returns bigint
+language plpgsql security definer set search_path = '' as $$
+declare
+  me    public.profiles := private.current_manager();
+  d     jsonb := private.clean(p_data, '{
+    "account_id":         {"type": "int"},
+    "spent_on":           {"type": "date", "required": true},
+    "payee":              {"type": "text", "required": true, "max": 200},
+    "payee_trn":          {"type": "text", "format": "trn"},
+    "description":        {"type": "text", "required": true, "max": 500},
+    "expense_account_id": {"type": "int", "required": true},
+    "vat_code":           {"type": "enum", "required": true, "values": ["standard", "zero", "exempt", "out_of_scope"]},
+    "recoverable":        {"type": "bool"},
+    "receipt_ref":        {"type": "text", "max": 100}
+  }');
+  box   bigint := coalesce((d ->> 'account_id')::bigint, private.acct('petty_cash'));
+  exp   public.accounts;
+  tot   numeric;
+  vat   numeric;
+  net   numeric;
+  rec   boolean := (d ->> 'recoverable')::boolean and d ->> 'vat_code' = 'standard';
+  errs  jsonb := '{}';
+  v_id  bigint;
+  num   text;
+begin
+  if not exists (select 1 from public.accounts where id = box and subtype = 'cash' and active) then
+    errs := errs || '{"account_id": "Pick a cash account"}';
+  end if;
+  select * into exp from public.accounts where id = (d ->> 'expense_account_id')::bigint and active;
+  if exp.id is null or exp.type not in ('expense', 'asset') or exp.subtype in ('bank', 'cash', 'pdc', 'receivable', 'vat_input') then
+    errs := errs || '{"expense_account_id": "Pick an expense account"}';
+  end if;
+  begin
+    tot := nullif(btrim(p_data ->> 'total'), '')::numeric;
+  exception when others then tot := null;
+  end;
+  if tot is null or tot <= 0 or scale(tot) > 2 or tot >= 1000000000 then
+    errs := errs || '{"total": "Enter the amount paid, above 0"}';
+  end if;
+  if (d ->> 'spent_on')::date > private.today() then
+    errs := errs || '{"spent_on": "Can''t be in the future"}';
+  end if;
+  if errs <> '{}' then
+    raise exception 'Please fix the highlighted fields' using errcode = '22023', detail = errs::text;
+  end if;
+  vat := case when d ->> 'vat_code' = 'standard' then round(tot * 5 / 105, 2) else 0 end;
+  net := tot - vat;
+  num := private.next_doc_number('petty_cash', 'PC', (d ->> 'spent_on')::date);
+  insert into public.petty_cash_expenses (number, account_id, spent_on, payee, payee_trn, description, expense_account_id, vat_code,
+                                          recoverable, net, vat, total, receipt_ref, created_by)
+  values (num, box, (d ->> 'spent_on')::date, d ->> 'payee', d ->> 'payee_trn', d ->> 'description', exp.id, d ->> 'vat_code',
+          rec or d ->> 'vat_code' <> 'standard', net, vat, tot, d ->> 'receipt_ref', me.id)
+  returning id into v_id;
+  perform private.post_journal((d ->> 'spent_on')::date, 'petty_cash', format('%s %s - %s', num, d ->> 'payee', d ->> 'description'),
+    coalesce(d ->> 'receipt_ref', num), 'petty_cash', v_id,
+    jsonb_build_array(
+      jsonb_build_object('account_id', exp.id, 'debit', net + case when rec then 0 else vat end, 'credit', 0, 'description', d ->> 'description'),
+      jsonb_build_object('account_id', private.acct('vat_input'), 'debit', case when rec then vat else 0 end, 'credit', 0, 'description', 'VAT on ' || num),
+      jsonb_build_object('account_id', box, 'debit', 0, 'credit', tot, 'description', d ->> 'payee')),
+    me.id);
+  return v_id;
+end $$;
+
+create or replace function public.void_petty_cash(p_id bigint) returns void
+language plpgsql security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  e   public.petty_cash_expenses;
+  jid bigint;
+begin
+  select * into e from public.petty_cash_expenses where id = p_id for update;
+  if e.id is null then
+    raise exception 'Not found' using errcode = 'P0002';
+  end if;
+  if e.status = 'void' then
+    return;
+  end if;
+  for jid in select id from public.journals where source_type = 'petty_cash' and source_id = p_id and reversed_by_id is null and reverses_id is null loop
+    perform private.reverse_journal(jid, greatest(private.today(), e.spent_on), null, me.id);
+  end loop;
+  update public.petty_cash_expenses set status = 'void', voided_at = now() where id = p_id;
+end $$;
+
+-- Petty cash book for a period: cash accounts with balances, spending, and top-ups / other money in.
+create or replace function public.petty_cash(p_from date, p_to date, p_account bigint default null) returns json
+language plpgsql stable security definer set search_path = '' as $$
+declare
+  me  public.profiles := private.current_manager();
+  f   date := coalesce(p_from, date_trunc('month', private.today())::date);
+  t   date := coalesce(p_to, private.today());
+  box bigint := coalesce(p_account, private.acct('petty_cash'));
+begin
+  return json_build_object('from', f, 'to', t, 'account_id', box,
+    'accounts', coalesce((select json_agg(x order by x.code) from (
+      select a.id, a.code, a.name, a.active, coalesce((select sum(l.debit - l.credit) from public.journal_lines l where l.account_id = a.id), 0) as balance
+      from public.accounts a where a.subtype = 'cash') x), '[]'),
+    'opening', coalesce((select sum(l.debit - l.credit) from public.journal_lines l join public.journals j on j.id = l.journal_id
+                         where l.account_id = box and j.entry_date < f), 0),
+    'closing', coalesce((select sum(l.debit - l.credit) from public.journal_lines l join public.journals j on j.id = l.journal_id
+                         where l.account_id = box and j.entry_date <= t), 0),
+    'expenses', coalesce((select json_agg(x order by x.spent_on desc, x.id desc) from (
+      select e.id, e.number, e.spent_on, e.payee, e.payee_trn, e.description, e.vat_code, e.recoverable, e.net, e.vat, e.total, e.receipt_ref, e.status,
+             a.code || ' · ' || a.name as expense_account,
+             (select j.id from public.journals j where j.source_type = 'petty_cash' and j.source_id = e.id order by j.id limit 1) as journal_id
+      from public.petty_cash_expenses e join public.accounts a on a.id = e.expense_account_id
+      where e.account_id = box and e.spent_on between f and t) x), '[]'),
+    'money_in', coalesce((select json_agg(x order by x.entry_date desc, x.id desc) from (
+      select j.id, j.number, j.entry_date, j.memo, l.debit as amount
+      from public.journal_lines l join public.journals j on j.id = l.journal_id
+      where l.account_id = box and l.debit > 0 and j.entry_date between f and t and coalesce(j.source_type, '') <> 'petty_cash') x), '[]'));
 end $$;
 
 -- Revenue account for the standard types of work (where not chosen yet).
@@ -4870,7 +6318,39 @@ begin
     'public.supplier_statement(bigint, date, date)',
     'public.payables_ageing(date)',
     'public.vat_return(date, date)',
-    'public.post_vat_settlement(date, date)'
+    'public.post_vat_settlement(date, date)',
+    'public.save_credit_note(bigint, jsonb)',
+    'public.issue_credit_note(bigint)',
+    'public.cancel_credit_note(bigint)',
+    'public.mark_credit_note_sent(bigint, text)',
+    'public.get_credit_note(bigint)',
+    'public.list_credit_notes(text, text, int)',
+    'public.apply_customer_credit(bigint, text, bigint, numeric)',
+    'public.remove_receivable_allocation(bigint)',
+    'public.record_receipt(jsonb)',
+    'public.void_receipt(bigint)',
+    'public.set_receipt_cheque(bigint, text)',
+    'public.get_receipt(bigint)',
+    'public.list_receipts(text, text, bigint, int)',
+    'public.receivable_customers()',
+    'public.customer_open_items(bigint)',
+    'public.customer_statement(bigint, date, date)',
+    'public.receivables_ageing(date)',
+    'public.save_recurring_invoice(bigint, jsonb)',
+    'public.list_recurring_invoices()',
+    'public.get_recurring_invoice(bigint)',
+    'public.delete_recurring_invoice(bigint)',
+    'public.run_recurring_invoices(bigint)',
+    'public.import_bank_statement(bigint, text, jsonb)',
+    'public.bank_reconciliation(bigint, date)',
+    'public.match_bank_line(bigint, bigint)',
+    'public.unmatch_bank_line(bigint)',
+    'public.auto_match_bank(bigint)',
+    'public.bank_line_entry(bigint, bigint, text)',
+    'public.delete_bank_import(bigint)',
+    'public.record_petty_cash(jsonb)',
+    'public.void_petty_cash(bigint)',
+    'public.petty_cash(date, date, bigint)'
   ] loop
     execute format('revoke all on function %s from public, anon', fn);
     execute format('grant execute on function %s to authenticated', fn);
