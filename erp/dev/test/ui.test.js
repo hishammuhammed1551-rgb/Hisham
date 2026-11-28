@@ -154,6 +154,13 @@ test('full flow: sign up, approve staff, customers, contacts, activity, export',
   await admin.waitForSelector('h1:text("Sign in")');
   await admin.fill('[name=email]', 'admin@lowcaps.test');
   await admin.fill('[name=password]', 'nope-nope-nope');
+  // The eye button shows the password, and hides it again
+  await admin.click('button[aria-label="Show password"]');
+  assert.equal(await admin.getAttribute('[name=password]', 'type'), 'text');
+  assert.equal(await admin.inputValue('[name=password]'), 'nope-nope-nope');
+  if (SHOTS) await admin.screenshot({ path: `${SHOTS}/login-eye.png` });
+  await admin.click('button[aria-label="Hide password"]');
+  assert.equal(await admin.getAttribute('[name=password]', 'type'), 'password');
   await admin.click('button[type=submit]');
   await admin.waitForSelector('text=Incorrect email or password');
   await admin.fill('[name=password]', 'demo-password-123');

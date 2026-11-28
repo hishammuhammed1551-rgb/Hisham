@@ -256,3 +256,15 @@ dialog::backdrop { background: rgba(10, 20, 14, 0.45); }
 .inline-form .field { flex: 1 1 260px; }
 .list a.row-link { font-weight: 600; text-decoration: none; color: var(--color-text); }
 .list a.row-link:hover { color: var(--color-primary); text-decoration: underline; }
+
+/* password show/hide */
+.pw-wrap { position: relative; display: block; }
+.pw-wrap input { padding-right: 2.75rem; }
+.pw-toggle {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  display: grid; place-items: center; padding: 6px; border: 0; border-radius: 6px;
+  background: none; color: var(--color-muted); cursor: pointer;
+}
+.pw-toggle:hover { color: var(--color-text); background: var(--color-surface); }
+.pw-toggle:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 1px; }
+.pw-toggle svg { width: 18px; height: 18px; display: block; }

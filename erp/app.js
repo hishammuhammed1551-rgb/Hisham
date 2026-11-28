@@ -46,6 +46,8 @@ const ICONS = {
   email: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m3 7 9 6 9-6"/>',
   follow_up: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   menu: '<path d="M3 6h18M3 12h18M3 18h18"/>',
+  eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+  eyeOff: '<path d="m3 3 18 18"/><path d="M10.6 5.1A9.8 9.8 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.8 8.4 2 12 2 12s3.5 7 10 7a9.8 9.8 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
   task: '<path d="m9 11 3 3 8-8"/><path d="M20 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   tag: '<path d="M3 12V3h9l9 9-9 9z"/><circle cx="7.5" cy="7.5" r="1.5"/>',
 };
@@ -138,7 +140,26 @@ function checkNewPassword(password) {
 function field(label, input, { hint, full } = {}) {
   const id = input.id || (input.id = 'f-' + (input.name || Math.random().toString(36).slice(2)));
   return h('div', { class: 'field' + (full ? ' full' : ''), 'data-field': input.name },
-    h('label', { for: id }, label), input, hint && h('div', { class: 'hint' }, hint));
+    h('label', { for: id }, label), input.type === 'password' ? withShowButton(input) : input,
+    hint && h('div', { class: 'hint' }, hint));
+}
+
+/** Password box with an eye button that shows or hides what was typed. */
+function withShowButton(pw) {
+  const btn = h('button', {
+    type: 'button', class: 'pw-toggle', 'aria-label': 'Show password', 'aria-pressed': 'false', title: 'Show password',
+    onclick: () => {
+      const show = pw.type === 'password';
+      pw.type = show ? 'text' : 'password';
+      const label = show ? 'Hide password' : 'Show password';
+      btn.setAttribute('aria-pressed', String(show));
+      btn.setAttribute('aria-label', label);
+      btn.title = label;
+      btn.replaceChildren(icon(show ? 'eyeOff' : 'eye'));
+      pw.focus();
+    },
+  }, icon('eye'));
+  return h('span', { class: 'pw-wrap' }, pw, btn);
 }
 
 const input = (name, value, attrs = {}) => h('input', { name, value: value ?? '', ...attrs });
